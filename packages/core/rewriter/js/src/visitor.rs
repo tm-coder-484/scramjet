@@ -77,6 +77,16 @@ where
 
 	fn handle_computed_member_expression(&mut self, it: &ComputedMemberExpression<'data>) {
 		if self.flags.disable_computed_wrap { return };
+		// the receiver is passed to the wrapper so it can tell a null-prototype dictionary apart
+		// from a window or location. it is only passed when it can be repeated verbatim without
+		// side effects: a plain identifier (that is not rewritten, see UNSAFE_GLOBALS) or `this`
+		let receiver: Option<Atom<'data>> = match &it.object {
+			Expression::Identifier(id) if !UNSAFE_GLOBALS.contains(&id.name.as_str()) => {
+				Some(id.name)
+			}
+			Expression::ThisExpression(_) => Some(self.alloc.alloc_str("this").into()),
+			_ => None,
+		};
 		match &it.expression {
 			Expression::NullLiteral(_)
 			| Expression::BigIntLiteral(_)
@@ -85,14 +95,21 @@ where
 			| Expression::BooleanLiteral(_) => {}
 			Expression::StringLiteral(lit) => {
 				if UNSAFE_GLOBALS.contains(&lit.value.as_str()) {
-					self.jschanges
-						.add(rewrite!(it.expression.span(), WrapProperty,));
+					self.add_wrap_property(it.expression.span(), receiver);
 				}
 			}
 			_ => {
-				self.jschanges
-					.add(rewrite!(it.expression.span(), WrapProperty,));
+				self.add_wrap_property(it.expression.span(), receiver);
 			}
+		}
+	}
+
+	fn add_wrap_property(&mut self, span: Span, receiver: Option<Atom<'data>>) {
+		match receiver {
+			Some(receiver) => self
+				.jschanges
+				.add(rewrite!(span, WrapPropertyWithReceiver { receiver })),
+			None => self.jschanges.add(rewrite!(span, WrapProperty,)),
 		}
 	}
 

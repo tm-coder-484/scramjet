@@ -260,4 +260,37 @@ export default [
 			});
 		},
 	}),
+
+	// scramjet/core
+	// computed keys named location/parent/top/eval were rewritten to the $scramjet__ alias even on
+	// null-prototype dictionaries, which have no Object.prototype getter to resolve the alias
+	basicTest({
+		name: "regression-nullproto-computed-keys",
+		js: `
+            for (const key of ["location", "parent", "top", "eval"]) {
+                const dict = Object.create(null);
+                dict[key] = key + "-value";
+                assertEqual(dict[key], key + "-value", "null-proto read of " + key);
+                assertEqual(key in dict, true, "null-proto has " + key);
+                delete dict[key];
+                assertEqual(dict[key], undefined, "null-proto delete of " + key);
+
+                const fn = Object.create(null);
+                fn[key] = () => "called " + key;
+                assertEqual(fn[key](), "called " + key, "null-proto call of " + key);
+
+                const plain = {};
+                plain[key] = key + "-plain";
+                assertEqual(plain[key], key + "-plain", "plain object read of " + key);
+
+                const viaThis = Object.create(null);
+                viaThis[key] = 7;
+                assertEqual((function () { return this[key]; }).call(viaThis), 7, "this receiver for " + key);
+            }
+            // the receiver form must not hand out the real window or location
+            assertEqual(window["location"].href, location.href, "window[location] stays proxied");
+            assertEqual(document["location"].href, location.href, "document[location] stays proxied");
+            assertEqual(self["location"].href, location.href, "self[location] stays proxied");
+        `,
+	}),
 ];

@@ -2,7 +2,10 @@ import { iswindow } from "@client/entry";
 import { SCRAMJETCLIENT } from "@/symbols";
 import { ScramjetClient } from "@client/index";
 // import { argdbg } from "@client/shared/err";
-import { Object_defineProperty } from "@/shared/snapshot";
+import {
+	Object_defineProperty,
+	Object_getPrototypeOf,
+} from "@/shared/snapshot";
 
 export function createWrapFn(client: ScramjetClient, self: GlobalThis) {
 	let wrappedParent: GlobalThis | null = null;
@@ -55,6 +58,29 @@ export function createWrapFn(client: ScramjetClient, self: GlobalThis) {
 	};
 }
 
+// decides whether `receiver[key]` can safely use the raw key instead of the `$scramjet__` alias.
+// only a null-prototype object is treated as a plain dictionary: Window, Location and Document
+// always have a prototype. cross-origin windows and locations report a null prototype, so they
+// are excluded by the `self` check, which is readable cross-origin and returns the window itself.
+// anything that throws (including proxies that throw) falls back to the alias.
+function isNullProtoDictionary(receiver: any, alias: string): boolean {
+	try {
+		if (receiver === null) return false;
+		const t = typeof receiver;
+		if (t !== "object" && t !== "function") return false;
+		if (Object_getPrototypeOf(receiver) !== null) return false;
+		if (alias in receiver) return false;
+
+		const selfRef = receiver.self;
+		if (selfRef !== null && selfRef !== undefined && selfRef.self === selfRef)
+			return false;
+
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export const order = 4;
 export default function (client: ScramjetClient, self: GlobalThis) {
 	Object_defineProperty(self, client.config.globals.wrapfn, {
@@ -64,14 +90,19 @@ export default function (client: ScramjetClient, self: GlobalThis) {
 		enumerable: false,
 	});
 	Object_defineProperty(self, client.config.globals.wrappropertyfn, {
-		value: function (str) {
+		// receiver is only passed for `receiver[key]`, where it is a plain identifier or `this`
+		value: function (str: any, receiver?: any) {
 			if (
 				str === "location" ||
 				str === "parent" ||
 				str === "top" ||
 				str === "eval"
-			)
-				return client.config.globals.wrappropertybase + str;
+			) {
+				const alias = client.config.globals.wrappropertybase + str;
+				if (isNullProtoDictionary(receiver, alias)) return str;
+
+				return alias;
+			}
 
 			return str;
 		},

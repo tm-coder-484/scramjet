@@ -60,8 +60,11 @@ function $wrap(val) {
     return val;
 }
 
-function $prop(prop) {
+function $prop(prop, receiver) {
     if (prop === "location" || prop === "top" || prop === "eval") {
+        if (arguments.length > 1 && receiver !== null && typeof receiver === "object" && Object.getPrototypeOf(receiver) === null) {
+            return prop
+        }
         return "$sj_"+prop
     }
     return prop
