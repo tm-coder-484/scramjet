@@ -4,6 +4,7 @@ import { URLMeta } from "@rewriters/url";
 import { getRewriter, JsRewriterOutput } from "@rewriters/wasm";
 import {
 	Array_from,
+	SyntaxError,
 	TextDecoder_decode,
 	_RegExp,
 	_Uint8Array,
@@ -152,6 +153,9 @@ export function rewriteJs(
 		if (flagEnabled("allowInvalidJs", context, meta.base)) {
 			return js;
 		} else {
+			// the rewriter only fails on code it cannot parse; report that as a SyntaxError like the engine does
+			if (err.message.includes("oxc panicked in parser"))
+				throw new SyntaxError(err.message);
 			throw err;
 		}
 	}

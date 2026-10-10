@@ -60,6 +60,7 @@ export const URL_revokeObjectURL = globalThis.URL.revokeObjectURL.bind(
 );
 
 export const Error = globalThis.Error;
+export const SyntaxError = globalThis.SyntaxError;
 export const Math_random = globalThis.Math.random;
 export const Math_min = globalThis.Math.min;
 
