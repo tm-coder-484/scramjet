@@ -26,7 +26,9 @@ export function rewriteWorkers(
 		rewritten = TextDecoder_decode(rewritten);
 	}
 
-	if (flagEnabled("encapsulateWorkers", context, meta.origin)) {
+	// module workers keep their body inline: the rewriter emits import specifiers as
+	// path-absolute urls, which cannot be resolved from the data: url of an encapsulated module
+	if (!isModule && flagEnabled("encapsulateWorkers", context, meta.origin)) {
 		// TODO: check if there's already a sourceURL/sourcemap before appending another?
 		rewritten += `//# sourceURL=${url}`;
 		str += script(b64(rewritten as string));

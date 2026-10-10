@@ -10,6 +10,7 @@ import {
 	_Uint8Array,
 	Object_keys,
 	Performance_now,
+	String_startsWith,
 } from "../snapshot";
 
 // eslint-disable-next-line scramjet-core/no-globals
@@ -35,6 +36,14 @@ function rewriteJsWasm(
 		flagsobj[flag] = flagEnabled(flag as any, context, meta.base);
 	}
 
+	// the rewriter encodes every static import specifier with codecEncode. blob: and
+	// data: specifiers must stay raw, the way rewriteUrl emits them, because the service
+	// worker reads them from the path without decoding (see handleBlobOrDataUrlFetch)
+	const encodeSpecifier = (url: string) =>
+		String_startsWith(url, "blob:") || String_startsWith(url, "data:")
+			? url
+			: context.interface.codecEncode(url);
+
 	try {
 		let out: JsRewriterOutput;
 		const before = Performance_now();
@@ -46,7 +55,7 @@ function rewriteJsWasm(
 					prefix: context.prefix.pathname,
 				},
 				flagsobj,
-				context.interface.codecEncode,
+				encodeSpecifier,
 				input,
 				meta.base.href,
 				source || "(unknown)",
@@ -59,7 +68,7 @@ function rewriteJsWasm(
 					prefix: context.prefix.pathname,
 				},
 				flagsobj,
-				context.interface.codecEncode,
+				encodeSpecifier,
 				input,
 				meta.base.href,
 				source || "(unknown)",
