@@ -29,6 +29,8 @@ const flagDescriptions: Record<keyof ScramjetFlags, string> = {
 		"if an api interceptor fails, call the api with original input unsafely instead of throwing",
 	encapsulateWorkers:
 		"wrap web worker scripts in data urls to prevent scope issues (potentially buggy)",
+	viewTransitions:
+		"allow view transition animations (chromium can crash the tab running these in an iframe, e.g. youtube)",
 	scramitize:
 		"Trigger debugger whenever the string 'scramjet' or the real location is detected in attacker code (debug feature)",
 	rewriterLogs: "Enable rewriter logging (debug feature)",
