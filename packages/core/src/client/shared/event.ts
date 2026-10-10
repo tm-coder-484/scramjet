@@ -7,7 +7,10 @@ import {
 	Reflect_get,
 	Reflect_ownKeys,
 	Symbol_for,
+	_WeakMap,
 } from "@/shared/snapshot";
+
+type Listener = (...args: any) => any;
 
 const realOnEvent = Symbol_for("scramjet original onevent function");
 
@@ -69,8 +72,18 @@ export default function (client: ScramjetClient, self: Self) {
 		},
 	};
 
-	function wraplistener(listener: (...args: any) => any) {
-		return new Proxy(listener, {
+	// one wrapper per original listener: the same function always maps to the same
+	// proxy, so native addEventListener dedupes it and native removeEventListener
+	// matches (type, proxy, capture) exactly like the browser would
+	const proxiedListeners = new _WeakMap() as WeakMap<Listener, Listener>;
+	// the event currently being dispatched to a wrapped listener (backs window.event)
+	let currentEvent: Event | undefined;
+
+	function wraplistener(listener: Listener): Listener {
+		const existing = proxiedListeners.get(listener);
+		if (existing) return existing;
+
+		const proxied = new Proxy(listener, {
 			apply(target, that, args) {
 				const realEvent: Event = args[0];
 
@@ -115,37 +128,32 @@ export default function (client: ScramjetClient, self: Self) {
 				if (!self.event) {
 					Object_defineProperty(self, "event", {
 						get() {
-							return args[0];
+							return currentEvent;
 						},
 						configurable: true,
 					});
 				}
 
-				const rv = Reflect_apply(target, that, args);
-
-				return rv;
+				const prevEvent = currentEvent;
+				currentEvent = args[0];
+				try {
+					return Reflect_apply(target, that, args);
+				} finally {
+					currentEvent = prevEvent;
+				}
 			},
 			getOwnPropertyDescriptor: getOwnPropertyDescriptorHandler,
 		});
+
+		proxiedListeners.set(listener, proxied);
+		return proxied;
 	}
 
 	client.Proxy("EventTarget.prototype.addEventListener", {
 		apply(ctx) {
 			if (typeof ctx.args[1] !== "function") return;
 
-			const origlistener = ctx.args[1];
-			const proxylistener = wraplistener(origlistener);
-
-			ctx.args[1] = proxylistener;
-
-			let arr = client.eventcallbacks.get(ctx.this);
-			arr ||= [] as any;
-			arr.push({
-				event: ctx.args[0] as string,
-				originalCallback: origlistener,
-				proxiedCallback: proxylistener,
-			});
-			client.eventcallbacks.set(ctx.this, arr);
+			ctx.args[1] = wraplistener(ctx.args[1]);
 		},
 	});
 
@@ -153,18 +161,8 @@ export default function (client: ScramjetClient, self: Self) {
 		apply(ctx) {
 			if (typeof ctx.args[1] !== "function") return;
 
-			const arr = client.eventcallbacks.get(ctx.this);
-			if (!arr) return;
-
-			const i = arr.findIndex(
-				(e) => e.event === ctx.args[0] && e.originalCallback === ctx.args[1]
-			);
-			if (i === -1) return;
-
-			const r = arr.splice(i, 1);
-			client.eventcallbacks.set(ctx.this, arr);
-
-			ctx.args[1] = r[0].proxiedCallback;
+			// keep capture/options in args[2] untouched: the native call matches on them
+			ctx.args[1] = proxiedListeners.get(ctx.args[1]) ?? ctx.args[1];
 		},
 	});
 
