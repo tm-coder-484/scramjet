@@ -18,6 +18,7 @@ import { rewriteBody } from "./body";
 import { Tap } from "@/Tap";
 import {
 	computeFetchSite,
+	rewriteContentDisposition,
 	rewriteRequestHeaders,
 	rewriteResponseHeaders,
 	worstFetchSite,
@@ -144,11 +145,19 @@ export async function doHandleFetch(
 		if (initiatorOriginUrl)
 			location.searchParams.set(QP.initiatorOrigin, initiatorOriginUrl.origin);
 		if (parsed.isModule) location.searchParams.set(QP.isModule, "module");
+		if (parsed.downloadName !== undefined)
+			location.searchParams.set(QP.download, parsed.downloadName);
 
 		responseHeaders.set("location", location.href);
 	}
 
-	if (response.body && !isRedirect(response)) {
+	let status = response.status;
+	if (!isRedirect(response)) {
+		status = rewriteContentDisposition(parsed, responseHeaders, status);
+		if (status === 204 && response.body) response.body.cancel().catch(() => {});
+	}
+
+	if (response.body && !isRedirect(response) && status !== 204) {
 		responseBody = await rewriteBody(handler, request, parsed, response);
 
 		// After rewriting HTML, the body is a JS string which will be encoded as
@@ -165,8 +174,8 @@ export async function doHandleFetch(
 		response: {
 			body: responseBody,
 			headers: responseHeaders,
-			status: response.status,
-			statusText: response.statusText,
+			status,
+			statusText: status === response.status ? response.statusText : "",
 		},
 	};
 
@@ -256,8 +265,11 @@ async function handleBlobOrDataUrlFetch(
 		);
 	}
 
+	const headers = ScramjetHeaders.fromRawHeaders(response.rawHeaders);
+	const status = rewriteContentDisposition(parsed, headers, response.status);
+
 	let body: BodyType;
-	if (response.body) {
+	if (response.body && status !== 204) {
 		body = await rewriteBody(
 			handler,
 			request,
@@ -265,8 +277,6 @@ async function handleBlobOrDataUrlFetch(
 			response as BareResponse
 		);
 	}
-	const headers = ScramjetHeaders.fromRawHeaders(response.rawHeaders);
-
 	// blob urls actually *can* set charsets, so we need to normalize them if it goes down the html path
 	normalizeContentType(parsed, headers);
 
@@ -279,8 +289,8 @@ async function handleBlobOrDataUrlFetch(
 
 	return {
 		body,
-		status: response.status,
-		statusText: response.statusText,
+		status,
+		statusText: status === response.status ? response.statusText : "",
 		headers: headers,
 	};
 }

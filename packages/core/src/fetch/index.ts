@@ -61,6 +61,8 @@ export interface ScramjetFetchParsed {
 	meta: URLMeta;
 	isModule: boolean;
 	isFakeDataURL: boolean;
+	// set when the request came from an <a download> link: the value of its download attribute
+	downloadName?: string;
 	referrerPolicy?: string;
 	trackedClient?: ScramjetFetchTrackedClient;
 }

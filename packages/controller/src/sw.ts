@@ -3,6 +3,7 @@
 import { RpcHelper } from "@mercuryworkshop/rpc";
 import type { Controllerbound, SWbound } from "./types";
 import type { RawHeaders } from "@mercuryworkshop/proxy-transports";
+import { DEFAULT_PREFIX } from "./symbols";
 
 function makeId(): string {
 	return Math.random().toString(36).substring(2, 10);
@@ -143,6 +144,31 @@ class ControllerReference {
 
 const tabs: ControllerReference[] = [];
 
+// When the browser restarts an idle service worker, `tabs` is empty until each
+// controller answers the revive message at the bottom of this file. Requests
+// that arrive in that window (often the one that woke the worker up) must
+// wait for their controller instead of falling through to the network and 404ing.
+const knownPrefixes = new Set<string>([DEFAULT_PREFIX]);
+const tabWaiters: (() => void)[] = [];
+const TAB_WAIT_TIMEOUT = 5000;
+
+function findTab(url: URL): ControllerReference | undefined {
+	return tabs.find((tab) => url.pathname.startsWith(tab.prefix));
+}
+
+async function waitForTab(url: URL): Promise<ControllerReference | undefined> {
+	const deadline = Date.now() + TAB_WAIT_TIMEOUT;
+	let tab = findTab(url);
+	while (!tab && Date.now() < deadline) {
+		await new Promise<void>((resolve) => {
+			tabWaiters.push(resolve);
+			setTimeout(resolve, deadline - Date.now());
+		});
+		tab = findTab(url);
+	}
+	return tab;
+}
+
 addEventListener("message", (e) => {
 	if (!e.data) return;
 	if (typeof e.data != "object") return;
@@ -155,18 +181,30 @@ addEventListener("message", (e) => {
 		tabs.splice(existing, 1);
 	}
 	tabs.push(new ControllerReference(init.prefix, init.id, e.ports[0]));
+
+	// the controller prefix is Config.prefix + id + "/"
+	const prefix: string = init.prefix;
+	knownPrefixes.add(
+		prefix.slice(0, prefix.lastIndexOf("/", prefix.length - 2) + 1)
+	);
+	for (const resolve of tabWaiters.splice(0)) resolve();
 });
 
 export function shouldRoute(event: FetchEvent): boolean {
 	const url = new URL(event.request.url);
-	const tab = tabs.find((tab) => url.pathname.startsWith(tab.prefix));
-	return tab !== undefined;
+	if (findTab(url)) return true;
+	for (const prefix of knownPrefixes) {
+		if (url.pathname.startsWith(prefix)) return true;
+	}
+	return false;
 }
 
 export async function route(event: FetchEvent): Promise<Response> {
 	try {
 		const url = new URL(event.request.url);
-		const tab = tabs.find((tab) => url.pathname.startsWith(tab.prefix))!;
+		const tab = await waitForTab(url);
+		// no controller owns this url (e.g. it belonged to a page that's gone); behave as if unrouted
+		if (!tab) return await fetch(event.request);
 		const client = await clients.get(event.clientId);
 
 		const rawheaders: RawHeaders = [...event.request.headers];
@@ -224,7 +262,10 @@ setTimeout(async () => {
 	console.log("service worker activated, notifying clients to revive");
 	for (const client of await clients.matchAll()) {
 		client.postMessage({
-			$controller$swrevive: {},
+			$controller$swrevive: {
+				// controllers that already registered with this instance don't need to again
+				known: tabs.map((tab) => tab.id),
+			},
 		});
 	}
 	// short delay is apparently needed

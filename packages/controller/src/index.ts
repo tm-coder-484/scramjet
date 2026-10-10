@@ -20,7 +20,7 @@ import {
 	type TrackedHistoryState,
 	Plugin,
 } from "@mercuryworkshop/scramjet";
-import { CONTROLLERFRAME } from "./symbols";
+import { CONTROLLERFRAME, DEFAULT_PREFIX } from "./symbols";
 import type {
 	FrameInitHooks,
 	SerializedCookieSyncEntry,
@@ -46,7 +46,7 @@ export type Config = {
 };
 
 export const config: Config = {
-	prefix: "/~/sj/",
+	prefix: DEFAULT_PREFIX,
 	scramjetPath: "/scramjet/scramjet.js",
 	injectPath: "/controller/controller.inject.js",
 	wasmPath: "/scramjet/scramjet.wasm",
@@ -514,9 +514,12 @@ export class Controller {
 			}
 
 			if (e.data.$controller$swrevive) {
-				// if we just spawned the service worker, it will send this even though it's not actually dead
-				// TODO: pretty jank, fix at some point
-				if (this.guardServiceWorkerRevive) {
+				const known = e.data.$controller$swrevive.known;
+				if (Array.isArray(known)) {
+					if (known.includes(this.id)) return;
+				} else if (this.guardServiceWorkerRevive) {
+					// older service workers don't say who they know. if we just spawned it,
+					// it will send this even though it's not actually dead
 					return;
 				}
 				this.setupMessagePort();

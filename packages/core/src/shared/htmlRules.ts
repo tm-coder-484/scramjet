@@ -4,6 +4,23 @@ import { rewriteUrl, unrewriteBlob, URLMeta } from "@rewriters/url";
 import { ScramjetContext } from "@/shared";
 import { _URL } from "./snapshot";
 
+// browsers ignore the download attribute on cross-origin links (they're navigated instead)
+function sameOriginDownload(
+	value: string,
+	meta: URLMeta,
+	download: string | undefined
+): string | undefined {
+	if (download === undefined) return undefined;
+	try {
+		const url = new _URL(value, meta.base);
+		if (url.protocol === "data:" || url.origin === meta.origin.origin)
+			return download;
+	} catch {
+		// unparseable hrefs aren't followed at all
+	}
+	return undefined;
+}
+
 export const htmlRules: {
 	[key: string]: "*" | string[] | ((...any: any[]) => string | null);
 	fn: (
@@ -19,12 +36,29 @@ export const htmlRules: {
 
 		// url rewrites
 		src: ["embed", "img", "frame", "input", "track"],
-		href: ["a", "area", "image"],
+		href: ["image"],
 		data: ["object"],
 		action: ["form"],
 		formaction: ["button", "input", "textarea", "submit"],
 		poster: ["video"],
 		"xlink:href": ["image"],
+	},
+	{
+		fn: (value, context, meta, attrs) =>
+			rewriteUrl(value, context, meta, {
+				navigateType: "location",
+				download: sameOriginDownload(value, meta, attrs?.download),
+			}),
+
+		href: ["a", "area"],
+	},
+	{
+		// browsers fetch <a download> links without going through the service worker, which 404s.
+		// the attribute is hidden from the real DOM and the href is marked for download instead (see above).
+		// cross-origin links keep navigating like they would natively
+		fn: () => null,
+
+		download: ["a", "area"],
 	},
 	{
 		fn: (value, context, meta, attrs) => {

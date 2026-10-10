@@ -1,4 +1,5 @@
 import {
+	isHtmlMimeType,
 	rewriteUrl,
 	ScramjetContext,
 	ScramjetHeaders,
@@ -525,4 +526,79 @@ function registrableDomain(hostname: string): string {
 
 	// For longer hostnames, use the last two labels as a rough eTLD+1
 	return labels.slice(-2).join(".");
+}
+
+function encodeFilename(name: string) {
+	// RFC 8187 ext-value; encodeURIComponent leaves a few characters that aren't attr-chars
+	return (
+		"UTF-8''" +
+		encodeURIComponent(name).replace(
+			/['()*]/g,
+			(c) => "%" + c.charCodeAt(0).toString(16).toUpperCase()
+		)
+	);
+}
+
+function filenameFromUrl(url: URL) {
+	if (url.protocol === "data:") return "download";
+	const segments = url.pathname.split("/");
+	const name = segments[segments.length - 1];
+	try {
+		return decodeURIComponent(name);
+	} catch {
+		return name;
+	}
+}
+
+/**
+ * Without this, a browser saving a proxied response names the file after the
+ * proxy url (e.g. "https___example.com_file.zip").
+ * - <a download> requests (see QP.download) are forced to download. Filename
+ *   precedence matches browsers: the server's, then the download attribute's,
+ *   then the url's. Unsuccessful ones become 204 so the page stays put.
+ * - Other navigations keep the browser's render-or-download decision and only
+ *   gain a filename.
+ */
+export function rewriteContentDisposition(
+	parsed: ScramjetFetchParsed,
+	headers: ScramjetHeaders,
+	status: number
+): number {
+	const disposition = headers.get("content-disposition");
+	const hasFilename = !!disposition && /filename\*?\s*=/i.test(disposition);
+
+	if (parsed.downloadName !== undefined) {
+		if (status < 200 || status > 299) return 204;
+		if (hasFilename) {
+			headers.set(
+				"content-disposition",
+				disposition.replace(/^[^;]*/, "attachment")
+			);
+		} else {
+			const name = parsed.downloadName || filenameFromUrl(parsed.url);
+			headers.set(
+				"content-disposition",
+				name ? `attachment; filename*=${encodeFilename(name)}` : "attachment"
+			);
+		}
+		return status;
+	}
+
+	if (
+		(parsed.destination === "document" || parsed.destination === "iframe") &&
+		status >= 200 &&
+		status <= 299 &&
+		!hasFilename &&
+		!isHtmlMimeType(headers.get("content-type") ?? "")
+	) {
+		const name = filenameFromUrl(parsed.url);
+		if (name) {
+			const type = disposition ? disposition.split(";")[0].trim() : "inline";
+			headers.set(
+				"content-disposition",
+				`${type || "inline"}; filename*=${encodeFilename(name)}`
+			);
+		}
+	}
+	return status;
 }

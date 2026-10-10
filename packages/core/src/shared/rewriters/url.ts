@@ -27,6 +27,8 @@ export type RewriteUrlOptions = {
 	mode?: string;
 	credentials?: string;
 	destination?: RequestDestination;
+	// the download attribute of the <a> this url is for
+	download?: string;
 };
 
 export type URLMeta = {
@@ -36,6 +38,21 @@ export type URLMeta = {
 	parentFrameName?: string;
 	referrerPolicy?: string;
 };
+
+// browsers fetch <a download> links without going through the service worker,
+// so they are rewritten into navigations tagged with this marker instead
+function downloadMarker(options?: RewriteUrlOptions, separator = "?") {
+	if (options?.download === undefined) return "";
+	return separator + QP.download + "=" + encodeURIComponent(options.download);
+}
+
+function stripDownloadMarker(url: string) {
+	const idx = Math.max(
+		url.lastIndexOf("?" + QP.download + "="),
+		url.lastIndexOf("&" + QP.download + "=")
+	);
+	return idx === -1 ? url : url.slice(0, idx);
+}
 
 function tryCanParseURL(url: string, origin?: string | URL): _URL | null {
 	try {
@@ -133,7 +150,7 @@ export function rewriteUrl(
 			)
 		);
 	} else if (String_startsWith(url, "blob:")) {
-		return context.prefix.href + url;
+		return context.prefix.href + url + downloadMarker(options);
 	} else if (String_startsWith(url, "data:")) {
 		const URL_MAX_LENGTH = 1024 * 1024 * 2;
 		const BUFFER = 1024;
@@ -146,11 +163,12 @@ export function rewriteUrl(
 				rewriteBlob(objectUrl, context, meta) +
 				"?" +
 				QP.fakeDataURL +
-				"=1"
+				"=1" +
+				downloadMarker(options, "&")
 			);
 		}
 
-		return context.prefix.href + url;
+		return context.prefix.href + url + downloadMarker(options);
 	} else if (
 		String_startsWith(url, "mailto:") ||
 		String_startsWith(url, "about:")
@@ -189,6 +207,8 @@ export function rewriteUrl(
 			paramsInit.set(QP.credentials, options.credentials);
 		if (options?.destination)
 			paramsInit.set(QP.destination, options.destination);
+		if (options?.download !== undefined)
+			paramsInit.set(QP.download, options.download);
 
 		// specific tracking for sec-fetch-site
 		// don't send for the top level controller calling it in go()
@@ -217,9 +237,9 @@ export function unrewriteUrl(url: string | URL, context: ScramjetContext) {
 		// realistically this shouldn't happen
 		return url;
 	} else if (String_startsWith(url, context.prefix.href + "blob:")) {
-		return url.substring(context.prefix.href.length);
+		return stripDownloadMarker(url.substring(context.prefix.href.length));
 	} else if (String_startsWith(url, context.prefix.href + "data:")) {
-		return url.substring(context.prefix.href.length);
+		return stripDownloadMarker(url.substring(context.prefix.href.length));
 	} else if (
 		String_startsWith(url, "mailto:") ||
 		String_startsWith(url, "about:")

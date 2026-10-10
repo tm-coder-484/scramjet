@@ -21,6 +21,7 @@ export const QP = {
 	fetchSite: "$fs",
 	crossSiteRedirect: "$csr",
 	fakeDataURL: "$fakedataurl",
+	download: "$dl",
 } as const;
 
 export type QueryParamKey = keyof typeof QP;
@@ -105,14 +106,18 @@ export function parseRequest(
 			? params.fetchSite
 			: undefined;
 
-	const fetchMode = ["cors", "no-cors", "same-origin", "navigate"].includes(
-		params.mode
-	)
-		? params.mode
-		: undefined;
+	const fetchMode =
+		params.download !== undefined
+			? "navigate"
+			: ["cors", "no-cors", "same-origin", "navigate"].includes(params.mode)
+				? params.mode
+				: undefined;
+	// <a download> navigations: browsers send these with an empty destination
 	const destination =
-		(params.destination as RequestDestination | undefined) ||
-		request.rawDestination;
+		params.download !== undefined
+			? ""
+			: (params.destination as RequestDestination | undefined) ||
+				request.rawDestination;
 
 	const meta: URLMeta = {
 		origin: url,
@@ -139,6 +144,7 @@ export function parseRequest(
 		destination,
 		isIframe: params.isIframe === "1",
 		isFakeDataURL: params.fakeDataURL === "1",
+		downloadName: params.download,
 	};
 
 	if (request.rawClientUrl) {

@@ -92,7 +92,18 @@ function collectAttributeMap(
 		client.natives.call("Element.prototype.getAttributeNames", element) ?? [];
 
 	for (const attrName of attrNames) {
-		if (String(attrName).startsWith("scramjet-attr")) continue;
+		if (String(attrName).startsWith("scramjet-attr-")) {
+			// attributes whose rule returned null only exist as scramjet-attr-*
+			const original = String(attrName).slice("scramjet-attr-".length);
+			if (!attrNames.includes(original)) {
+				attrs[original.toLowerCase()] = client.natives.call(
+					"Element.prototype.getAttribute",
+					element,
+					attrName
+				);
+			}
+			continue;
+		}
 		const value = client.natives.call(
 			"Element.prototype.getAttribute",
 			element,
@@ -106,7 +117,48 @@ function collectAttributeMap(
 	return attrs;
 }
 
+function findRule(name: string, tagName: string) {
+	return htmlRules.find((rule) => {
+		const r = rule[name.toLowerCase()];
+		if (!r) return false;
+		if (r === "*") return true;
+		if (typeof r === "function") return false; // this can't happen but ts
+
+		return r.includes(tagName.toLowerCase());
+	});
+}
+
+function isDownloadAttribute(element: Element, name: string) {
+	const tagName = element.tagName.toLowerCase();
+	return (
+		String(name).toLowerCase() === "download" &&
+		(tagName === "a" || tagName === "area")
+	);
+}
+
 export default function (client: ScramjetClient, self: typeof window) {
+	// the rewritten href of an <a> depends on its download attribute, so redo it when that changes
+	function refreshDownloadHref(element: Element) {
+		const href = client.natives.call(
+			"Element.prototype.getAttribute",
+			element,
+			"scramjet-attr-href"
+		);
+		if (href === null) return;
+		const rule = findRule("href", element.tagName);
+		client.natives.call(
+			"Element.prototype.setAttribute",
+			element,
+			"href",
+			rule.fn(
+				href,
+				client.context,
+				client.meta,
+				collectAttributeMap(client, element, "href", href)
+			)
+		);
+	}
+
 	const attrObject = {
 		nonce: [self.HTMLElement],
 		integrity: [self.HTMLScriptElement, self.HTMLLinkElement],
@@ -268,6 +320,12 @@ export default function (client: ScramjetClient, self: typeof window) {
 			const cleaned = attrNames.filter(
 				(attr) => !attr.startsWith("scramjet-attr")
 			);
+			for (const attr of attrNames) {
+				if (!attr.startsWith("scramjet-attr-")) continue;
+				const original = attr.slice("scramjet-attr-".length);
+				if (original !== "script-source-src" && !cleaned.includes(original))
+					cleaned.push(original);
+			}
 
 			ctx.return(cleaned);
 		},
@@ -282,8 +340,17 @@ export default function (client: ScramjetClient, self: typeof window) {
 
 	client.Proxy("Element.prototype.hasAttribute", {
 		apply(ctx) {
-			if (String(ctx.args[0]).startsWith("scramjet-attr"))
-				return ctx.return(false);
+			const name = String(ctx.args[0]);
+			if (name.startsWith("scramjet-attr")) return ctx.return(false);
+			if (
+				!ctx.call() &&
+				client.natives.call(
+					"Element.prototype.hasAttribute",
+					ctx.this,
+					`scramjet-attr-${name}`
+				)
+			)
+				ctx.return(true);
 		},
 	});
 
@@ -318,6 +385,8 @@ export default function (client: ScramjetClient, self: typeof window) {
 						name
 					);
 					ctx.fn.call(ctx.this, `scramjet-attr-${name}`, value);
+					if (isDownloadAttribute(ctx.this, name))
+						refreshDownloadHref(ctx.this);
 					ctx.return(undefined);
 
 					return;
@@ -361,6 +430,16 @@ export default function (client: ScramjetClient, self: typeof window) {
 					`scramjet-attr-${ctx.args[1]}`,
 					value
 				);
+				if (ctx.args[2] == null) {
+					client.natives.call(
+						"Element.prototype.removeAttribute",
+						ctx.this,
+						name
+					);
+					if (isDownloadAttribute(ctx.this, name))
+						refreshDownloadHref(ctx.this);
+					ctx.return(undefined);
+				}
 			}
 		},
 	});
@@ -391,10 +470,20 @@ export default function (client: ScramjetClient, self: typeof window) {
 		apply(ctx) {
 			const name = String(ctx.args[0]);
 			if (name.startsWith("scramjet-attr")) return ctx.return(undefined);
+			const hidden = client.natives.call(
+				"Element.prototype.hasAttribute",
+				ctx.this,
+				`scramjet-attr-${name}`
+			);
 			if (
+				hidden ||
 				client.natives.call("Element.prototype.hasAttribute", ctx.this, name)
 			) {
 				ctx.fn.call(ctx.this, `scramjet-attr-${ctx.args[0]}`);
+			}
+			if (hidden && isDownloadAttribute(ctx.this, name)) {
+				ctx.call();
+				refreshDownloadHref(ctx.this);
 			}
 		},
 	});
@@ -403,13 +492,52 @@ export default function (client: ScramjetClient, self: typeof window) {
 		apply(ctx) {
 			const name = String(ctx.args[0]);
 			if (name.startsWith("scramjet-attr")) return ctx.return(false);
-			if (
-				client.natives.call("Element.prototype.hasAttribute", ctx.this, name)
-			) {
-				ctx.fn.call(ctx.this, `scramjet-attr-${ctx.args[0]}`);
+			const real = client.natives.call(
+				"Element.prototype.hasAttribute",
+				ctx.this,
+				name
+			);
+			const hidden =
+				!real &&
+				client.natives.call(
+					"Element.prototype.hasAttribute",
+					ctx.this,
+					`scramjet-attr-${name}`
+				);
+			if (hidden || findRule(name, ctx.this.tagName)) {
+				// go through set/removeAttribute so the rewrite rules apply
+				const present = real || hidden;
+				const force = ctx.args.length > 1 ? !!ctx.args[1] : !present;
+				if (force !== present) {
+					if (force) ctx.this.setAttribute(name, "");
+					else ctx.this.removeAttribute(name);
+				}
+				return ctx.return(force);
+			}
+			if (real) {
+				client.natives.call(
+					"Element.prototype.removeAttribute",
+					ctx.this,
+					`scramjet-attr-${name}`
+				);
 			}
 		},
 	});
+
+	client.Trap(
+		[
+			"HTMLAnchorElement.prototype.download",
+			"HTMLAreaElement.prototype.download",
+		],
+		{
+			get(ctx) {
+				return ctx.this.getAttribute("download") ?? "";
+			},
+			set(ctx, value) {
+				ctx.this.setAttribute("download", value);
+			},
+		}
+	);
 
 	client.Trap("Element.prototype.innerHTML", {
 		set(ctx, value: string) {
