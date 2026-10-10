@@ -78,6 +78,7 @@ export default function (client: ScramjetClient, self: Self) {
 	const proxiedListeners = new _WeakMap() as WeakMap<Listener, Listener>;
 	// the event currently being dispatched to a wrapped listener (backs window.event)
 	let currentEvent: Event | undefined;
+	let windowEventDefined = false;
 
 	function wraplistener(listener: Listener): Listener {
 		const existing = proxiedListeners.get(listener);
@@ -125,7 +126,11 @@ export default function (client: ScramjetClient, self: Self) {
 					}
 				}
 
-				if (!self.event) {
+				// only where the browser doesn't provide it (e.g. workers), and only once:
+				// our getter reads undefined between dispatches, so checking self.event
+				// alone would redefine it on every call (e.g. every pointer move)
+				if (!windowEventDefined && !self.event) {
+					windowEventDefined = true;
 					Object_defineProperty(self, "event", {
 						get() {
 							return currentEvent;
