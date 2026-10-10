@@ -19,13 +19,19 @@ import {
 	ScramjetClient,
 	setWasm,
 	Tap,
+	WORKERTRANSPORT,
 	type CookieSyncOptions,
+	type ScramjetClientInit,
 	type ScramjetConfig,
 	type ScramjetContext,
 	type TrackedHistoryState,
 } from "@mercuryworkshop/scramjet";
 
 const MessagePort_postMessage = MessagePort.prototype.postMessage;
+// grabbed before the client hooks these, for the worker transport handoff
+const EventTarget_addEventListener = EventTarget.prototype.addEventListener;
+const EventTarget_removeEventListener =
+	EventTarget.prototype.removeEventListener;
 const postMessage = (
 	port: MessagePort,
 	data: any,
@@ -47,7 +53,10 @@ class RemoteTransport implements ProxyTransport {
 	}
 
 	private rpc: RpcHelper<ControllerToTransport, TransportToController>;
-	constructor(public port: MessagePort) {
+	public port: MessagePort | null = null;
+	// calls made before a worker receives its port
+	private queued: [any, Transferable[]][] = [];
+	constructor(port?: MessagePort) {
 		this.rpc = new RpcHelper<ControllerToTransport, TransportToController>(
 			{
 				ready: async () => {
@@ -56,9 +65,15 @@ class RemoteTransport implements ProxyTransport {
 			},
 			"transport",
 			(data, transfer) => {
-				postMessage(port, data, transfer);
+				if (this.port) postMessage(this.port, data, transfer);
+				else this.queued.push([data, transfer]);
 			}
 		);
+		if (port) this.attach(port);
+	}
+
+	attach(port: MessagePort) {
+		this.port = port;
 		port.onmessageerror = (ev) => {
 			console.error("onmessageerror (this should never happen!)", ev);
 		};
@@ -66,6 +81,16 @@ class RemoteTransport implements ProxyTransport {
 			this.rpc.recieve(ev.data);
 		};
 		port.start();
+		for (const [data, transfer] of this.queued)
+			postMessage(port, data, transfer);
+		this.queued = [];
+	}
+
+	/** a port for a new transport served by the same controller, to give to a worker */
+	fork(): MessagePort {
+		const channel = new MessageChannel();
+		this.rpc.call("fork", channel.port2, [channel.port2]);
+		return channel.port1;
 	}
 	connect(
 		url: URL,
@@ -163,7 +188,8 @@ class RemoteTransport implements ProxyTransport {
 	}
 }
 
-const sw = navigator.serviceWorker.controller;
+// workers have no navigator.serviceWorker
+const sw = navigator.serviceWorker?.controller;
 
 type Init = {
 	config: Config;
@@ -193,14 +219,82 @@ export function load(init: Init) {
 		});
 		return;
 	}
+	loadWasm();
+
+	new ExecutionContextWrapper(globalThis, init);
+}
+
+type WorkerInit = {
+	sjconfig: ScramjetConfig;
+	prefix: URL;
+	cookies: string;
+	codecEncode: (input: string) => string;
+	codecDecode: (input: string) => string;
+};
+
+function loadWasm() {
 	if (!("WASM" in self)) {
 		throw new Error("WASM not found in global scope!");
 	}
-	const wasm = Uint8Array.from(atob(self.WASM), (c) => c.charCodeAt(0));
+	const wasm = Uint8Array.from(atob(self.WASM as string), (c) =>
+		c.charCodeAt(0)
+	);
 	delete (self as any).WASM;
 	setWasm(wasm);
+}
 
-	new ExecutionContextWrapper(globalThis, init);
+export function loadWorker(init: WorkerInit) {
+	if (SCRAMJETCLIENT in globalThis) return;
+	loadWasm();
+
+	// the realm that created this worker sends its transport port as the first
+	// message (see client/shared/worker.ts in core). until then requests just queue
+	const transport = new RemoteTransport();
+	const takeTransport = (target: EventTarget) => {
+		const listener = (ev: Event) => {
+			const port = (ev as MessageEvent).data?.[WORKERTRANSPORT];
+			if (!(port instanceof MessagePort)) return;
+			ev.stopImmediatePropagation();
+			EventTarget_removeEventListener.call(target, "message", listener);
+			// a shared worker gets one from every page that connects; it only needs one
+			if (transport.port) port.close();
+			else transport.attach(port);
+		};
+		EventTarget_addEventListener.call(target, "message", listener);
+	};
+	if ("SharedWorkerGlobalScope" in self) {
+		EventTarget_addEventListener.call(self, "connect", (ev: Event) =>
+			takeTransport((ev as MessageEvent).ports[0])
+		);
+	} else {
+		takeTransport(self);
+	}
+
+	const cookieJar = new CookieJar();
+	cookieJar.load(init.cookies);
+
+	// workers have no document, so none of the document-only init
+	const workerInit: Partial<ScramjetClientInit> = {
+		context: {
+			config: init.sjconfig,
+			prefix: init.prefix,
+			cookieJar,
+			interface: {
+				codecEncode: init.codecEncode,
+				codecDecode: init.codecDecode,
+			} as ScramjetContext["interface"],
+		},
+		transport,
+		sendSetCookie: async (cookies, options) => {
+			await transport.sendSetCookie(cookies, options);
+		},
+		createWorkerTransport: () => transport.fork(),
+	};
+	const client = new ScramjetClient(
+		globalThis,
+		workerInit as ScramjetClientInit
+	);
+	client.hook();
 }
 
 function createFrameId() {
@@ -341,6 +435,7 @@ class ExecutionContextWrapper {
 			shouldBlockMessageEvent: () => {
 				return false;
 			},
+			createWorkerTransport: () => this.transport.fork(),
 			hookSubcontext: (frameself) => {
 				const context = new ExecutionContextWrapper(frameself, {
 					...this.init,

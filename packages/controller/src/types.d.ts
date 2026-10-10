@@ -85,6 +85,8 @@ export type TransportToController = {
 			  }
 		),
 	];
+	// a new transport for a child realm (a worker), served by the same controller
+	fork: [MessagePort];
 };
 
 export type ControllerToTransport = {

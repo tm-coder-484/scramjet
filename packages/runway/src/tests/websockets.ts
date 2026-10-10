@@ -131,6 +131,37 @@ export default [
 		},
 	}),
 	serverTest({
+		name: "websockets-in-worker",
+		autoPass: false,
+		js: `
+			document.cookie = "wsworker=1";
+			// the socket opens synchronously at worker startup, before scramjet has handed
+			// the worker its transport
+			const src = [
+				"const socket = new WebSocket('ws://localhost:" + location.port + "');",
+				"socket.onopen = () => socket.send('ping');",
+				"socket.onmessage = (m) => postMessage({ data: m.data });",
+				"socket.onerror = () => postMessage({ error: true });",
+			].join("\\n");
+			const worker = new Worker(URL.createObjectURL(new Blob([src], { type: "text/javascript" })));
+			worker.onmessage = (e) => {
+				assert(!e.data.error, "WebSocket in a worker should connect");
+				const [message, cookie] = e.data.data.split("|");
+				assert(message === "ping", "echo should match what the worker sent");
+				assert(cookie.includes("wsworker=1"), "the handshake should carry the cookie, got " + cookie);
+				pass("WebSocket in a worker works");
+			};
+		`,
+		async start(server) {
+			const wss = new WebSocketServer({ server });
+			wss.on("connection", (socket, request) => {
+				socket.on("message", (message) => {
+					socket.send(message + "|" + (request.headers.cookie ?? ""));
+				});
+			});
+		},
+	}),
+	serverTest({
 		name: "websocketstream-sanity",
 		autoPass: false,
 		js: `

@@ -1,6 +1,16 @@
 import { ScramjetClient } from "@client/index";
+import { WORKERTRANSPORT } from "@/symbols";
 
 export default function (client: ScramjetClient, _self: GlobalThis) {
+	// worker fetches go through the service worker, but websockets need a transport.
+	// hand each new worker its own one as its first message (see loadWorker in the controller)
+	const transportMessage = (): [any, StructuredSerializeOptions] | null => {
+		const port = client.init.createWorkerTransport?.();
+		if (!port) return null;
+
+		return [{ [WORKERTRANSPORT]: port }, { transfer: [port] }];
+	};
+
 	client.Proxy("Worker", {
 		construct(ctx) {
 			ctx.args[0] = client.rewriteUrl(ctx.args[0], {
@@ -9,20 +19,9 @@ export default function (client: ScramjetClient, _self: GlobalThis) {
 			});
 
 			const worker = ctx.call();
-			// const conn = new BareMuxConnection();
-
-			// (async () => {
-			// 	const port = await conn.getInnerPort();
-			// 	client.natives.call(
-			// 		"Worker.prototype.postMessage",
-			// 		worker,
-			// 		{
-			// 			$scramjet$type: "baremuxinit",
-			// 			port,
-			// 		},
-			// 		[port]
-			// 	);
-			// })();
+			const message = transportMessage();
+			if (message)
+				client.natives.call("Worker.prototype.postMessage", worker, ...message);
 		},
 	});
 
@@ -47,20 +46,13 @@ export default function (client: ScramjetClient, _self: GlobalThis) {
 			}
 
 			const worker = ctx.call();
-			// const conn = new BareMuxConnection();
-
-			// (async () => {
-			// 	const port = await conn.getInnerPort();
-			// 	client.natives.call(
-			// 		"MessagePort.prototype.postMessage",
-			// 		worker.port,
-			// 		{
-			// 			$scramjet$type: "baremuxinit",
-			// 			port,
-			// 		},
-			// 		[port]
-			// 	);
-			// })();
+			const message = transportMessage();
+			if (message)
+				client.natives.call(
+					"MessagePort.prototype.postMessage",
+					worker.port,
+					...message
+				);
 		},
 	});
 

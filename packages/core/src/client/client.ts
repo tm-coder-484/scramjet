@@ -75,6 +75,8 @@ export type ScramjetClientInit = {
 		options?: CookieSyncOptions
 	) => Promise<void>;
 	shouldBlockMessageEvent?: (ev: MessageEvent) => boolean;
+	/** returns a transport port for a worker this realm creates, so the worker can open websockets */
+	createWorkerTransport?: () => MessagePort;
 	hookSubcontext: (self: Self, frame?: HTMLIFrameElement) => ScramjetClient;
 	initHeaders: RawHeaders;
 	history: TrackedHistoryState[];

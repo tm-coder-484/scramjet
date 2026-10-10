@@ -431,6 +431,9 @@ export class Controller {
 
 						return [await promise, []];
 					},
+					fork: async (port) => {
+						await this.methods.initRemoteTransport(port);
+					},
 				},
 				"transport",
 				(data, transfer) => port.postMessage(data, transfer)
@@ -741,34 +744,17 @@ export class Frame {
 
 					str += script(this.controller.config.scramjetPath);
 					str += script(this.prefix + this.controller.config.virtualWasmPath);
+					str += script(this.controller.config.injectPath);
 					str += script(
 						"data:text/javascript;charset=utf-8;base64," +
 							base64Encode(`
-					(()=>{
-						const { ScramjetClient, CookieJar, setWasm } = $scramjet;
-
-						setWasm(Uint8Array.from(atob(self.WASM), (c) => c.charCodeAt(0)));
-						delete self.WASM;
-
-						const sjconfig = ${JSON.stringify(this.controller.scramjetConfig)};
-						const prefix = new URL("${this.prefix}", location.href);
-
-						const context = {
-							config: sjconfig,
-							prefix,
-							interface: {
-								codecEncode: ${this.controller.config.codec.encode.toString()},
-								codecDecode: ${this.controller.config.codec.decode.toString()},
-							},
-						};
-
-						const client = new ScramjetClient(globalThis, {
-							context,
-							transport: null,
-						});
-
-						client.hook();
-					})();
+					$scramjetController.loadWorker({
+						sjconfig: ${JSON.stringify(this.controller.scramjetConfig)},
+						prefix: new URL("${this.prefix}", location.href),
+						cookies: ${JSON.stringify(this.controller.cookieJar.dump())},
+						codecEncode: ${this.controller.config.codec.encode.toString()},
+						codecDecode: ${this.controller.config.codec.decode.toString()},
+					});
 					`)
 					);
 

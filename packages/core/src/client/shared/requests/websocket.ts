@@ -66,7 +66,8 @@ export default function (client: ScramjetClient, self: GlobalThis) {
 			const barews = client.bare.createWebSocket(url, ctx.args[1], [
 				["User-Agent", self.navigator.userAgent],
 				["Origin", client.url.origin],
-				["Cookie", client.context.cookieJar.getCookies(client.url, false)],
+				// the socket's own cookies, like the browser sends (not the page's: in a blob worker that's a blob: url)
+				["Cookie", client.context.cookieJar.getCookies(rawurl, false)],
 			]);
 
 			const state: FakeWebSocketState = {
@@ -88,6 +89,9 @@ export default function (client: ScramjetClient, self: GlobalThis) {
 			}
 
 			barews.addEventListener("open", () => {
+				// the subprotocol/extensions the server picked
+				state.protocol = barews.protocol;
+				state.extensions = barews.extensions;
 				fakeEventSend(new Event("open"));
 			});
 			barews.addEventListener("close", (ev) => {
@@ -290,6 +294,8 @@ export default function (client: ScramjetClient, self: GlobalThis) {
 
 				opened: new Promise((resolve, reject) => {
 					barews.addEventListener("open", () => {
+						state.protocol = barews.protocol;
+						state.extensions = barews.extensions;
 						resolve({
 							readable: state.readable,
 							writable: state.writable,

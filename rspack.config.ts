@@ -539,8 +539,9 @@ const controllerConfig = createGenericConfig({
 		path: join(controllerdir, "dist"),
 		iife: true,
 		library: {
-			type: "var",
-			name: "$scramjetController",
+			// assigned to self, not a var, so module workers can import controller.inject.js too
+			type: "assign",
+			name: "self.$scramjetController",
 		},
 	},
 	target: "web",
