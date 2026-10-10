@@ -39,19 +39,28 @@ export type URLMeta = {
 	referrerPolicy?: string;
 };
 
+// blob: and data: urls carry the module flag and the <a download> marker in
+// their query string, since the service worker only sees the url it is given
 // browsers fetch <a download> links without going through the service worker,
-// so they are rewritten into navigations tagged with this marker instead
-function downloadMarker(options?: RewriteUrlOptions, separator = "?") {
-	if (options?.download === undefined) return "";
-	return separator + QP.download + "=" + encodeURIComponent(options.download);
+// so they are rewritten into navigations tagged with the download marker instead
+function markerQuery(options?: RewriteUrlOptions, ...extra: string[]) {
+	const params = [...extra];
+	if (options?.isModule) params.push(QP.isModule + "=module");
+	if (options?.download !== undefined)
+		params.push(QP.download + "=" + encodeURIComponent(options.download));
+	return params.length ? "?" + params.join("&") : "";
 }
 
-function stripDownloadMarker(url: string) {
-	const idx = Math.max(
-		url.lastIndexOf("?" + QP.download + "="),
-		url.lastIndexOf("&" + QP.download + "=")
-	);
-	return idx === -1 ? url : url.slice(0, idx);
+function stripMarkerQuery(url: string) {
+	let end = url.length;
+	for (const key of [QP.isModule, QP.download]) {
+		const idx = Math.max(
+			url.lastIndexOf("?" + key + "="),
+			url.lastIndexOf("&" + key + "=")
+		);
+		if (idx !== -1 && idx < end) end = idx;
+	}
+	return url.slice(0, end);
 }
 
 function tryCanParseURL(url: string, origin?: string | URL): _URL | null {
@@ -150,7 +159,7 @@ export function rewriteUrl(
 			)
 		);
 	} else if (String_startsWith(url, "blob:")) {
-		return context.prefix.href + url + downloadMarker(options);
+		return context.prefix.href + url + markerQuery(options);
 	} else if (String_startsWith(url, "data:")) {
 		const URL_MAX_LENGTH = 1024 * 1024 * 2;
 		const BUFFER = 1024;
@@ -161,14 +170,11 @@ export function rewriteUrl(
 			return (
 				context.prefix.href +
 				rewriteBlob(objectUrl, context, meta) +
-				"?" +
-				QP.fakeDataURL +
-				"=1" +
-				downloadMarker(options, "&")
+				markerQuery(options, QP.fakeDataURL + "=1")
 			);
 		}
 
-		return context.prefix.href + url + downloadMarker(options);
+		return context.prefix.href + url + markerQuery(options);
 	} else if (
 		String_startsWith(url, "mailto:") ||
 		String_startsWith(url, "about:")
@@ -237,9 +243,9 @@ export function unrewriteUrl(url: string | URL, context: ScramjetContext) {
 		// realistically this shouldn't happen
 		return url;
 	} else if (String_startsWith(url, context.prefix.href + "blob:")) {
-		return stripDownloadMarker(url.substring(context.prefix.href.length));
+		return stripMarkerQuery(url.substring(context.prefix.href.length));
 	} else if (String_startsWith(url, context.prefix.href + "data:")) {
-		return stripDownloadMarker(url.substring(context.prefix.href.length));
+		return stripMarkerQuery(url.substring(context.prefix.href.length));
 	} else if (
 		String_startsWith(url, "mailto:") ||
 		String_startsWith(url, "about:")
