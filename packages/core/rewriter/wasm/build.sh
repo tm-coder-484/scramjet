@@ -42,7 +42,9 @@ fi
 	if [ "${OPTIMIZE_FOR_SPEED:-0}" = "0" ]; then
 		STD_FEATURES="${STD_FEATURES},optimize_for_size"
 	fi
-	cargo +nightly build --release --target wasm32-unknown-unknown \
+	# no +nightly: that bypasses ../rust-toolchain.toml, so rustup wouldn't install its
+	# rust-src component and wasm target (needed for -Z build-std) on a fresh setup
+	cargo build --release --target wasm32-unknown-unknown \
 		-Z build-std=panic_abort,std -Z build-std-features=${STD_FEATURES} \
 		--no-default-features --features "$FEATURES"
 )
