@@ -242,6 +242,32 @@ export default [
 		`,
 	}),
 	basicTest({
+		// a <base> url is resolved against the document url when the base is processed and
+		// then frozen: pushState/replaceState don't move it. GeForce NOW's lazy chunks are
+		// relative to <base href="#"> and load after it replaceStates a share url.
+		name: "elurls-base-href-frozen",
+		js: `
+			const original = location.href;
+			history.replaceState(null, "", "/deep/page.html");
+			const b = document.createElement("base");
+			b.setAttribute("href", "sub/");
+			document.head.prepend(b);
+			const resolve = () => {
+				const s = document.createElement("script");
+				s.src = "chunk.js";
+				return new URL(s.src).pathname;
+			};
+			assertEqual(resolve(), "/deep/sub/chunk.js", "relative base href resolves against the document url");
+			history.replaceState(null, "", "/elsewhere/other.html");
+			assertEqual(resolve(), "/deep/sub/chunk.js", "base url stays frozen across replaceState");
+			assertEqual(new URL(document.baseURI).pathname, "/deep/sub/", "baseURI stays frozen");
+			b.setAttribute("href", "next/");
+			assertEqual(resolve(), "/elsewhere/next/chunk.js", "changing href re-resolves against the current url");
+			b.remove();
+			history.replaceState(null, "", original);
+		`,
+	}),
+	basicTest({
 		name: "elurls-picture-source-selection",
 		js: `
 			const p = document.createElement("picture");

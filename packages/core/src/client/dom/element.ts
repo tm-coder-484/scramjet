@@ -277,6 +277,8 @@ export default function (client: ScramjetClient, self: typeof window) {
 			const doc = client.box.instanceof(node, "Document")
 				? (node as Document)
 				: node.ownerDocument;
+			if (doc === client.global.document) return client.meta.base.href;
+
 			const base = doc?.querySelector("base[href]") as HTMLBaseElement | null;
 
 			if (base) {

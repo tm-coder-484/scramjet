@@ -353,29 +353,66 @@ export class ScramjetClient {
 		};
 		// eslint-disable-next-line @typescript-eslint/no-this-alias
 		const client = this;
+		// the url of the first <base href>, resolved when it was last processed
+		let frozenBase: {
+			element: HTMLBaseElement;
+			href: string;
+			count: number;
+			url: string;
+		} | null = null;
 		this.meta = {
 			get origin() {
 				return client.url;
 			},
 			get base() {
-				if (iswindow) {
-					const base = client.natives.call(
-						"Document.prototype.querySelector",
-						client.global.document,
-						"base"
-					);
-					if (base) {
-						let url = base.getAttribute("href");
-						if (!url) return client.url;
-						const frag = url.indexOf("#");
-						url = url.substring(0, frag === -1 ? undefined : frag);
-						if (!url) return client.url;
+				if (!iswindow) return client.url;
 
-						return new _URL(url, client.url.origin);
+				const bases = client.natives.call(
+					"Document.prototype.getElementsByTagName",
+					client.global.document,
+					"base"
+				);
+				let base: HTMLBaseElement | null = null;
+				for (let i = 0; i < bases.length; i++) {
+					if (bases[i].hasAttribute("href")) {
+						base = bases[i] as HTMLBaseElement;
+						break;
 					}
 				}
+				if (!base) {
+					frozenBase = null;
+					return client.url;
+				}
 
-				return client.url;
+				// like the browser, resolve the base href against the document url only when the
+				// base is processed (inserted, href changed, bases added or removed), so a later
+				// pushState/replaceState doesn't move it (GeForce NOW's lazy chunks rely on this)
+				const href = base.getAttribute("href");
+				if (
+					frozenBase?.element !== base ||
+					frozenBase.href !== href ||
+					frozenBase.count !== bases.length
+				) {
+					let url = client.url;
+					try {
+						const parsed = new _URL(href, url);
+						if (
+							parsed.protocol !== "data:" &&
+							parsed.protocol !== "javascript:"
+						)
+							url = parsed;
+					} catch {
+						// an invalid href falls back to the document url
+					}
+					frozenBase = {
+						element: base,
+						href,
+						count: bases.length,
+						url: url.href,
+					};
+				}
+
+				return new _URL(frozenBase.url);
 			},
 			// TODO: very bad assumptions made here, window.parent never throws
 			get topFrameName() {
