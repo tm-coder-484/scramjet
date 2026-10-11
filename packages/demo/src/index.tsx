@@ -9,6 +9,46 @@ import { demoSettingsStore, getWebrtcRelay } from "./store";
 
 let app = document.getElementById("app")!;
 
+// Retries of a proxied url that the service worker missed, shared by this tab's documents.
+// A count older than RETRY_WINDOW_MS starts over, so the limit only bounds a burst of failures.
+const RETRY_KEY = "scramjet-proxy-retry";
+const MAX_RETRIES = 3;
+const RETRY_WINDOW_MS = 30000;
+
+function takeRetry(): boolean {
+	try {
+		const [count, at] = (sessionStorage.getItem(RETRY_KEY) ?? "0|0").split("|");
+		const n = Date.now() - Number(at) < RETRY_WINDOW_MS ? Number(count) : 0;
+		if (n >= MAX_RETRIES) return false;
+		sessionStorage.setItem(RETRY_KEY, `${n + 1}|${Date.now()}`);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// This app must never mount inside its own site frame: the frame then shows a second omnibox.
+function isNestedInDemo(): boolean {
+	if (window.parent === window) return false;
+	try {
+		return !!window.parent.document.querySelector("form.url-form");
+	} catch {
+		return false;
+	}
+}
+
+// Retry the frame's url through the service worker, which handles it after a reload.
+function recoverNestedDemo() {
+	if (!takeRetry() || !navigator.serviceWorker) {
+		app.innerText =
+			"Could not load this page through the proxy. Reload the tab to try again.";
+		return;
+	}
+	navigator.serviceWorker.ready.then(() =>
+		setTimeout(() => location.reload(), 1000)
+	);
+}
+
 let controller: InstanceType<typeof Controller>;
 const cachePlugin = new HttpCachePlugin();
 
@@ -129,5 +169,9 @@ async function mount() {
 	}
 }
 
-init().then(() => mount());
+if (isNestedInDemo()) {
+	recoverNestedDemo();
+} else {
+	init().then(() => mount());
+}
 export { controller, cachePlugin };

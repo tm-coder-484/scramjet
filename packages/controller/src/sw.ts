@@ -260,7 +260,9 @@ addEventListener("activate", (event: ExtendableEvent) => {
 // notify all clients to send over their messageports again
 setTimeout(async () => {
 	console.log("service worker activated, notifying clients to revive");
-	for (const client of await clients.matchAll()) {
+	// includeUncontrolled: a hard reload (Ctrl+Shift+R) leaves the page without a
+	// controller, but its Controller still owns a tab channel that must be revived
+	for (const client of await clients.matchAll({ includeUncontrolled: true })) {
 		client.postMessage({
 			$controller$swrevive: {
 				// controllers that already registered with this instance don't need to again
