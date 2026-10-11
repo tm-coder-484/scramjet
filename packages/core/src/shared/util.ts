@@ -55,12 +55,5 @@ export const base64ToBytes: (text: string) => Uint8Array =
 		: base64ToBytesFallback;
 
 export function base64Encode(text: string) {
-	return btoa(
-		TextEncoder_encode(text)
-			.reduce(
-				(data, byte) => (data.push(String_fromCharCode(byte)), data),
-				[] as any
-			)
-			.join("")
-	);
+	return bytesToBase64(TextEncoder_encode(text));
 }

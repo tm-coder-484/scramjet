@@ -6,7 +6,7 @@ import type {
 
 import { RpcHelper } from "@mercuryworkshop/rpc";
 import type { Config } from ".";
-import { CONTROLLERFRAME } from "./symbols";
+import { CONTROLLERFRAME, WASM_DIGEST, WASM_MODULE } from "./symbols";
 import type {
 	SerializedCookieSyncEntry,
 	ControllerToTransport,
@@ -219,7 +219,9 @@ export function load(init: Init) {
 		});
 		return;
 	}
-	loadWasm();
+	// the host's wasmPath, on the host origin. location is no base here: a srcdoc or about:blank
+	// frame has none, while the prefix is always the absolute proxy url
+	loadWasm(new URL(init.config.wasmPath, init.prefix).href);
 
 	new ExecutionContextWrapper(globalThis, init);
 }
@@ -232,22 +234,81 @@ type WorkerInit = {
 	codecDecode: (input: string) => string;
 };
 
-function loadWasm() {
-	if (!("WASM" in self)) {
-		throw new Error("WASM not found in global scope!");
+/**
+ * The host page compiles the rewriter once and publishes the Module on its window (see
+ * Controller.loadScramjetWasm). Walk the real window chain to find it: parent, top, opener,
+ * and each of their chains. Runs before any hooks exist; a cross-origin read throws, so each is guarded.
+ */
+function findHostWasm(): [WebAssembly.Module, string] | undefined {
+	const seen: any[] = [globalThis];
+	for (let i = 0; i < seen.length && i < 32; i++) {
+		const win = seen[i];
+		try {
+			const module = win[WASM_MODULE];
+			const digest = win[WASM_DIGEST];
+			// not instanceof: the Module comes from another realm
+			if (
+				typeof digest === "string" &&
+				Object.prototype.toString.call(module) === "[object WebAssembly.Module]"
+			)
+				return [module, digest];
+		} catch {}
+		for (const next of [() => win.parent, () => win.top, () => win.opener]) {
+			try {
+				const w = next();
+				if (w && !seen.includes(w)) seen.push(w);
+			} catch {}
+		}
 	}
-	// Uint8Array.from(string, mapFn) costs ~70ms for the 1.2 MB payload on every
-	// document/worker load; a plain loop over the decoded string is ~5ms.
-	const bin = atob(self.WASM as string);
+	return undefined;
+}
+
+/**
+ * Synchronous fetch of the wasm file itself, for a document with no host module (e.g. a noopener
+ * popup). Sync XHR is not routed through the service worker in Chromium, so this cannot go
+ * through the virtual payload path; it reads the static file the host fetches. The bytes come
+ * back as a string with x-user-defined, one byte per char, since sync XHR has no responseType.
+ */
+function fetchWasmSync(url: string): Uint8Array {
+	const xhr = new XMLHttpRequest();
+	xhr.open("GET", url, false);
+	xhr.overrideMimeType("text/plain; charset=x-user-defined");
+	xhr.send();
+	if (xhr.status !== 200)
+		throw new Error(`rewriter wasm fetch failed: ${xhr.status}`);
+	const bin = xhr.responseText;
 	const wasm = new Uint8Array(bin.length);
 	for (let i = 0; i < bin.length; i++) wasm[i] = bin.charCodeAt(i);
+	return wasm;
+}
+
+function loadWasm(fallbackUrl: string | undefined) {
+	const host = findHostWasm();
+	if (host) {
+		setWasm(host[0], host[1]);
+		return;
+	}
+
+	// workers get the payload as a script, which sets self.WASM. documents without a host fetch the file
+	const b64 = (self as any).WASM as string | undefined;
+	if (b64 === undefined) {
+		if (fallbackUrl === undefined)
+			throw new Error("WASM not found in global scope!");
+		setWasm(fetchWasmSync(fallbackUrl));
+		return;
+	}
 	delete (self as any).WASM;
+	// Uint8Array.from(string, mapFn) costs ~70ms for the 1.2 MB payload on every
+	// document/worker load; a plain loop over the decoded string is ~5ms.
+	const bin = atob(b64);
+	const wasm = new Uint8Array(bin.length);
+	for (let i = 0; i < bin.length; i++) wasm[i] = bin.charCodeAt(i);
 	setWasm(wasm);
 }
 
 export function loadWorker(init: WorkerInit) {
 	if (SCRAMJETCLIENT in globalThis) return;
-	loadWasm();
+	loadWasm(undefined);
 
 	// the realm that created this worker sends its transport port as the first
 	// message (see client/shared/worker.ts in core). until then requests just queue

@@ -5,7 +5,7 @@
 // writes the current prefix over those bytes, so the prefix length must match (it is in the key)
 
 import { TextEncoder_encode } from "../snapshot";
-import { getWasmBytes } from "./wasm";
+import { getKnownWasmDigest, getWasmBytes } from "./wasm";
 
 declare const VERSION: string;
 declare const COMMITHASH: string;
@@ -71,7 +71,13 @@ async function sha256(data: Uint8Array<ArrayBuffer>): Promise<string> {
 let buildTag: Promise<string> | undefined;
 function getBuildTag(): Promise<string> {
 	if (!buildTag) {
-		buildTag = sha256(getWasmBytes() as Uint8Array<ArrayBuffer>).then((wasm) =>
+		// the digest comes with the wasm when the host hands it over; otherwise hash the bytes
+		const known = getKnownWasmDigest();
+		const digest =
+			known !== undefined
+				? Promise.resolve(known)
+				: sha256(getWasmBytes() as Uint8Array<ArrayBuffer>);
+		buildTag = digest.then((wasm) =>
 			[VERSION, COMMITHASH, BUILDDATE, wasm].join(" ")
 		);
 	}

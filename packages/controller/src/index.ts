@@ -8,6 +8,8 @@ import {
 	CookieJar,
 	defaultConfig as scramjetDefaultConfig,
 	rewriteUrl,
+	bytesToBase64,
+	getWasmBytes,
 	ScramjetFetchHandler,
 	ScramjetHeaders,
 	setWasm,
@@ -20,7 +22,12 @@ import {
 	type TrackedHistoryState,
 	Plugin,
 } from "@mercuryworkshop/scramjet";
-import { CONTROLLERFRAME, DEFAULT_PREFIX } from "./symbols";
+import {
+	CONTROLLERFRAME,
+	DEFAULT_PREFIX,
+	WASM_DIGEST,
+	WASM_MODULE,
+} from "./symbols";
 import type {
 	FrameInitHooks,
 	SerializedCookieSyncEntry,
@@ -72,7 +79,8 @@ const scramjetConfig: Partial<ScramjetConfig> = {
 		...scramjetDefaultConfig.flags,
 		allowFailedIntercepts: true,
 	},
-	maskedfiles: ["inject.js", "scramjet.wasm.js"],
+	// scramjet.wasm: the document fallback fetches the wasm file directly (inject.ts fetchWasmSync)
+	maskedfiles: ["inject.js", "scramjet.wasm.js", "scramjet.wasm"],
 };
 
 type PersistedCookieState = {
@@ -287,7 +295,25 @@ export class Controller {
 		}
 
 		const resp = await fetch(this.config.wasmPath);
-		setWasm(await resp.arrayBuffer());
+		const bytes = await resp.arrayBuffer();
+		setWasm(bytes);
+		// compiled once here, off the main thread. documents adopt the Module from this window
+		// (inject.ts findHostWasm), so they neither get the payload nor compile it themselves
+		const [module, digest] = await Promise.all([
+			WebAssembly.compile(bytes),
+			sha256Hex(bytes),
+		]);
+		setWasm(module, digest);
+		Object.defineProperty(globalThis, WASM_MODULE, {
+			value: module,
+			enumerable: false,
+			configurable: true,
+		});
+		Object.defineProperty(globalThis, WASM_DIGEST, {
+			value: digest,
+			enumerable: false,
+			configurable: true,
+		});
 		this.wasmAlreadyFetched = true;
 	}
 
@@ -307,19 +333,9 @@ export class Controller {
 				await this.loadSavedCookies();
 
 				if (path === frame.prefix + this.config.virtualWasmPath) {
+					// built on first request only, by workers and documents without a host module
 					if (!this.wasmPayload) {
-						const resp = await fetch(this.config.wasmPath);
-						const buf = await resp.arrayBuffer();
-						const b64 = btoa(
-							new Uint8Array(buf)
-								.reduce(
-									(data, byte) => (data.push(String.fromCharCode(byte)), data),
-									[] as any
-								)
-								.join("")
-						);
-
-						this.wasmPayload = `self.WASM = '${b64}';`;
+						this.wasmPayload = `self.WASM = '${bytesToBase64(getWasmBytes())}';`;
 					}
 
 					return [
@@ -493,7 +509,11 @@ export class Controller {
 		this.transport = init.transport!;
 
 		if (init.worker) {
-			this.ready = this.startWorker(init.worker);
+			// this page still compiles the rewriter: its frames take the compiled module from it
+			this.ready = Promise.all([
+				this.startWorker(init.worker),
+				this.loadScramjetWasm(),
+			]).then(() => undefined);
 			this.rpc = null!;
 			return;
 		}
@@ -789,6 +809,14 @@ export class Controller {
 	}
 }
 
+// sha256 hex of the rewriter, the same digest the core's rewrite cache keys on
+async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return Array.from(new Uint8Array(digest), (b) =>
+		b.toString(16).padStart(2, "0")
+	).join("");
+}
+
 function base64Encode(text: string) {
 	return btoa(
 		new TextEncoder()
@@ -826,9 +854,10 @@ function yieldGetInjectScripts(
 					.join("")
 			);
 		}
+		// no wasm payload here: documents take the host's compiled module, or fetch the wasm
+		// file synchronously when there is no host (inject.ts loadWasm)
 		return [
 			script(config.scramjetPath),
-			script(prefix.href + config.virtualWasmPath),
 			script(config.injectPath),
 			script(
 				"data:text/javascript;charset=utf-8;base64," +

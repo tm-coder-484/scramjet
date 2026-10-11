@@ -11,6 +11,7 @@ export * from "./headers";
 export * from "./htmlRules";
 export * from "./mime";
 export * from "./rewriters";
+export { bytesToBase64 } from "./util";
 
 export function flagEnabled(
 	flag: keyof ScramjetFlags,
