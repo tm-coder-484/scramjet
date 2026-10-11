@@ -1,5 +1,13 @@
 import { ScramjetClient } from "@client/index";
-import { Object_keys, Reflect_get, Reflect_ownKeys } from "@/shared/snapshot";
+import {
+	Object_defineProperty,
+	Object_getOwnPropertyDescriptor,
+	Object_keys,
+	Object_values,
+	Reflect_apply,
+	Reflect_get,
+	Reflect_ownKeys,
+} from "@/shared/snapshot";
 
 export default function (client: ScramjetClient, self: Self) {
 	// stored keys are "<host>@<key>"; a page only ever sees its own namespace
@@ -104,31 +112,51 @@ export default function (client: ScramjetClient, self: Self) {
 		},
 	};
 
-	const realLocalStorage = self.localStorage;
-	const realSessionStorage = self.sessionStorage;
-	const localStorageProxy = new Proxy(realLocalStorage, handler);
-	const sessionStorageProxy = new Proxy(realSessionStorage, handler);
+	// the storage areas are opened on first access, as natively: reading self.localStorage makes
+	// Blink load the origin's storage synchronously (~3ms per document), and throws where storage
+	// is unavailable, so doing it during hook setup cost every page that never uses storage
+	const areas: Record<
+		"localStorage" | "sessionStorage",
+		{ real?: Storage; proxy?: Storage }
+	> = { localStorage: {}, sessionStorage: {} };
+	for (const name of ["localStorage", "sessionStorage"] as const) {
+		const native = Object_getOwnPropertyDescriptor(self, name);
+		if (!native?.get) continue;
+		const nativeGet = native.get;
+		const area = areas[name];
+		const { get } = {
+			get() {
+				if (!area.proxy) {
+					area.real = Reflect_apply(nativeGet, self, []);
+					area.proxy = new Proxy(area.real!, handler);
+				}
 
-	delete self.localStorage;
-	delete self.sessionStorage;
-
-	self.localStorage = localStorageProxy;
-	self.sessionStorage = sessionStorageProxy;
+				return area.proxy;
+			},
+		};
+		// looks like the native getter: its name, and its source text through toString
+		Object_defineProperty(get, "name", { value: nativeGet.name });
+		client.box.unproxy.set(get, nativeGet);
+		Object_defineProperty(self, name, {
+			get,
+			set: native.set,
+			enumerable: native.enumerable,
+			configurable: native.configurable,
+		});
+	}
 
 	// Web IDL needs a real Storage for StorageEvent.storageArea, so unwrap the
 	// proxies when constructing an event and re-wrap them when reading it back.
-	const toReal = (area: unknown) =>
-		area === localStorageProxy
-			? realLocalStorage
-			: area === sessionStorageProxy
-				? realSessionStorage
-				: area;
-	const toProxy = (area: unknown) =>
-		area === realLocalStorage
-			? localStorageProxy
-			: area === realSessionStorage
-				? sessionStorageProxy
-				: area;
+	const toReal = (area: unknown) => {
+		for (const a of Object_values(areas)) if (area && area === a.proxy) return a.real;
+
+		return area;
+	};
+	const toProxy = (area: unknown) => {
+		for (const a of Object_values(areas)) if (area && area === a.real) return a.proxy;
+
+		return area;
+	};
 
 	client.Proxy("StorageEvent", {
 		construct(ctx) {
