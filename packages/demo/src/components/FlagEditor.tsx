@@ -34,7 +34,7 @@ const flagDescriptions: Record<keyof ScramjetFlags, string> = {
 	rewriteCache:
 		"cache rewritten scripts in the browser, so repeat loads skip the rewriter",
 	renderBlocking:
-		"hold a page's body until its head stylesheets load, so the frame is not laid out unstyled first (the way a top-level page renders)",
+		"hold a page's body until its head stylesheets load, so the frame is not laid out unstyled first (less main thread work, but the body's scripts and images start later; usually slower overall)",
 	scramitize:
 		"Trigger debugger whenever the string 'scramjet' or the real location is detected in attacker code (debug feature)",
 	rewriterLogs: "Enable rewriter logging (debug feature)",

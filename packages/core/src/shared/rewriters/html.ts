@@ -296,7 +296,9 @@ function rewriteHtmlInner(
 // a script at the start of <body>, which the parser only runs once the stylesheets before it have
 // loaded, so the body waits for them. a top-level document is not rendered while its head
 // stylesheets load, but an iframe is laid out (and its text shaped) unstyled meanwhile, then again
-// once they arrive: ~100ms of extra main thread work for a long article. it removes itself
+// once they arrive: ~100ms of extra main thread work for a long article. it removes itself.
+// off by default (the renderBlocking flag): while the parser waits here, Chromium also holds back
+// the body's scripts and images, which cost more than the layout it saves on most sites
 export function renderBlockingScript(): Element {
 	return new Element("script", { "scramjet-injected": "true" }, [
 		new Text("document.currentScript.remove()"),
