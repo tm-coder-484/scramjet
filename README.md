@@ -56,3 +56,16 @@ pnpm dev
 ```
 
 The demo page for scramjet should now be running at <http://localhost:4141> and should rebuild upon a file being changed (excluding the rewriter).
+
+#### Transports
+
+The demo's settings page picks how requests leave the browser:
+
+- **Relay** (the default): the dev server makes each request itself, with native TLS, HTTP/2 and a DNS cache, and streams responses back over one websocket. The controller then runs in a worker, so requests never wait on the proxied page's main thread. It also prefetches a page's stylesheets, scripts and first images while the HTML streams through, and keeps a shared HTTP cache that follows the rules for shared caches (RFC 9111). This is by far the fastest option. The catch: the dev server sees your traffic in plaintext, so only use it with a server you run yourself (your machine, your Codespace). See `devrelay.ts`.
+- **Libcurl** / **Epoxy**: TLS happens inside the page (in wasm) and the server only forwards encrypted bytes over wisp. Slower, but the server never sees your traffic.
+
+Relay and wisp share one port (4142 by default; the relay is at `/relay`), so forwarding that port is enough for both.
+
+#### Controller worker mode
+
+`new Controller({ serviceworker, worker: { scripts, transport, setupFrame } })` runs request handling (transport, cookies, rewriting) in a dedicated worker instead of on the page. Proxied frames are same-origin with the page that hosts them, so they share its main thread. Without a worker, every request waits whenever the site runs script or lays out. `transport` and `setupFrame` are function sources (functions are serialized with `toString`) that run in the worker after `scripts` load. Fetch hooks tapped on the page's frames don't run in this mode; install those plugins in `setupFrame` instead. After changing `controller.scramjetConfig` in place, call `controller.pushConfig()`.
