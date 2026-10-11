@@ -30,10 +30,13 @@ function rewriteJsWasm(
 	isModule: boolean
 ): RewriterResult {
 	const [rewriter, ret] = getRewriter(context, meta);
+	// meta.base is a getter that re-resolves the base url (and in the client, re-parses
+	// location.href), so read it once per rewrite instead of once per flag
+	const base = meta.base;
 
 	const flagsobj = {};
 	for (const flag of Object_keys(context.config.flags)) {
-		flagsobj[flag] = flagEnabled(flag as any, context, meta.base);
+		flagsobj[flag] = flagEnabled(flag as any, context, base);
 	}
 
 	// the rewriter encodes every static import specifier with codecEncode. blob: and
@@ -57,7 +60,7 @@ function rewriteJsWasm(
 				flagsobj,
 				encodeSpecifier,
 				input,
-				meta.base.href,
+				base.href,
 				source || "(unknown)",
 				isModule
 			);
@@ -70,7 +73,7 @@ function rewriteJsWasm(
 				flagsobj,
 				encodeSpecifier,
 				input,
-				meta.base.href,
+				base.href,
 				source || "(unknown)",
 				isModule
 			);
@@ -86,7 +89,7 @@ function rewriteJsWasm(
 
 		// 	return { js: input, tag: "", map: null };
 		// }
-		if (flagEnabled("rewriterLogs", context, meta.base)) {
+		if (flagEnabled("rewriterLogs", context, base)) {
 			dbg.time(meta, before, `oxc rewrite for "${source || "(unknown)"}"`);
 		}
 

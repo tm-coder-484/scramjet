@@ -529,24 +529,29 @@ export class ScramjetClient {
 				if (!iswindow) return "";
 
 				// TODO: need to nullify the actual meta tag so it still sends unsafe-url
-				const meta = [
-					...client.natives.call(
-						"Document.prototype.querySelectorAll",
-						client.global.document,
-						"meta[name='referrer']"
-					),
-					...client.natives.call(
-						"Document.prototype.querySelectorAll",
-						client.global.document,
-						"meta[name='referrer-policy']"
-					),
-					...client.natives.call(
-						"Document.prototype.querySelectorAll",
-						client.global.document,
-						"meta[http-equiv='referrer-policy']"
-					),
+				// one walk for the <meta> tags (the engine caches a live tag collection until the DOM
+				// changes), then the three checks run on that short list. the last match wins, in the
+				// order: name=referrer, name=referrer-policy, http-equiv=referrer-policy (ASCII case-insensitive)
+				// a querySelectorAll with a selector list costs as much as three separate walks, so it is not used
+				const metas = client.natives.call(
+					"Document.prototype.getElementsByTagName",
+					client.global.document,
+					"meta"
+				);
+				const attr = (el: Element, name: string) =>
+					client.natives.call("Element.prototype.getAttribute", el, name);
+				const matchers: ((el: Element) => boolean)[] = [
+					(el) => attr(el, "name") === "referrer",
+					(el) => attr(el, "name") === "referrer-policy",
+					(el) =>
+						(attr(el, "http-equiv") ?? "").toLowerCase() === "referrer-policy",
 				];
-				const last = meta[meta.length - 1];
+				let last: Element | undefined;
+				for (const matches of matchers) {
+					for (let i = 0; i < metas.length; i++) {
+						if (matches(metas[i])) last = metas[i];
+					}
+				}
 				if (last) {
 					return last.getAttribute("content");
 				}
@@ -605,8 +610,18 @@ export class ScramjetClient {
 		}
 	}
 
+	// location.href is unrewritten (two URL parses) on every read of client.url, and client.url
+	// is read several times per URL rewrite (meta.origin, meta.base), so keep the last result
+	private lastRawHref: string | undefined;
+	private lastUnrewrittenHref: string | undefined;
+
 	get url(): _URL {
-		return new _URL(this.unrewriteUrl(this.global.location.href));
+		const raw = this.global.location.href;
+		if (raw !== this.lastRawHref || this.lastUnrewrittenHref === undefined) {
+			this.lastUnrewrittenHref = this.unrewriteUrl(raw);
+			this.lastRawHref = raw;
+		}
+		return new _URL(this.lastUnrewrittenHref);
 	}
 
 	set url(url: _URL | string) {
