@@ -206,19 +206,35 @@ function shareable(r: PrefetchedResponse) {
 	return !/\*|cookie/.test(get("vary"));
 }
 
-// one per websocket, i.e. per transport instance: its own connection pool, and the prefetches
-// started for documents it loaded
-class RelaySession {
-	agent: Dispatcher = new Agent({
+const newAgent = (keepAlive?: number): Dispatcher =>
+	new Agent({
 		allowH2: true,
 		connect: { lookup: cachedLookup as any },
+		// undici closes idle connections after 4s by default; Chromium keeps them for minutes
+		...(keepAlive
+			? { keepAliveTimeout: keepAlive, keepAliveMaxTimeout: keepAlive }
+			: {}),
 	});
+
+// the connections to sites are kept open for every browser that uses the relay, the way a proxy
+// server's are: a page then skips the TCP and TLS handshakes for any site it, or anyone, loaded
+// recently. RELAY_POOL=session gives each transport its own pool instead (closed with it), which
+// is what a browser without the relay would have
+const SHARED_POOL = process.env.RELAY_POOL !== "session";
+let sharedAgent: Dispatcher | null = null;
+
+// one per websocket, i.e. per transport instance: the prefetches started for documents it loaded,
+// and its connection pool if the pool isn't shared
+class RelaySession {
+	agent: Dispatcher = SHARED_POOL
+		? (sharedAgent ??= newAgent(5 * 60_000))
+		: newAgent();
 	prefetched = new Map<string, PrefetchEntry>();
 	/** whether this transport asked for the shared cache */
 	useCache = false;
 
 	close() {
-		this.agent.close().catch(() => {});
+		if (!SHARED_POOL) this.agent.close().catch(() => {});
 		this.prefetched.clear();
 	}
 
