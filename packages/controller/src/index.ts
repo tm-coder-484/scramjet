@@ -700,6 +700,10 @@ export class Controller {
 				$controller$init: {
 					prefix: this.prefix,
 					id: this.id,
+					// the scripts every document loads, which the service worker serves from its cache
+					client: [this.config.scramjetPath, this.config.injectPath].map(
+						(path) => new URL(path, location.href).href
+					),
 				},
 			},
 			[channel.port2]

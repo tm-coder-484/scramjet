@@ -170,12 +170,90 @@ async function waitForTab(url: URL): Promise<ControllerReference | undefined> {
 	return tab;
 }
 
+// ---- scramjet's client scripts, from CacheStorage ----
+// Every proxied document loads the same client scripts (scramjet.js, controller.inject.js), and
+// in a fresh profile each document compiled them again: ~20-30ms per document. Chromium keeps the
+// compiled code of scripts a service worker caches while it installs, so they are cached here and
+// answered from the cache. A controller reports its client paths when it connects; the cached
+// copies are then checked against the server (and replaced if they changed, e.g. after a rebuild)
+// before any document gets them, so a page's frames run the client its controller loaded with.
+const CLIENT_CACHE = "scramjet-client";
+const DEFAULT_CLIENT_PATHS = [
+	"/scramjet/scramjet.js",
+	"/controller/controller.inject.js",
+];
+// path -> the check that must finish before the cached copy is used
+const clientChecks = new Map<string, Promise<boolean>>();
+
+function sameBytes(a: ArrayBuffer, b: ArrayBuffer) {
+	if (a.byteLength !== b.byteLength) return false;
+	const x = new Uint8Array(a),
+		y = new Uint8Array(b);
+	for (let i = 0; i < x.length; i++) if (x[i] !== y[i]) return false;
+	return true;
+}
+
+// the cached copy of a client script, refreshed if the server's differs. resolves whether the
+// cache now holds the server's current version
+async function checkClientScript(path: string): Promise<boolean> {
+	try {
+		const cache = await caches.open(CLIENT_CACHE);
+		const fresh = await fetch(path, { cache: "no-cache" });
+		if (!fresh.ok) {
+			await cache.delete(path);
+			return false;
+		}
+		const cached = await cache.match(path);
+		if (
+			cached &&
+			sameBytes(await cached.arrayBuffer(), await fresh.clone().arrayBuffer())
+		)
+			return true;
+		await cache.put(path, fresh);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+function watchClientScripts(paths: string[]) {
+	for (const path of paths) {
+		if (new URL(path, location.href).origin !== location.origin) continue;
+		const pathname = new URL(path, location.href).pathname;
+		clientChecks.set(pathname, checkClientScript(pathname));
+	}
+}
+
+addEventListener("install", (e: ExtendableEvent) => {
+	// failures only cost the speedup; they must not fail the install
+	e.waitUntil(
+		caches
+			.open(CLIENT_CACHE)
+			.then((cache) => cache.addAll(DEFAULT_CLIENT_PATHS))
+			.catch(() => {})
+	);
+});
+
+function isClientScript(url: URL) {
+	return url.origin === location.origin && clientChecks.has(url.pathname);
+}
+
+async function routeClientScript(event: FetchEvent): Promise<Response> {
+	const path = new URL(event.request.url).pathname;
+	if (await clientChecks.get(path)) {
+		const cached = await (await caches.open(CLIENT_CACHE)).match(path);
+		if (cached) return cached;
+	}
+	return fetch(event.request);
+}
+
 addEventListener("message", (e) => {
 	if (!e.data) return;
 	if (typeof e.data != "object") return;
 	if (!e.data.$controller$init) return;
 	if (typeof e.data.$controller$init != "object") return;
 	const init = e.data.$controller$init;
+	if (Array.isArray(init.client)) watchClientScripts(init.client);
 
 	const existing = tabs.findIndex((t) => t.id === init.id);
 	if (existing !== -1) {
@@ -193,6 +271,7 @@ addEventListener("message", (e) => {
 
 export function shouldRoute(event: FetchEvent): boolean {
 	const url = new URL(event.request.url);
+	if (event.request.method === "GET" && isClientScript(url)) return true;
 	if (findTab(url)) return true;
 	for (const prefix of knownPrefixes) {
 		if (url.pathname.startsWith(prefix)) return true;
@@ -203,6 +282,8 @@ export function shouldRoute(event: FetchEvent): boolean {
 export async function route(event: FetchEvent): Promise<Response> {
 	try {
 		const url = new URL(event.request.url);
+		if (event.request.method === "GET" && isClientScript(url))
+			return await routeClientScript(event);
 		const tab = await waitForTab(url);
 		// no controller owns this url (e.g. it belonged to a page that's gone); behave as if unrouted
 		if (!tab) return await fetch(event.request);
