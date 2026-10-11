@@ -220,12 +220,11 @@ class ConstructHookCtx {
 
 const emptyFunction = function () {};
 
-// true for a method that lives on a prototype object and is not constructible, the kind of
-// function a plain wrapper can stand in for. constructors and static functions stay on Proxy
-function isPlainPrototypeMethod(target: any, value: any): boolean {
+// true for a function that is not constructible and has no prototype property: a prototype method,
+// a global function such as fetch, or a static such as URL.createObjectURL. these are the kind a plain
+// wrapper can stand in for. constructors (and bound functions of constructors) stay on Proxy
+function isPlainFunction(value: any): boolean {
 	if (typeof value !== "function") return false;
-	const ctor = Object_getOwnPropertyDescriptor(target, "constructor")?.value;
-	if (typeof ctor !== "function" || ctor.prototype !== target) return false;
 	if (Reflect_has(value, "prototype")) return false;
 	// the real test: Reflect.construct throws when newTarget is not a constructor, and reads nothing
 	// from it since value has no prototype property
@@ -948,12 +947,9 @@ return { apply, construct };
 		};
 
 		let proxy: any;
-		if (
-			handler.apply &&
-			!handler.construct &&
-			isPlainPrototypeMethod(target, value)
-		) {
-			// a plain method on a prototype: a real function is much cheaper than a Proxy apply trap
+		if (handler.apply && !handler.construct && isPlainFunction(value)) {
+			// a non-constructible function without a prototype (method, global or static): a real
+			// function is much cheaper than a Proxy apply trap
 			proxy = createMethodWrapper(prop, value, applyHook);
 		} else {
 			if (handler.apply) h.apply = applyHook;
