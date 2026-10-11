@@ -4,6 +4,7 @@ import { RpcHelper } from "@mercuryworkshop/rpc";
 import type { Controllerbound, SWbound } from "./types";
 import type { RawHeaders } from "@mercuryworkshop/proxy-transports";
 import { DEFAULT_PREFIX } from "./symbols";
+import { receiveBody } from "./bodystream";
 
 function makeId(): string {
 	return Math.random().toString(36).substring(2, 10);
@@ -224,6 +225,7 @@ export async function route(event: FetchEvent): Promise<Response> {
 				initialHeaders: rawheaders,
 				rawClientUrl: client ? client.url : undefined,
 				clientId: event.clientId || event.resultingClientId,
+				acceptsBodyPort: true,
 			},
 			event.request.body instanceof ReadableStream ||
 				// @ts-expect-error the types for fetchevent are messed up
@@ -232,11 +234,14 @@ export async function route(event: FetchEvent): Promise<Response> {
 				: undefined
 		);
 
-		return new Response(response.body, {
-			status: response.status,
-			statusText: response.statusText,
-			headers: response.headers,
-		});
+		return new Response(
+			response.bodyPort ? receiveBody(response.bodyPort) : response.body,
+			{
+				status: response.status,
+				statusText: response.statusText,
+				headers: response.headers,
+			}
+		);
 	} catch (e) {
 		console.error("Service Worker error:", e);
 		return new Response(

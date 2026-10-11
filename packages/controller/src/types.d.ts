@@ -20,10 +20,14 @@ export type TransferRequest = {
 	initialHeaders: RawHeaders;
 	rawClientUrl?: string;
 	clientId?: string;
+	/** the service worker can take a streamed body as `bodyPort` (see bodystream.ts) */
+	acceptsBodyPort?: boolean;
 };
 
 export type TransferResponse = {
 	body: BodyType;
+	/** when set, the body streams over this port instead (see bodystream.ts) */
+	bodyPort?: MessagePort;
 	headers: RawHeaders;
 	status: number;
 	statusText: string;

@@ -31,6 +31,8 @@ const DROP = new Set([
 	"keep-alive",
 ]);
 const REQUEST_DROP = new Set(["host", "connection", "content-length"]);
+// RELAY_LOG=1 prints each upstream request's timing
+const LOG = !!process.env.RELAY_LOG;
 
 // DNS answers are kept for a minute, like Chromium's host cache
 const dnsCache = new Map<string, { expires: number; result: any[] }>();
@@ -398,6 +400,7 @@ function handleMuxSocket(ws: WebSocket) {
 	};
 
 	async function run(msg: any, body?: Buffer) {
+		const started = performance.now();
 		const ac = new AbortController();
 		live.set(msg.id, ac);
 		try {
@@ -444,6 +447,7 @@ function handleMuxSocket(ws: WebSocket) {
 			const raw: RawHeaders = [];
 			for (const [k, v] of r.headers) if (!DROP.has(k)) raw.push([k, v]);
 			sendJson({ t: "head", id: msg.id, status: r.status, statusText: r.statusText, headers: raw });
+			const headAt = performance.now();
 
 			const dest = header(headers, "sec-fetch-dest").toLowerCase();
 			const scanner =
@@ -467,6 +471,10 @@ function handleMuxSocket(ws: WebSocket) {
 				}
 			}
 			scanner?.end();
+			if (LOG)
+				console.log(
+					`[relay] ${r.status} ${Math.round(headAt - started)}ms head, ${Math.round(performance.now() - started)}ms end ${msg.url.slice(0, 100)}`
+				);
 			if (keep)
 				cacheStore(msg.url, msg.method, headers, {
 					status: r.status,

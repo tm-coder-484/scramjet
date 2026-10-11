@@ -37,8 +37,10 @@ import type {
 	SWbound,
 	WebSocketMessage,
 	FrameErrorHooks,
+	BodyType,
 } from "./types";
 import { assertRuntimeScramjetVersion } from "./version";
+import { sendBody } from "./bodystream";
 
 export { VERSION } from "./version";
 export { assertRuntimeScramjetVersion } from "./version";
@@ -368,6 +370,25 @@ export class Controller {
 					cache: data.cache,
 					clientId: data.clientId,
 				});
+
+				// a streamed body goes over a port, pushed chunk by chunk, when the service worker
+				// knows how to take it: a transferred stream costs a round trip per chunk
+				if (
+					data.acceptsBodyPort &&
+					fetchresponse.body instanceof ReadableStream
+				) {
+					const bodyPort = sendBody(fetchresponse.body);
+					return [
+						{
+							body: null as unknown as BodyType,
+							bodyPort,
+							status: fetchresponse.status,
+							statusText: fetchresponse.statusText,
+							headers: fetchresponse.headers.toRawHeaders(),
+						},
+						[bodyPort],
+					];
+				}
 
 				return [
 					{
