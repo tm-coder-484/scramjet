@@ -30,6 +30,7 @@ export type ScramjetFlags = {
 	encapsulateWorkers: boolean;
 	viewTransitions: boolean;
 	rewriteCache: boolean;
+	renderBlocking: boolean;
 };
 
 export interface ScramjetConfig {

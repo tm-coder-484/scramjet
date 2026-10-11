@@ -1,5 +1,5 @@
 import { ElementType, Parser } from "htmlparser2";
-import { ChildNode, DomHandler, Element, Comment } from "domhandler";
+import { ChildNode, DomHandler, Element, Comment, Text } from "domhandler";
 import render from "dom-serializer";
 import { URLMeta, rewriteUrl } from "@rewriters/url";
 import { rewriteCss } from "@rewriters/css";
@@ -265,6 +265,12 @@ function rewriteHtmlInner(
 			}
 
 			headElement.children.unshift(...injectScripts);
+
+			const body = htmlRoot.children.find(
+				(child) => child.type === ElementType.Tag && child.name === "body"
+			);
+			if (body && flagEnabled("renderBlocking", context, meta.base))
+				(body as Element).children.unshift(renderBlockingScript());
 		}
 	}
 
@@ -285,6 +291,16 @@ function rewriteHtmlInner(
 	}
 
 	return render(handler.root, renderOptions);
+}
+
+// a script at the start of <body>, which the parser only runs once the stylesheets before it have
+// loaded, so the body waits for them. a top-level document is not rendered while its head
+// stylesheets load, but an iframe is laid out (and its text shaped) unstyled meanwhile, then again
+// once they arrive: ~100ms of extra main thread work for a long article. it removes itself
+export function renderBlockingScript(): Element {
+	return new Element("script", { "scramjet-injected": "true" }, [
+		new Text("document.currentScript.remove()"),
+	]);
 }
 
 export function rewriteHtml(

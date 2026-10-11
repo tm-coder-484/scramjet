@@ -17,6 +17,7 @@ import {
 } from "@/shared/snapshot";
 import {
 	HtmlContext,
+	renderBlockingScript,
 	renderOptions,
 	rewriteElementAttributes,
 	traverseParsedHtml,
@@ -330,6 +331,7 @@ class HtmlStreamRewriter {
 	private heldHtmlEnd = 0;
 	private sawRootHtml = false;
 	private pendingAfterHeadOpen: string | undefined;
+	private sawBody = false;
 	private out = "";
 
 	// root-level content arrived after a provisional decision, so the output may differ from detectQuirks
@@ -494,6 +496,18 @@ class HtmlStreamRewriter {
 			this.pendingAfterHeadOpen = undefined;
 		}
 		if (depth === 0 && name === "html") this.heldHtmlEnd = this.held.length;
+		// the first <body> in <html> starts with renderBlockingScript, as in the buffered rewrite
+		if (
+			name === "body" &&
+			depth === 1 &&
+			!this.sawBody &&
+			parent?.name === "html" &&
+			(this.injection === "head" || this.injection === "html")
+		) {
+			this.sawBody = true;
+			if (flagEnabled("renderBlocking", this.context, this.meta.base))
+				this.emit(render(renderBlockingScript(), renderOptions));
+		}
 		this.stack.push({ name: tagName, mode, kind: "elem" });
 	}
 

@@ -47,6 +47,7 @@ export const defaultConfig: ScramjetConfig = {
 		debugSourceURL: false,
 		viewTransitions: false,
 		rewriteCache: true,
+		renderBlocking: true,
 	},
 	siteFlags: {},
 	maskedfiles: [],

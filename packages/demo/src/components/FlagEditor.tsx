@@ -33,6 +33,8 @@ const flagDescriptions: Record<keyof ScramjetFlags, string> = {
 		"allow view transition animations (chromium can crash the tab running these in an iframe, e.g. youtube)",
 	rewriteCache:
 		"cache rewritten scripts in the browser, so repeat loads skip the rewriter",
+	renderBlocking:
+		"hold a page's body until its head stylesheets load, so the frame is not laid out unstyled first (the way a top-level page renders)",
 	scramitize:
 		"Trigger debugger whenever the string 'scramjet' or the real location is detected in attacker code (debug feature)",
 	rewriterLogs: "Enable rewriter logging (debug feature)",
