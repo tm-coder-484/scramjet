@@ -7,7 +7,7 @@
 // encrypted bytes. That's fine for your own machine or Codespace, not for a public deployment.
 //
 // Protocol, on ws://<host>/relay (one socket per RelayTransport):
-//   client -> server  text   {t:"req", id, url, method, headers, body:bool, prefetch?:bool}
+//   client -> server  text   {t:"req", id, url, method, headers, body:bool, prefetch?:bool, cache?:bool}
 //                     binary [u32 id][request body]   (follows a req with body:true)
 //                     text   {t:"abort", id}
 //   server -> client  text   {t:"head", id, status, statusText, headers} | {t:"err", id, error}
@@ -55,6 +55,122 @@ function cachedLookup(hostname: string, options: any, cb: any) {
 	});
 }
 
+// ---- shared HTTP cache (opt-in per request: the transport's `cache` option) ----
+// a forward-proxy cache like a CDN's or Squid's, following RFC 9111's rules for shared caches:
+// only GETs without Authorization, only responses a shared cache may store (not private or
+// no-store; with explicit freshness or a Last-Modified heuristic), only while fresh, keyed on
+// the headers named by Vary. Set-Cookie is never replayed from it.
+type CachedResponse = {
+	status: number;
+	statusText: string;
+	headers: RawHeaders;
+	body: Buffer;
+	stored: number;
+	lifetime: number;
+	vary: Record<string, string>;
+};
+const CACHE_LIMIT = Number(process.env.RELAY_CACHE_MB || 512) * 1024 * 1024;
+const CACHEABLE_STATUS = new Set([200, 203, 204, 300, 301, 308, 404, 410]);
+const httpCache = new Map<string, CachedResponse[]>();
+let httpCacheBytes = 0;
+
+function directives(value: string) {
+	const out: Record<string, string> = {};
+	for (const part of value.toLowerCase().split(",")) {
+		const [k, v = ""] = part.trim().split("=");
+		if (k) out[k] = v.replace(/^"|"$/g, "");
+	}
+	return out;
+}
+
+// the freshness lifetime in ms a shared cache may give a response, or 0 if it can't store it
+function freshnessLifetime(status: number, headers: RawHeaders, now: number) {
+	if (!CACHEABLE_STATUS.has(status)) return 0;
+	const cc = directives(header(headers, "cache-control"));
+	if ("no-store" in cc || "private" in cc || "no-cache" in cc) return 0;
+	if (/\*/.test(header(headers, "vary"))) return 0;
+	const age = Number(header(headers, "age")) || 0;
+	let lifetime: number | undefined;
+	if (cc["s-maxage"] !== undefined) lifetime = Number(cc["s-maxage"]) * 1000;
+	else if (cc["max-age"] !== undefined) lifetime = Number(cc["max-age"]) * 1000;
+	else if (header(headers, "expires")) {
+		const date = Date.parse(header(headers, "date")) || now;
+		lifetime = Date.parse(header(headers, "expires")) - date;
+	} else if (header(headers, "last-modified")) {
+		// the usual heuristic: a tenth of the time since the last change, capped at a day
+		const since = now - Date.parse(header(headers, "last-modified"));
+		lifetime = Math.min(since / 10, 86_400_000);
+	}
+	if (!lifetime || !Number.isFinite(lifetime)) return 0;
+	return lifetime - age * 1000;
+}
+
+function varyValues(responseHeaders: RawHeaders, requestHeaders: RawHeaders) {
+	const vary: Record<string, string> = {};
+	for (const name of header(responseHeaders, "vary").toLowerCase().split(",")) {
+		const n = name.trim();
+		if (n) vary[n] = header(requestHeaders, n);
+	}
+	return vary;
+}
+
+function cacheLookup(url: string, method: string, headers: RawHeaders) {
+	if (method !== "GET" || header(headers, "authorization") || header(headers, "range")) return null;
+	const cc = directives(header(headers, "cache-control"));
+	if ("no-cache" in cc || "no-store" in cc || /no-cache/i.test(header(headers, "pragma"))) return null;
+	const now = Date.now();
+	const entries = httpCache.get(url);
+	for (const entry of entries ?? []) {
+		if (now - entry.stored > entry.lifetime) continue;
+		if (Object.entries(entry.vary).every(([k, v]) => header(headers, k) === v)) {
+			// most recently used last, for eviction
+			httpCache.delete(url);
+			httpCache.set(url, entries!);
+			return entry;
+		}
+	}
+	return null;
+}
+
+function cacheStore(url: string, method: string, requestHeaders: RawHeaders, r: { status: number; statusText: string; headers: RawHeaders; body: Buffer }) {
+	if (method !== "GET" || header(requestHeaders, "authorization") || header(requestHeaders, "range")) return;
+	const now = Date.now();
+	const lifetime = freshnessLifetime(r.status, r.headers, now);
+	if (lifetime <= 0 || r.body.byteLength > CACHE_LIMIT / 16) return;
+	const entry: CachedResponse = {
+		status: r.status,
+		statusText: r.statusText,
+		headers: r.headers.filter(([k]) => k.toLowerCase() !== "set-cookie"),
+		body: r.body,
+		stored: now,
+		lifetime,
+		vary: varyValues(r.headers, requestHeaders),
+	};
+	const list = (httpCache.get(url) ?? []).filter(
+		(e) => JSON.stringify(e.vary) !== JSON.stringify(entry.vary)
+	);
+	list.push(entry);
+	httpCache.delete(url);
+	httpCache.set(url, list);
+	httpCacheBytes += r.body.byteLength;
+	for (const [key, entries] of httpCache) {
+		if (httpCacheBytes <= CACHE_LIMIT) break;
+		for (const e of entries) httpCacheBytes -= e.body.byteLength;
+		httpCache.delete(key);
+	}
+}
+
+// the response a cached entry gives, with its Age
+function fromCache(entry: CachedResponse): PrefetchedResponse {
+	const age = Math.floor((Date.now() - entry.stored) / 1000);
+	return {
+		status: entry.status,
+		statusText: entry.statusText,
+		headers: [...entry.headers.filter(([k]) => k.toLowerCase() !== "age"), ["age", String(age)]],
+		body: entry.body,
+	};
+}
+
 type PrefetchedResponse = {
 	status: number;
 	statusText: string;
@@ -96,6 +212,8 @@ class RelaySession {
 		connect: { lookup: cachedLookup as any },
 	});
 	prefetched = new Map<string, PrefetchEntry>();
+	/** whether this transport asked for the shared cache */
+	useCache = false;
 
 	close() {
 		this.agent.close().catch(() => {});
@@ -104,6 +222,9 @@ class RelaySession {
 
 	prefetch(url: string, headers: Record<string, string>) {
 		if (this.prefetched.has(url) || this.prefetched.size > 400) return;
+		const rawRequest: RawHeaders = Object.entries(headers);
+		// a fresh cached copy needs no prefetch: the proxied request will hit the cache
+		if (this.useCache && cacheLookup(url, "GET", rawRequest)) return;
 		const promise = undiciFetch(url, {
 			headers,
 			redirect: "manual",
@@ -114,7 +235,9 @@ class RelaySession {
 			const body = Buffer.from(await r.arrayBuffer());
 			if (/text\/css/.test(r.headers.get("content-type") || ""))
 				this.prefetchFromCss(url, body.toString("utf8"), headers);
-			return { status: r.status, statusText: r.statusText, headers: raw, body };
+			const res = { status: r.status, statusText: r.statusText, headers: raw, body };
+			if (this.useCache) cacheStore(url, "GET", rawRequest, res);
+			return res;
 		});
 		const entry: PrefetchEntry = {
 			origin: headers.origin || "",
@@ -279,6 +402,17 @@ function handleMuxSocket(ws: WebSocket) {
 		live.set(msg.id, ac);
 		try {
 			const headers: RawHeaders = msg.headers;
+			if (msg.cache) {
+				session.useCache = true;
+				const hit = cacheLookup(msg.url, msg.method, headers);
+				if (hit) {
+					const r = fromCache(hit);
+					sendJson({ t: "head", id: msg.id, status: r.status, statusText: r.statusText, headers: r.headers });
+					if (r.body.byteLength) sendChunk(msg.id, r.body);
+					sendJson({ t: "end", id: msg.id });
+					return;
+				}
+			}
 			const pre = msg.prefetch
 				? session.takePrefetch(msg.url, msg.method, headers)
 				: null;
@@ -319,13 +453,27 @@ function handleMuxSocket(ws: WebSocket) {
 					? session.htmlScanner(msg.url, headers, r.headers.getSetCookie())
 					: null;
 			const decoder = scanner ? new TextDecoder() : null;
+			// keep the body for the cache only if the response may be stored at all
+			const keep =
+				msg.cache &&
+				freshnessLifetime(r.status, raw, Date.now()) > 0 &&
+				msg.method === "GET";
+			const chunks: Uint8Array[] = [];
 			if (r.body) {
 				for await (const chunk of r.body) {
 					sendChunk(msg.id, chunk);
+					if (keep) chunks.push(chunk);
 					if (scanner) scanner.write(decoder!.decode(chunk, { stream: true }));
 				}
 			}
 			scanner?.end();
+			if (keep)
+				cacheStore(msg.url, msg.method, headers, {
+					status: r.status,
+					statusText: r.statusText,
+					headers: raw,
+					body: Buffer.concat(chunks),
+				});
 			sendJson({ t: "end", id: msg.id });
 		} catch (e: any) {
 			sendJson({ t: "err", id: msg.id, error: String(e?.cause ?? e) });

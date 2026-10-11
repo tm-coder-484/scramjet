@@ -14,6 +14,12 @@ export type RelayTransportOptions = {
 	 * when a prefetched resource ends up unused.
 	 */
 	prefetch?: boolean;
+	/**
+	 * let the relay answer from its shared HTTP cache (a forward-proxy cache that follows the
+	 * RFC 9111 rules for shared caches), so a site's static files come from the relay instead of
+	 * the network on later visits, from any browser
+	 */
+	cache?: boolean;
 };
 
 type Pending = {
@@ -128,6 +134,7 @@ export class RelayTransport implements ProxyTransport {
 				headers,
 				body: bytes !== null,
 				prefetch: !!this.options.prefetch,
+				cache: !!this.options.cache,
 			})
 		);
 		if (bytes) {
