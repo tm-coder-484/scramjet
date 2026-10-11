@@ -535,15 +535,22 @@ function handleMuxSocket(ws: WebSocket) {
 
 // a proxied websocket: the first message to the browser is {protocol, extensions} or {error}
 function handleWebSocketRelay(client: WebSocket, url: URL) {
-	const target = url.searchParams.get("url")!;
-	const protocols: string[] = JSON.parse(url.searchParams.get("protocols") || "[]");
-	const headers: Record<string, string> = Object.fromEntries(
-		JSON.parse(url.searchParams.get("headers") || "[]")
-	);
-	for (const k of Object.keys(headers))
-		if (REQUEST_DROP.has(k.toLowerCase())) delete headers[k];
-
-	const upstream = new WebSocket(target, protocols, { headers });
+	let upstream: WebSocket;
+	try {
+		const target = url.searchParams.get("url")!;
+		const protocols: string[] = JSON.parse(url.searchParams.get("protocols") || "[]");
+		const headers: Record<string, string> = Object.fromEntries(
+			JSON.parse(url.searchParams.get("headers") || "[]")
+		);
+		for (const k of Object.keys(headers))
+			if (REQUEST_DROP.has(k.toLowerCase())) delete headers[k];
+		// throws for a url ws rejects (one with a fragment, say), which must not take the server down
+		upstream = new WebSocket(target, protocols, { headers });
+	} catch (e) {
+		client.send(JSON.stringify({ error: String(e) }));
+		client.close();
+		return;
+	}
 	const pending: (string | Buffer)[] = [];
 	upstream.on("open", () => {
 		client.send(JSON.stringify({ protocol: upstream.protocol, extensions: upstream.extensions }));
