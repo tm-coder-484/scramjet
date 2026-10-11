@@ -157,6 +157,113 @@ export type ScramjetModule = {
 	default: (client: ScramjetClient, self: GlobalThis) => void;
 };
 
+// the ctx a hook handler gets for an apply. return and call are on the prototype, so a hooked
+// call allocates this one object instead of two closures. no handler uses return/call detached
+class ApplyHookCtx {
+	fn: any;
+	"this": any;
+	args: any[];
+	newTarget: null = null;
+	earlyreturn = false;
+	returnValue: any = undefined;
+	invoke: (fn: any, that: any, args: any[]) => any;
+	constructor(
+		fn: any,
+		that: any,
+		args: any[],
+		invoke: (fn: any, that: any, args: any[]) => any
+	) {
+		this.fn = fn;
+		this["this"] = that;
+		this.args = args;
+		this.invoke = invoke;
+	}
+	return(r: any) {
+		this.earlyreturn = true;
+		this.returnValue = r;
+	}
+	call() {
+		this.earlyreturn = true;
+		return (this.returnValue = this.invoke(this.fn, this["this"], this.args));
+	}
+}
+
+// same as ApplyHookCtx, for a construct
+class ConstructHookCtx {
+	fn: any;
+	args: any[];
+	newTarget: any;
+	"this": null = null;
+	earlyreturn = false;
+	returnValue: any = undefined;
+	invoke: (fn: any, args: any[], newTarget: any) => any;
+	constructor(
+		fn: any,
+		args: any[],
+		newTarget: any,
+		invoke: (fn: any, args: any[], newTarget: any) => any
+	) {
+		this.fn = fn;
+		this.args = args;
+		this.newTarget = newTarget;
+		this.invoke = invoke;
+	}
+	return(r: any) {
+		this.earlyreturn = true;
+		this.returnValue = r;
+	}
+	call() {
+		this.earlyreturn = true;
+		return (this.returnValue = this.invoke(this.fn, this.args, this.newTarget));
+	}
+}
+
+const emptyFunction = function () {};
+
+// true for a method that lives on a prototype object and is not constructible, the kind of
+// function a plain wrapper can stand in for. constructors and static functions stay on Proxy
+function isPlainPrototypeMethod(target: any, value: any): boolean {
+	if (typeof value !== "function") return false;
+	const ctor = Object_getOwnPropertyDescriptor(target, "constructor")?.value;
+	if (typeof ctor !== "function" || ctor.prototype !== target) return false;
+	if (Reflect_has(value, "prototype")) return false;
+	// the real test: Reflect.construct throws when newTarget is not a constructor, and reads nothing
+	// from it since value has no prototype property
+	try {
+		Reflect_construct(emptyFunction, [], value);
+	} catch {
+		return true;
+	}
+	return false;
+}
+
+// a method-shorthand function has no [[Construct]] and no prototype, like the native it wraps.
+// name and length are copied from the native
+function createMethodWrapper(
+	name: string,
+	value: AnyFunction,
+	applyHook: (fn: any, that: any, args: any[]) => any
+): AnyFunction {
+	const wrapper = {
+		[name](this: any, ...args: any[]) {
+			return applyHook(value, this, args);
+		},
+	}[name];
+	Object_defineProperty(wrapper, "length", {
+		value: value.length,
+		writable: false,
+		enumerable: false,
+		configurable: true,
+	});
+	Object_defineProperty(wrapper, "name", {
+		value: value.name,
+		writable: false,
+		enumerable: false,
+		configurable: true,
+	});
+	return wrapper;
+}
+
 function findBox(global: Window, seen: Window[]): SingletonBox | null {
 	if (seen.includes(global)) return null;
 	seen.push(global);
@@ -685,7 +792,8 @@ export class ScramjetClient {
 
 		let applyFn: typeof Reflect_apply;
 		let constructFn: typeof Reflect_construct;
-		if (this.flagEnabled("debugTrampolines")) {
+		const debugTrampolines = this.flagEnabled("debugTrampolines");
+		if (debugTrampolines) {
 			let fnName: string;
 			if (debugname) {
 				fnName = debugname;
@@ -742,97 +850,66 @@ return { apply, construct };
 				args: any[],
 				newTarget: AnyFunction
 			) {
-				let returnValue: any = undefined;
-				let earlyreturn = false;
-
-				const ctx: ProxyCtx<any, "construct"> = {
-					fn: constructor,
-					this: null,
+				const ctx = new ConstructHookCtx(
+					constructor,
 					args,
-					newTarget: newTarget,
-					return: (r: any) => {
-						earlyreturn = true;
-						returnValue = r;
-					},
-					call: () => {
-						earlyreturn = true;
-						returnValue = constructFn(ctx.fn, ctx.args, ctx.newTarget);
+					newTarget,
+					constructFn
+				);
 
-						return returnValue;
-					},
-				};
+				handler.construct!(ctx as any as ProxyCtx<any, "construct">);
 
-				handler.construct(ctx);
-
-				if (earlyreturn) {
-					return returnValue;
+				if (ctx.earlyreturn) {
+					return ctx.returnValue;
 				}
 
 				return constructFn(ctx.fn, ctx.args, ctx.newTarget);
 			};
 		}
 
-		if (handler.apply) {
-			h.apply = (fn: any, that: any, args: any[]) => {
-				let returnValue: any = undefined;
-				let earlyreturn = false;
+		// the apply logic, shared by the Proxy apply trap and the plain wrapper below
+		// allowFailedIntercepts is read on the first call, exactly when the old per-call check first read it
+		// (flagEnabled caches per client, so every later read returns the same value)
+		let allowFailed: boolean | undefined;
+		// hoisted: one function per hook, not one per call
+		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		const client = this;
+		const prepareStackTrace = function (err: any, s: any[]) {
+			if (
+				s[0].getFileName() &&
+				!s[0].getFileName().startsWith(client.context.prefix.href)
+			) {
+				return { stack: err.stack };
+			}
+		};
+		const applyHook = (fn: any, that: any, args: any[]) => {
+			const ctx = new ApplyHookCtx(fn, that, args, applyFn);
+			allowFailed ??= this.flagEnabled("allowFailedIntercepts");
 
-				const ctx: ProxyCtx<any, "apply"> = {
-					fn,
-					this: that,
-					args,
-					newTarget: null,
-					return: (r: any) => {
-						earlyreturn = true;
-						returnValue = r;
-					},
-					call: () => {
-						earlyreturn = true;
-						returnValue = applyFn(ctx.fn, ctx.this, ctx.args);
+			if (!debugTrampolines && allowFailed) {
+				// fast path, no error detection
+				handler.apply!(ctx as any as ProxyCtx<any, "apply">);
 
-						return returnValue;
-					},
-				};
-				if (
-					!this.flagEnabled("debugTrampolines") &&
-					this.flagEnabled("allowFailedIntercepts")
-				) {
-					// fast path, no error detection
-					handler.apply(ctx);
-
-					if (earlyreturn) {
-						return returnValue;
-					}
-					return applyFn(ctx.fn, ctx.this, ctx.args);
+				if (ctx.earlyreturn) {
+					return ctx.returnValue;
 				}
+				return applyFn(ctx.fn, ctx.this, ctx.args);
+			}
 
-				const pst = Error.prepareStackTrace;
+			const pst = Error.prepareStackTrace;
 
-				// eslint-disable-next-line @typescript-eslint/no-this-alias
-				const client = this;
-				Error.prepareStackTrace = function (err, s) {
-					if (
-						s[0].getFileName() &&
-						!s[0].getFileName().startsWith(client.context.prefix.href)
-					) {
-						return { stack: err.stack };
-					}
-				};
+			Error.prepareStackTrace = prepareStackTrace;
 
-				try {
-					handler.apply(ctx);
-				} catch (err) {
-					if (this.box.instanceof(err, "Error")) {
-						if (this.box.instanceof(err.stack, "Object")) {
-							//i'm not going to explain this
-							err.stack = err.stack.stack;
-							// eslint-disable-next-line scramjet-core/no-globals
-							console.error("ERROR FROM SCRAMJET INTERNALS", err);
-							if (!this.flagEnabled("allowFailedIntercepts")) {
-								Error.prepareStackTrace = pst;
-								throw err;
-							}
-						} else {
+			try {
+				handler.apply!(ctx as any as ProxyCtx<any, "apply">);
+			} catch (err) {
+				if (this.box.instanceof(err, "Error")) {
+					if (this.box.instanceof(err.stack, "Object")) {
+						//i'm not going to explain this
+						err.stack = err.stack.stack;
+						// eslint-disable-next-line scramjet-core/no-globals
+						console.error("ERROR FROM SCRAMJET INTERNALS", err);
+						if (!allowFailed) {
 							Error.prepareStackTrace = pst;
 							throw err;
 						}
@@ -840,21 +917,35 @@ return { apply, construct };
 						Error.prepareStackTrace = pst;
 						throw err;
 					}
+				} else {
+					Error.prepareStackTrace = pst;
+					throw err;
 				}
+			}
 
-				Error.prepareStackTrace = pst;
+			Error.prepareStackTrace = pst;
 
-				if (earlyreturn) {
-					return returnValue;
-				}
+			if (ctx.earlyreturn) {
+				return ctx.returnValue;
+			}
 
-				return applyFn(ctx.fn, ctx.this, ctx.args);
-			};
+			return applyFn(ctx.fn, ctx.this, ctx.args);
+		};
+
+		let proxy: any;
+		if (
+			handler.apply &&
+			!handler.construct &&
+			isPlainPrototypeMethod(target, value)
+		) {
+			// a plain method on a prototype: a real function is much cheaper than a Proxy apply trap
+			proxy = createMethodWrapper(prop, value, applyHook);
+		} else {
+			if (handler.apply) h.apply = applyHook;
+			h.getOwnPropertyDescriptor = getOwnPropertyDescriptorHandler;
+			proxy = new Proxy(value, h);
 		}
-
-		const proxy = new Proxy(value, h);
 		this.box.unproxy.set(proxy, value);
-		h.getOwnPropertyDescriptor = getOwnPropertyDescriptorHandler;
 		// Preserve original property descriptor (enumerable, configurable, etc.)
 		Object_defineProperty(target, prop, {
 			value: proxy,
