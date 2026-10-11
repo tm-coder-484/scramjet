@@ -236,9 +236,11 @@ function loadWasm() {
 	if (!("WASM" in self)) {
 		throw new Error("WASM not found in global scope!");
 	}
-	const wasm = Uint8Array.from(atob(self.WASM as string), (c) =>
-		c.charCodeAt(0)
-	);
+	// Uint8Array.from(string, mapFn) costs ~70ms for the 1.2 MB payload on every
+	// document/worker load; a plain loop over the decoded string is ~5ms.
+	const bin = atob(self.WASM as string);
+	const wasm = new Uint8Array(bin.length);
+	for (let i = 0; i < bin.length; i++) wasm[i] = bin.charCodeAt(i);
 	delete (self as any).WASM;
 	setWasm(wasm);
 }
