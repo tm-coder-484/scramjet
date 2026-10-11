@@ -195,44 +195,84 @@ export function rewriteUrl(
 			return url;
 		}
 
-		const encodedHash = context.interface.codecEncode(realUrl.hash.slice(1));
-		const realHash = encodedHash ? "#" + encodedHash : "";
-		realUrl.hash = "";
-
-		const paramsInit = new _URLSearchParams();
-
-		const referrerPolicy =
-			!options?.isModule && (options?.referrerPolicy ?? meta.referrerPolicy);
-		if (referrerPolicy) paramsInit.set(QP.referrerPolicy, referrerPolicy);
-		if (options?.isModule) paramsInit.set(QP.isModule, "module");
-		if (options?.topFrame) paramsInit.set(QP.topFrame, options.topFrame);
-		if (options?.parentFrame)
-			paramsInit.set(QP.parentFrame, options.parentFrame);
-		if (options?.isIframe) paramsInit.set(QP.isIframe, options.isIframe);
-		if (options?.mode) paramsInit.set(QP.mode, options.mode);
-		if (options?.credentials)
-			paramsInit.set(QP.credentials, options.credentials);
-		if (options?.destination)
-			paramsInit.set(QP.destination, options.destination);
-		if (options?.download !== undefined)
-			paramsInit.set(QP.download, options.download);
-
-		// specific tracking for sec-fetch-site
-		// don't send for the top level controller calling it in go()
-		if (meta.origin.origin !== context.prefix.origin) {
-			paramsInit.set(QP.initiatorOrigin, meta.origin.origin);
+		// the fragment is cut from href: the first "#" in a serialized url starts it, since the
+		// path and query percent-encode theirs. cheaper than the hash setter, which reparses
+		let href = realUrl.href;
+		let fragment = "";
+		const hashIndex = href.indexOf("#");
+		if (hashIndex !== -1) {
+			fragment = href.slice(hashIndex + 1);
+			href = href.slice(0, hashIndex);
 		}
-
-		let paramstring = "";
-		if (paramsInit.toString()) paramstring = "?" + paramsInit.toString();
+		const encodedHash = context.interface.codecEncode(fragment);
+		const realHash = encodedHash ? "#" + encodedHash : "";
 
 		return (
 			context.prefix.href +
-			context.interface.codecEncode(realUrl.href) +
-			paramstring +
+			context.interface.codecEncode(href) +
+			rewriteQuery(context, meta, options) +
 			realHash
 		);
 	}
+}
+
+// the application/x-www-form-urlencoded serializer URLSearchParams uses: encodeURIComponent, plus
+// "!'()~" escaped and spaces as "+"
+function formEncode(value: string): string {
+	try {
+		return encodeURIComponent(value).replace(/%20|[!'()~]/g, (c) =>
+			c === "%20" ? "+" : "%" + c.charCodeAt(0).toString(16).toUpperCase()
+		);
+	} catch {
+		// lone surrogates, which URLSearchParams replaces with U+FFFD
+		const params = new _URLSearchParams();
+		params.set("", value);
+		return params.toString().slice(1);
+	}
+}
+
+// the query rewriteUrl appends; without options it only depends on these, so the last one is
+// kept (a document's urls are rewritten with the same meta, one after another)
+let lastQueryKey: string | undefined;
+let lastQuery = "";
+
+function rewriteQuery(
+	context: ScramjetContext,
+	meta: URLMeta,
+	options?: RewriteUrlOptions
+): string {
+	const referrerPolicy =
+		!options?.isModule && (options?.referrerPolicy ?? meta.referrerPolicy);
+	// specific tracking for sec-fetch-site
+	// don't send for the top level controller calling it in go()
+	const origin = meta.origin.origin;
+	const initiatorOrigin = origin !== context.prefix.origin ? origin : "";
+
+	const plain = !options;
+	const key = plain ? (referrerPolicy || "") + "\n" + initiatorOrigin : undefined;
+	if (plain && key === lastQueryKey) return lastQuery;
+
+	// the same parameters, in the same order, as the URLSearchParams this replaced
+	const params: string[] = [];
+	const add = (name: string, value: string) =>
+		params.push(formEncode(name) + "=" + formEncode(value));
+	if (referrerPolicy) add(QP.referrerPolicy, referrerPolicy);
+	if (options?.isModule) add(QP.isModule, "module");
+	if (options?.topFrame) add(QP.topFrame, options.topFrame);
+	if (options?.parentFrame) add(QP.parentFrame, options.parentFrame);
+	if (options?.isIframe) add(QP.isIframe, options.isIframe);
+	if (options?.mode) add(QP.mode, options.mode);
+	if (options?.credentials) add(QP.credentials, options.credentials);
+	if (options?.destination) add(QP.destination, options.destination);
+	if (options?.download !== undefined) add(QP.download, options.download);
+	if (initiatorOrigin) add(QP.initiatorOrigin, initiatorOrigin);
+
+	const query = params.length ? "?" + params.join("&") : "";
+	if (plain) {
+		lastQueryKey = key;
+		lastQuery = query;
+	}
+	return query;
 }
 
 // results of unrewriting http(s) urls, for repeated reads of the same links (a.href and friends). an
