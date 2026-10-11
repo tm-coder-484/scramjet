@@ -71,7 +71,7 @@ export function getTransport(): LibcurlClient | EpoxyClient {
 function getRelayWorker() {
 	return {
 		scripts: ["/utils/scramjet-utils.js"],
-		transport: `() => new $scramjetUtils.RelayTransport({ url: ${JSON.stringify(getRelayUrl())}, prefetch: true })`,
+		transport: `() => new $scramjetUtils.RelayTransport({ url: ${JSON.stringify(getRelayUrl())}, prefetch: true, cache: true, rewriteCache: true })`,
 		// the worker's frames get the fetch-hook plugins this page would otherwise install
 		setupFrame: `(frame) => {
 			new $scramjetUtils.HttpCachePlugin().install(frame);

@@ -3,7 +3,15 @@ import { URLMeta } from "@rewriters/url";
 
 import { getRewriter, JsRewriterOutput } from "@rewriters/wasm";
 import { bytesToBase64 } from "@/shared/util";
-import { getRewrite, openDb, rewriteKey, storeRewrite } from "./jscache";
+import {
+	getRemoteRewriteCache,
+	getRewrite,
+	materialize,
+	openDb,
+	rewriteKey,
+	storeEntry,
+	storeRewrite,
+} from "./jscache";
 import {
 	JSON_stringify,
 	SyntaxError,
@@ -279,6 +287,17 @@ export async function rewriteJsWithCache(
 		return { ...hit, errors: [] };
 	}
 
+	const remote = getRemoteRewriteCache();
+	if (remote) {
+		const entry = await remote.get(key).catch(() => undefined);
+		if (entry) {
+			storeEntry(key, entry);
+			if (flagEnabled("rewriterLogs", context, base))
+				dbg.time(meta, before, `remote rewrite cache hit for "${source}"`);
+			return { ...materialize(entry, prefix), errors: [] };
+		}
+	}
+
 	const res = rewriteJsInner(js, url, context, meta, isModule);
 
 	// the output goes to the caller, which may transfer it: the cache stores its own copy,
@@ -294,6 +313,8 @@ export async function rewriteJsWithCache(
 			js,
 			prefix
 		);
+		// the remote cache computes its own copy, for the next browser
+		remote?.put(key, header, js);
 	}
 	return res;
 }

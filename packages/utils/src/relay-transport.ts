@@ -20,6 +20,13 @@ export type RelayTransportOptions = {
 	 * the network on later visits, from any browser
 	 */
 	cache?: boolean;
+	/**
+	 * use the relay's shared rewrite cache: in controller worker mode, the rewriter threads look
+	 * scripts up there before rewriting them, and send the ones they had to rewrite, which the
+	 * relay rewrites itself and keeps. A browser with an empty cache then skips the rewrites of
+	 * scripts anyone loaded through the relay before (YouTube's 10MB bundle: ~600ms).
+	 */
+	rewriteCache?: boolean;
 };
 
 type Pending = {
@@ -41,7 +48,12 @@ export class RelayTransport implements ProxyTransport {
 	private nextId = 1;
 	private streams = new Map<number, Pending>();
 
-	constructor(private options: RelayTransportOptions) {}
+	/** the relay's shared rewrite cache, read by the controller's rewriter threads */
+	rewriteCacheUrl?: string;
+
+	constructor(private options: RelayTransportOptions) {
+		if (options.rewriteCache) this.rewriteCacheUrl = options.url;
+	}
 
 	async init() {
 		this.ready = true;

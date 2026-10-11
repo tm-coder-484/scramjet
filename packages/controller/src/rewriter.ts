@@ -2,9 +2,11 @@
 // rewritten here (see rewriterPool in worker.ts), so the controller worker keeps answering other
 // requests meanwhile, and several bundles can be rewritten at once
 import "./worker-bootstrap";
+import { RelayRewriteCache } from "./remotecache";
 import {
 	rewriteJsInner,
 	rewriteJsWithCache,
+	setRemoteRewriteCache,
 	setWasm,
 	type ScramjetConfig,
 	type ScramjetContext,
@@ -15,6 +17,8 @@ type InitMessage = {
 	digest?: string;
 	config: ScramjetConfig;
 	codec: { encode: string; decode: string };
+	// the relay's shared rewrite cache (see remotecache.ts), when the transport has one
+	remoteRewriteCache?: string;
 };
 
 export type RewriteRequest = {
@@ -60,6 +64,8 @@ self.addEventListener("message", (e: MessageEvent) => {
 	if (data.$rewriter$init) {
 		const init: InitMessage = data.$rewriter$init;
 		setWasm(init.module, init.digest);
+		if (init.remoteRewriteCache)
+			setRemoteRewriteCache(new RelayRewriteCache(init.remoteRewriteCache));
 		config = init.config;
 		codecEncode = revive(init.codec.encode);
 		codecDecode = revive(init.codec.decode);

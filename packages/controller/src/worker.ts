@@ -65,6 +65,8 @@ function startRewriterPool(controller: Controller) {
 				digest,
 				config: controller.scramjetConfig,
 				codec: { encode: encode.toString(), decode: decode.toString() },
+				// a transport that comes with a shared rewrite cache (RelayTransport's rewriteCache)
+				remoteRewriteCache: (controller.transport as any).rewriteCacheUrl,
 			},
 		});
 		worker.addEventListener("message", (e) => {

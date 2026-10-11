@@ -334,6 +334,64 @@ export async function getRewrite(
 	return materialize(entry, prefix);
 }
 
+// a rewrite as a cache entry, with the prefix's offsets, or undefined when the script contains
+// the prefix itself (its occurrences would not all be the rewriter's, so it isn't cached)
+export function templateRewrite(
+	rewrite: RewriteOutput,
+	input: Uint8Array,
+	prefix: Uint8Array
+): CachedRewrite | undefined {
+	if (findBytes(input, prefix).length) return undefined;
+	return {
+		js: rewrite.js,
+		offsets: findBytes(rewrite.js, prefix),
+		map: rewrite.map,
+		tag: rewrite.tag,
+	};
+}
+
+// keeps an entry that came from elsewhere (the remote tier) in this cache's tiers
+export function storeEntry(key: string, entry: CachedRewrite) {
+	setTimeout(() =>
+		enqueue(async () => {
+			memoryPut(key, entry);
+			if (!(await openDb())) return;
+			const size = sizeOf(entry);
+			const old = pending.get(key);
+			if (old) pendingBytes -= old.size;
+			pending.set(key, { entry, size });
+			pendingBytes += size;
+			scheduleFlush();
+		})
+	);
+}
+
+/**
+ * A rewrite cache shared beyond this browser, consulted after memory and IndexedDB miss: the
+ * relay's (devrelay.ts), say, so a page loaded in a fresh profile skips rewrites any visitor
+ * already paid for. Entries must be computed by the cache's owner from the scripts it is given,
+ * never taken from clients, or one client could hand its rewrites to another.
+ */
+export type RemoteRewriteCache = {
+	/** the entry for a key (see rewriteKey), or undefined */
+	get(key: string): Promise<CachedRewrite | undefined>;
+	/**
+	 * asks the cache to compute and keep the rewrite of `input` under `header` (the same header
+	 * rewriteKey takes). `key` is this client's key for it, a hint the owner may use to skip work
+	 */
+	put(key: string, header: string, input: Uint8Array): void;
+};
+
+let remote: RemoteRewriteCache | null = null;
+
+export function setRemoteRewriteCache(cache: RemoteRewriteCache | null) {
+	remote = cache;
+}
+
+export function getRemoteRewriteCache(): RemoteRewriteCache | null {
+	return remote;
+}
+
 // stores a rewrite after the response has been returned. the caller passes a copy of the
 // rewriter output, since the response body may be transferred. input is the script that was rewritten
 export function storeRewrite(
@@ -344,16 +402,8 @@ export function storeRewrite(
 ) {
 	setTimeout(() =>
 		enqueue(async () => {
-			// the script contains the prefix itself, so its occurrences would not all be the
-			// rewriter's; leave it uncached
-			if (findBytes(input, prefix).length) return;
-
-			const entry: CachedRewrite = {
-				js: rewrite.js,
-				offsets: findBytes(rewrite.js, prefix),
-				map: rewrite.map,
-				tag: rewrite.tag,
-			};
+			const entry = templateRewrite(rewrite, input, prefix);
+			if (!entry) return;
 			memoryPut(key, entry);
 
 			// without indexedDB the entry stays in memory only

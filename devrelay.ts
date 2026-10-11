@@ -13,9 +13,16 @@
 //   server -> client  text   {t:"head", id, status, statusText, headers} | {t:"err", id, error}
 //                     binary [u32 id][chunk]...
 //                     text   {t:"end", id}
+//   the shared rewrite cache (RelayTransport's rewriteCache, used by the controller's rewriter threads):
+//   client -> server  text   {t:"rwget", id, key}
+//                     text   {t:"rwput", id, key, header, body:true} + binary [u32 id][script]
+//   server -> client  text   {t:"rwhit", id, tag, offsets, jsLength} + binary [u32 id][js][map] | {t:"rwmiss", id}
 // Websockets get their own socket: ws://<host>/relay/ws?url=&protocols=&headers=
 import http from "node:http";
 import dns from "node:dns";
+import fs from "node:fs";
+import os from "node:os";
+import { Worker } from "node:worker_threads";
 import { Agent, fetch as undiciFetch, type Dispatcher } from "undici";
 import { WebSocketServer, WebSocket } from "ws";
 import { Parser } from "htmlparser2";
@@ -400,6 +407,206 @@ class RelaySession {
 	}
 }
 
+// ---- shared rewrite cache (opt-in per client: RelayTransport's rewriteCache) ----
+// A controller's rewriter threads ask for a script's rewrite here before rewriting it themselves,
+// and send the scripts they had to rewrite. The relay rewrites those itself, with scramjet's own
+// build (packages/core/dist) in worker threads: an entry is never taken from a client, so no
+// client can hand its rewrites to another. Entries are keyed the way the browser's rewrite cache
+// keys them (rewriteKey: the build, the rewriter's config and the script's hash), and rewritten
+// under a placeholder prefix whose offsets are kept, so any prefix of the same length fits.
+const REWRITE_CACHE_LIMIT =
+	Number(process.env.RELAY_REWRITE_CACHE_MB || 256) * 1024 * 1024;
+const MAX_REWRITE_INPUT = 32 * 1024 * 1024;
+const CORE_DIST = new URL("./packages/core/dist/", import.meta.url);
+
+type RewriteEntry = {
+	js: Uint8Array;
+	map: Uint8Array | null;
+	offsets: number[];
+	tag: string;
+};
+const rewriteCache = new Map<string, { entry: RewriteEntry; size: number }>();
+let rewriteCacheBytes = 0;
+
+function rewriteCacheGet(key: string) {
+	const hit = rewriteCache.get(key);
+	if (!hit) return undefined;
+	rewriteCache.delete(key);
+	rewriteCache.set(key, hit);
+	return hit.entry;
+}
+
+function rewriteCachePut(key: string, entry: RewriteEntry) {
+	const size =
+		entry.js.byteLength + (entry.map?.byteLength ?? 0) + entry.offsets.length * 8 + 128;
+	if (size > REWRITE_CACHE_LIMIT / 4) return;
+	const old = rewriteCache.get(key);
+	if (old) {
+		rewriteCache.delete(key);
+		rewriteCacheBytes -= old.size;
+	}
+	rewriteCache.set(key, { entry, size });
+	rewriteCacheBytes += size;
+	for (const [k, v] of rewriteCache) {
+		if (rewriteCacheBytes <= REWRITE_CACHE_LIMIT) break;
+		rewriteCache.delete(k);
+		rewriteCacheBytes -= v.size;
+	}
+}
+
+// runs in each rewriter thread: scramjet's bundle, reloaded when the build changes
+const REWRITE_WORKER = String.raw`
+const { parentPort, workerData } = require("node:worker_threads");
+const fs = require("node:fs");
+const vm = require("node:vm");
+const jsPath = workerData.dist + "scramjet.js";
+const wasmPath = workerData.dist + "scramjet.wasm";
+let stamp = "";
+function load() {
+	const now = fs.statSync(jsPath).mtimeMs + ":" + fs.statSync(wasmPath).mtimeMs;
+	if (now === stamp) return false;
+	globalThis.self = globalThis;
+	vm.runInThisContext(fs.readFileSync(jsPath, "utf8"), { filename: jsPath });
+	globalThis.$scramjet.setWasm(fs.readFileSync(wasmPath));
+	stamp = now;
+	return true;
+}
+// the controller's default codec (Config.codec), the only one run here; it encodes the import
+// specifiers of modules. a script rewritten under another codec that needs it fails, and isn't kept
+const DEFAULT_CODEC = [
+	/^\(?([A-Za-z_$][\w$]*)\)?=>\1\?encodeURIComponent\(\1\):\1$/,
+	/^\(?([A-Za-z_$][\w$]*)(?::string)?\)?=>\{if\(!\1\)return\1;?returnencodeURIComponent\(\1\);?\}$/,
+];
+const isDefaultCodec = (src) => DEFAULT_CODEC.some((re) => re.test(String(src).replace(/\s+/g, "")));
+const encodeDefault = (u) => (u ? encodeURIComponent(u) : u);
+const refuse = () => { throw new Error("not the default codec"); };
+parentPort.on("message", async ({ id, header, js }) => {
+	let reloaded = false;
+	try {
+		reloaded = load();
+		const sj = globalThis.$scramjet;
+		const h = JSON.parse(header);
+		if (!Number.isInteger(h.prefixLength) || h.prefixLength < 2 || h.prefixLength > 1024)
+			throw new Error("bad prefix length");
+		// a placeholder no rewriter output contains but where the prefix goes
+		const prefix = "/" + "a".repeat(h.prefixLength - 2) + "/";
+		const context = {
+			config: { globals: h.globals, flags: h.flags, siteFlags: {} },
+			prefix: new URL(prefix, "http://relay.invalid"),
+			interface: { codecEncode: isDefaultCodec(h.codec) ? encodeDefault : refuse, codecDecode: decodeURIComponent },
+		};
+		const meta = { origin: new URL(h.origin), base: new URL(h.base) };
+		const input = new Uint8Array(js);
+		const key = await sj.rewriteKey(header, input);
+		const res = sj.rewriteJsInner(input, h.source, context, meta, !!h.isModule);
+		if (res.errors.length) return parentPort.postMessage({ id, reloaded });
+		const entry = sj.templateRewrite({ js: res.js, map: res.map, tag: res.tag }, input, new TextEncoder().encode(prefix));
+		parentPort.postMessage({ id, reloaded, key, entry });
+	} catch (e) {
+		parentPort.postMessage({ id, reloaded, error: String((e && e.message) || e) });
+	}
+});
+`;
+
+type RewriteJob = { header: string; js: ArrayBuffer; hint: string };
+
+class RewritePool {
+	private idle: Worker[] = [];
+	private queue: RewriteJob[] = [];
+	// the hints (client keys) of jobs queued or running, so a script sent twice is rewritten once
+	private hints = new Set<string>();
+	private running = new Map<Worker, RewriteJob>();
+
+	constructor(size: number) {
+		for (let i = 0; i < size; i++) {
+			const worker = new Worker(REWRITE_WORKER, {
+				eval: true,
+				workerData: { dist: CORE_DIST.pathname },
+			});
+			worker.unref();
+			worker.on("message", (m) => this.done(worker, m));
+			worker.on("error", (e) => {
+				console.warn("[relay] rewrite worker failed:", e);
+				const job = this.running.get(worker);
+				if (job) this.hints.delete(job.hint);
+				this.running.delete(worker);
+			});
+			this.idle.push(worker);
+		}
+	}
+
+	submit(job: RewriteJob) {
+		if (this.hints.has(job.hint) || this.queue.length >= 32) return;
+		this.hints.add(job.hint);
+		this.queue.push(job);
+		this.pump();
+	}
+
+	private pump() {
+		while (this.idle.length && this.queue.length) {
+			const worker = this.idle.pop()!;
+			const job = this.queue.shift()!;
+			this.running.set(worker, job);
+			worker.postMessage({ id: 0, header: job.header, js: job.js }, [job.js]);
+		}
+	}
+
+	private done(worker: Worker, m: any) {
+		const job = this.running.get(worker);
+		this.running.delete(worker);
+		if (job) this.hints.delete(job.hint);
+		// a rebuilt scramjet makes different keys and output: what's kept was made by the old one
+		if (m.reloaded) {
+			rewriteCache.clear();
+			rewriteCacheBytes = 0;
+		}
+		if (m.key && m.entry) {
+			rewriteCachePut(m.key, m.entry);
+			if (LOG)
+				console.log(
+					`[relay] rewrite cache stored ${m.key.slice(0, 12)} (${Math.round(m.entry.js.byteLength / 1024)}KB${m.key === job?.hint ? "" : ", client key differs"})`
+				);
+		} else if (LOG)
+			console.log(`[relay] rewrite not kept: ${m.error ?? "parse errors or prefix in the script"}`);
+		this.idle.push(worker);
+		this.pump();
+	}
+}
+
+let rewritePool: RewritePool | null | undefined;
+function getRewritePool() {
+	if (rewritePool === undefined) {
+		if (
+			fs.existsSync(new URL("scramjet.js", CORE_DIST)) &&
+			fs.existsSync(new URL("scramjet.wasm", CORE_DIST))
+		) {
+			rewritePool = new RewritePool(
+				Math.max(1, Math.min(2, os.availableParallelism() - 1))
+			);
+		} else {
+			console.warn(
+				"[relay] no scramjet build in packages/core/dist: the shared rewrite cache is off"
+			);
+			rewritePool = null;
+		}
+	}
+	return rewritePool;
+}
+
+function rewritePut(msg: any, body: Buffer) {
+	if (
+		typeof msg.header !== "string" ||
+		msg.header.length > 64 * 1024 ||
+		typeof msg.key !== "string" ||
+		body.byteLength > MAX_REWRITE_INPUT ||
+		rewriteCache.has(msg.key)
+	)
+		return;
+	// its own copy, transferred to the thread
+	const js = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
+	getRewritePool()?.submit({ header: msg.header, js, hint: msg.key });
+}
+
 function handleMuxSocket(ws: WebSocket) {
 	const session = new RelaySession();
 	const live = new Map<number, AbortController>();
@@ -511,7 +718,8 @@ function handleMuxSocket(ws: WebSocket) {
 			const id = data.readUInt32LE(0);
 			const msg = waitingForBody.get(id);
 			waitingForBody.delete(id);
-			if (msg) run(msg, data.subarray(4));
+			if (msg?.t === "rwput") rewritePut(msg, data.subarray(4));
+			else if (msg) run(msg, data.subarray(4));
 			return;
 		}
 		let msg: any;
@@ -523,6 +731,27 @@ function handleMuxSocket(ws: WebSocket) {
 		if (msg.t === "req") {
 			if (msg.body) waitingForBody.set(msg.id, msg);
 			else run(msg);
+		} else if (msg.t === "rwget") {
+			const entry = typeof msg.key === "string" ? rewriteCacheGet(msg.key) : undefined;
+			if (LOG)
+				console.log(
+					`[relay] rewrite cache ${entry ? `hit (${Math.round(entry.js.byteLength / 1024)}KB)` : "miss"} ${String(msg.key).slice(0, 12)}`
+				);
+			if (!entry) return sendJson({ t: "rwmiss", id: msg.id });
+			sendJson({
+				t: "rwhit",
+				id: msg.id,
+				tag: entry.tag,
+				offsets: entry.offsets,
+				jsLength: entry.js.byteLength,
+			});
+			const frame = Buffer.allocUnsafe(4 + entry.js.byteLength + (entry.map?.byteLength ?? 0));
+			frame.writeUInt32LE(msg.id, 0);
+			frame.set(entry.js, 4);
+			if (entry.map) frame.set(entry.map, 4 + entry.js.byteLength);
+			ws.send(frame);
+		} else if (msg.t === "rwput") {
+			waitingForBody.set(msg.id, msg);
 		} else if (msg.t === "abort") {
 			live.get(msg.id)?.abort();
 		}
