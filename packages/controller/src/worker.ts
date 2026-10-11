@@ -78,7 +78,7 @@ function startRewriterPool(controller: Controller) {
 		slots.push({ worker, busy: 0 });
 	}
 
-	setJsRewriteOffload((js, scriptUrl, context, meta, isModule) => {
+	setJsRewriteOffload((js, scriptUrl, context, meta, isModule, useCache) => {
 		const slot = slots.reduce((a, b) => (b.busy < a.busy ? b : a));
 		slot.busy++;
 		const id = nextId++;
@@ -93,6 +93,7 @@ function startRewriterPool(controller: Controller) {
 					origin: meta.origin.href,
 					base: meta.base.href,
 					isModule,
+					useCache,
 				},
 			});
 		});

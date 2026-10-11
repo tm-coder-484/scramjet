@@ -205,14 +205,17 @@ export function rewriteJs(
 
 /**
  * Rewrites a script somewhere else (the controller's rewriter pool), so the thread handling
- * requests isn't blocked while a big bundle is rewritten. Same inputs and result as rewriteJsInner.
+ * requests isn't blocked while a bundle is hashed, looked up in the cache, rewritten and stored.
+ * Same inputs and result as rewriteJsWithCache (or rewriteJsInner, without the cache).
  */
 export type JsRewriteOffload = (
 	js: Uint8Array,
 	url: string | null,
 	context: ScramjetContext,
 	meta: URLMeta,
-	isModule: boolean
+	isModule: boolean,
+	// false: rewrite without the cache (rewriteJsInner)
+	useCache: boolean
 ) => Promise<RewriterResult>;
 
 let jsRewriteOffload: JsRewriteOffload | null = null;
@@ -225,23 +228,21 @@ export function setJsRewriteOffload(offload: JsRewriteOffload | null) {
 // scripts under this size are rewritten every time. a small rewrite takes about 1ms, less than a
 // lookup in the disk store, which also waits for the database to open in a fresh page
 const MIN_CACHED_BYTES = 64 * 1024;
+// scripts under this size are rewritten where they are, even with an offload: a pool thread can be
+// busy with a big bundle for 100ms
+const MIN_OFFLOAD_BYTES = 16 * 1024;
 
-// rewriteJs for script bodies, with the rewriter output cached (see jscache.ts). the result
-// is the same as rewriteJs's. a hit skips the rewriter, which costs 40-80ms per MB
-export async function rewriteJsCached(
-	js: string | Uint8Array,
+/**
+ * The rewriter output for a script body, from the cache (see jscache.ts) when it has it, and
+ * stored there when it didn't. Throws if the rewrite fails; a failed rewrite is never cached.
+ */
+export async function rewriteJsWithCache(
+	js: Uint8Array,
 	url: string | null,
 	context: ScramjetContext,
 	meta: URLMeta,
-	isModule = false
-): Promise<string | Uint8Array> {
-	if (
-		typeof js === "string" ||
-		js.byteLength < MIN_CACHED_BYTES ||
-		!flagEnabled("rewriteCache", context, meta.base)
-	)
-		return rewriteJs(js, url, context, meta, isModule);
-
+	isModule: boolean
+): Promise<RewriterResult> {
 	const before = Performance_now();
 	const base = meta.base;
 	const source = url || "(unknown)";
@@ -268,29 +269,17 @@ export async function rewriteJsCached(
 		key = await rewriteKey(header, js);
 	} catch {
 		// no SubtleCrypto (an insecure origin), or no wasm yet
-		return rewriteJs(js, url, context, meta, isModule);
+		return rewriteJsInner(js, url, context, meta, isModule);
 	}
 
 	const hit = await getRewrite(key, prefix);
 	if (hit) {
 		if (flagEnabled("rewriterLogs", context, base))
 			dbg.time(meta, before, `rewrite cache hit for "${source}"`);
-		try {
-			return finishRewrite({ ...hit, errors: [] }, context, meta);
-		} catch (err) {
-			return failRewrite(err, js, url, context, meta);
-		}
+		return { ...hit, errors: [] };
 	}
 
-	let res: RewriterResult;
-	try {
-		res = jsRewriteOffload
-			? await jsRewriteOffload(js, url, context, meta, isModule)
-			: rewriteJsInner(js, url, context, meta, isModule);
-	} catch (err) {
-		// a failed rewrite is never cached
-		return failRewrite(err, js, url, context, meta);
-	}
+	const res = rewriteJsInner(js, url, context, meta, isModule);
 
 	// the output goes to the caller, which may transfer it: the cache stores its own copy,
 	// made before returning. rewrites with parse errors are not cached
@@ -305,6 +294,37 @@ export async function rewriteJsCached(
 			js,
 			prefix
 		);
+	}
+	return res;
+}
+
+// rewriteJs for script bodies, with the rewriter output cached (see jscache.ts). the result
+// is the same as rewriteJs's. a hit skips the rewriter, which costs 40-80ms per MB
+export async function rewriteJsCached(
+	js: string | Uint8Array,
+	url: string | null,
+	context: ScramjetContext,
+	meta: URLMeta,
+	isModule = false
+): Promise<string | Uint8Array> {
+	if (typeof js === "string") return rewriteJs(js, url, context, meta, isModule);
+	const useCache =
+		js.byteLength >= MIN_CACHED_BYTES &&
+		flagEnabled("rewriteCache", context, meta.base);
+	const offload =
+		jsRewriteOffload && js.byteLength >= MIN_OFFLOAD_BYTES
+			? jsRewriteOffload
+			: null;
+	if (!useCache && !offload)
+		return rewriteJs(js, url, context, meta, isModule);
+
+	let res: RewriterResult;
+	try {
+		res = offload
+			? await offload(js, url, context, meta, isModule, useCache)
+			: await rewriteJsWithCache(js, url, context, meta, isModule);
+	} catch (err) {
+		return failRewrite(err, js, url, context, meta);
 	}
 
 	try {

@@ -4,6 +4,7 @@
 import "./worker-bootstrap";
 import {
 	rewriteJsInner,
+	rewriteJsWithCache,
 	setWasm,
 	type ScramjetConfig,
 	type ScramjetContext,
@@ -24,6 +25,7 @@ export type RewriteRequest = {
 	origin: string;
 	base: string;
 	isModule: boolean;
+	useCache: boolean;
 };
 
 // eslint-disable-next-line @typescript-eslint/no-implied-eval
@@ -32,6 +34,26 @@ const revive = (source: string) => new Function(`return (${source})`)();
 let config: ScramjetConfig | null = null;
 let codecEncode: (url: string) => string;
 let codecDecode: (url: string) => string;
+
+// hashes the script, looks it up in the rewrite cache, and rewrites and stores it on a miss (or
+// just rewrites it, for the scripts too small to cache): all of it here, off the controller's thread
+async function runJob(job: RewriteRequest) {
+	try {
+		const context = {
+			config: config!,
+			prefix: new URL(job.prefix),
+			interface: { codecEncode, codecDecode },
+		} as unknown as ScramjetContext;
+		const meta = { origin: new URL(job.origin), base: new URL(job.base) };
+		const res = job.useCache
+			? await rewriteJsWithCache(job.js, job.url, context, meta, job.isModule)
+			: rewriteJsInner(job.js, job.url, context, meta, job.isModule);
+		// copied, not transferred: the cache may hold on to these bytes
+		self.postMessage({ id: job.id, res });
+	} catch (err: any) {
+		self.postMessage({ id: job.id, error: String(err?.message ?? err) });
+	}
+}
 
 self.addEventListener("message", (e: MessageEvent) => {
 	const data = e.data;
@@ -44,19 +66,6 @@ self.addEventListener("message", (e: MessageEvent) => {
 	} else if (data.$rewriter$config) {
 		config = data.$rewriter$config;
 	} else if (data.$rewriter$job) {
-		const job: RewriteRequest = data.$rewriter$job;
-		try {
-			const context = {
-				config: config!,
-				prefix: new URL(job.prefix),
-				interface: { codecEncode, codecDecode },
-			} as unknown as ScramjetContext;
-			const meta = { origin: new URL(job.origin), base: new URL(job.base) };
-			const res = rewriteJsInner(job.js, job.url, context, meta, job.isModule);
-			// copied, not transferred: the output may be a view of the rewriter's wasm memory
-			self.postMessage({ id: job.id, res });
-		} catch (err: any) {
-			self.postMessage({ id: job.id, error: String(err?.message ?? err) });
-		}
+		void runJob(data.$rewriter$job);
 	}
 });
