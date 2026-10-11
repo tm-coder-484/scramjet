@@ -696,8 +696,12 @@ async function main() {
 			"./harness/scramjet/index.ts"
 		);
 		await startHarness();
-		scramjetUrl = `http://localhost:${HARNESS_PORT}`;
-		console.log(`📡 Scramjet harness running at ${scramjetUrl}`);
+		// RUNWAY_CONTROLLER_WORKER=1: the harness page builds its controller in worker mode
+		const controllerWorker = process.env.RUNWAY_CONTROLLER_WORKER === "1";
+		scramjetUrl = `http://localhost:${HARNESS_PORT}${controllerWorker ? "/?worker" : ""}`;
+		console.log(
+			`📡 Scramjet harness running at ${scramjetUrl}${controllerWorker ? " (controller worker mode)" : ""}`
+		);
 		if (needsBareHarness) {
 			const { startBareHarness, BARE_PORT } = await import(
 				"./harness/bare/index.ts"

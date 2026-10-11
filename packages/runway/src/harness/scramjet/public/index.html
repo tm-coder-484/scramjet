@@ -28,6 +28,93 @@
 			let controller;
 			let scramjetFrame;
 
+			// RUNWAY_CONTROLLER_WORKER=1 (see harness/scramjet/index.ts) opens this page with ?worker:
+			// the controller runs in a worker and builds its transport there
+			const workerMode = new URLSearchParams(location.search).has("worker");
+
+			// worker mode: the per-test globals runway sets on this page (cleartext site and host
+			// lists) are forwarded to the worker over this channel. each message carries all of
+			// them and is acked, so a navigation can wait until the worker has applied them.
+			const CLEARTEXT_GLOBALS = [
+				"__runwayCleartextSite",
+				"__runwayCleartextHttpsHosts",
+				"__runwayCleartextHttps",
+			];
+			const cleartextState = {};
+			let cleartextSeq = 0;
+			let cleartextAckedSeq = 0;
+			let cleartextWaiters = [];
+			let cleartextPost = null;
+			if (workerMode) {
+				const wire = new BroadcastChannel("runway-cleartext");
+				wire.onmessage = (e) => {
+					if (e.data?.kind !== "runway-cleartext-ack") return;
+					cleartextAckedSeq = Math.max(cleartextAckedSeq, e.data.seq);
+					cleartextWaiters = cleartextWaiters.filter((w) => {
+						if (w.seq > cleartextAckedSeq) return true;
+						w.resolve();
+						return false;
+					});
+				};
+				cleartextPost = () => {
+					const seq = ++cleartextSeq;
+					wire.postMessage({
+						kind: "runway-cleartext",
+						seq,
+						globals: { ...cleartextState },
+					});
+					return seq;
+				};
+				for (const name of CLEARTEXT_GLOBALS) {
+					Object.defineProperty(window, name, {
+						configurable: true,
+						get: () => cleartextState[name],
+						set: (value) => {
+							cleartextState[name] = value;
+							cleartextPost();
+						},
+					});
+				}
+			}
+			// resolves once the worker has applied every cleartext global set so far
+			function cleartextSynced() {
+				const seq = cleartextPost();
+				return new Promise((resolve, reject) => {
+					const timer = setTimeout(
+						() =>
+							reject(
+								new Error(
+									"controller worker did not apply the cleartext settings"
+								)
+							),
+						10000
+					);
+					cleartextWaiters.push({
+						seq,
+						resolve: () => {
+							clearTimeout(timer);
+							resolve();
+						},
+					});
+				});
+			}
+
+			// the controller worker runs this (its source is sent there), so it can only use what
+			// the worker has: the libcurl and cleartext scripts it imported, and globalThis
+			function runwayWorkerTransport() {
+				const wire = new BroadcastChannel("runway-cleartext");
+				wire.onmessage = (e) => {
+					if (e.data?.kind !== "runway-cleartext") return;
+					Object.assign(globalThis, e.data.globals);
+					wire.postMessage({ kind: "runway-cleartext-ack", seq: e.data.seq });
+				};
+				return new RunwayCleartextHttpsTransport(
+					new LibcurlTransport.LibcurlClient({
+						wisp: "ws://localhost:4501/",
+					})
+				);
+			}
+
 			async function init() {
 				statusEl.textContent = "Registering service worker...";
 
@@ -62,32 +149,49 @@
 
 				statusEl.textContent = "Initializing controller...";
 
-				const innerTransport = new LibcurlClient({
-					wisp: "ws://localhost:4501/",
-				});
-				const transport = new RunwayCleartextHttpsTransport(innerTransport);
-
 				const sw = navigator.serviceWorker.controller ?? registration.active;
 				if (!sw) {
 					throw new Error("No service worker available for controller");
 				}
 
-				controller = new Controller({
-					serviceworker: sw,
-					transport,
-					scramjetConfig: {
-						// every RTCPeerConnection relays through the harness's TURN server
-						webrtcRelay: [
-							{
-								urls: "turn:127.0.0.1:4503?transport=tcp",
-								username: "runway",
-								credential: "runway",
-							},
-						],
-						// the rewrite cache is off for /nocache/ paths (tests/adversarial/modules.ts)
-						siteFlags: { "/nocache/": { rewriteCache: false } },
-					},
-				});
+				const scramjetConfig = {
+					// every RTCPeerConnection relays through the harness's TURN server
+					webrtcRelay: [
+						{
+							urls: "turn:127.0.0.1:4503?transport=tcp",
+							username: "runway",
+							credential: "runway",
+						},
+					],
+					// the rewrite cache is off for /nocache/ paths (tests/adversarial/modules.ts)
+					siteFlags: { "/nocache/": { rewriteCache: false } },
+				};
+
+				if (workerMode) {
+					// the transport is built inside the controller worker; the per-test globals
+					// reach it over the cleartext channel (see sync below)
+					controller = new Controller({
+						serviceworker: sw,
+						worker: {
+							scripts: [
+								"/libcurl/index.js",
+								"/runway-cleartext-https-transport.js",
+							],
+							transport: runwayWorkerTransport,
+						},
+						scramjetConfig,
+					});
+				} else {
+					const innerTransport = new LibcurlClient({
+						wisp: "ws://localhost:4501/",
+					});
+					const transport = new RunwayCleartextHttpsTransport(innerTransport);
+					controller = new Controller({
+						serviceworker: sw,
+						transport,
+						scramjetConfig,
+					});
+				}
 				window.__runwayController = controller;
 
 				await controller.ready;
@@ -104,14 +208,23 @@
 					reloadBtn.style.display = "inline-block";
 					// injectTestFunctions();
 					console.log("navigating to", url);
+					if (workerMode) {
+						cleartextSynced()
+							.then(() => scramjetFrame.go(url))
+							.catch((err) => console.error("navigation not started:", err));
+						return;
+					}
 					scramjetFrame.go(url);
 				};
 
 				window.__runwayGetProxiedUrl = (url) => {
-					return $scramjet.rewriteUrl(url, scramjetFrame.context, {
-						origin: new URL(location.href),
-						base: new URL(location.href),
-					});
+					const rewrite = () =>
+						$scramjet.rewriteUrl(url, scramjetFrame.context, {
+							origin: new URL(location.href),
+							base: new URL(location.href),
+						});
+					// the test may fetch the result right away, so the worker must have its settings
+					return workerMode ? cleartextSynced().then(rewrite) : rewrite();
 				};
 
 				window.__runwayReload = () => {
