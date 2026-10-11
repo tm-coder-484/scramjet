@@ -721,14 +721,29 @@ export class ScramjetClient {
 	// is read several times per URL rewrite (meta.origin, meta.base), so keep the last result
 	private lastRawHref: string | undefined;
 	private lastUnrewrittenHref: string | undefined;
+	// the parsed form of lastUnrewrittenHref, built lazily. it stays inside the client: it is only read
+	// by peekUrl(), and url hands out a fresh object each time since callers may mutate it
+	private cachedUrl: _URL | undefined;
 
-	get url(): _URL {
+	private syncUrl(): string {
 		const raw = this.global.location.href;
 		if (raw !== this.lastRawHref || this.lastUnrewrittenHref === undefined) {
 			this.lastUnrewrittenHref = this.unrewriteUrl(raw);
 			this.lastRawHref = raw;
+			this.cachedUrl = undefined;
 		}
-		return new _URL(this.lastUnrewrittenHref);
+		return this.lastUnrewrittenHref;
+	}
+
+	get url(): _URL {
+		return new _URL(this.syncUrl());
+	}
+
+	// read-only view of the current url, for reading its string properties (href, origin, ...).
+	// never pass it to code that might mutate it, use url for that
+	peekUrl(): _URL {
+		const href = this.syncUrl();
+		return this.cachedUrl ?? (this.cachedUrl = new _URL(href));
 	}
 
 	set url(url: _URL | string) {

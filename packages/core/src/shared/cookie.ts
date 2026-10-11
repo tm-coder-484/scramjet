@@ -20,6 +20,21 @@ export class CookieJar {
 	private cookies: Record<string, Cookie> = {};
 	// Index by domain (without leading dot)
 	private byDomain: Map<string, Cookie[]> = new Map();
+	// the last getCookies result, for the same host, path and call options. it stays valid until a
+	// cookie in it expires (expiry is the only time-dependent input), and any change to the jar clears it
+	private cached: {
+		hostname: string;
+		pathname: string;
+		fromJs: boolean;
+		sameSiteContext: string;
+		result: string;
+		computedAt: number;
+		validUntil: number;
+	} | null = null;
+
+	private invalidate() {
+		this.cached = null;
+	}
 
 	private defaultPath(url: URL): string {
 		const pathname = url.pathname;
@@ -62,6 +77,7 @@ export class CookieJar {
 	}
 
 	setCookies(cookieString: string, url: URL) {
+		this.invalidate();
 		const parsedCookies = parse(cookieString);
 
 		for (const parsedCookie of parsedCookies) {
@@ -123,7 +139,20 @@ export class CookieJar {
 		const now = _Date.now();
 		const hostname = url.hostname;
 		const pathname = url.pathname;
+		const cached = this.cached;
+		if (
+			cached !== null &&
+			cached.hostname === hostname &&
+			cached.pathname === pathname &&
+			cached.fromJs === fromJs &&
+			cached.sameSiteContext === sameSiteContext &&
+			now >= cached.computedAt &&
+			now <= cached.validUntil
+		)
+			return cached.result;
 		const validCookies: Cookie[] = [];
+		// the earliest expiry among the cookies returned: once it passes, the result can change
+		let validUntil = Infinity;
 
 		// Walk the hostname's domain suffix chain
 		let key: string | undefined = hostname;
@@ -154,20 +183,33 @@ export class CookieJar {
 					// "strict" context: all cookies allowed (no filtering)
 
 					validCookies.push(cookie);
+					if (cookie.expires !== undefined && cookie.expires < validUntil)
+						validUntil = cookie.expires;
 				}
 			}
 			const dot = key.indexOf(".");
 			key = dot === -1 ? undefined : key.slice(dot + 1);
 		}
 
-		return validCookies
+		const result = validCookies
 			.map((cookie) =>
 				cookie.name ? `${cookie.name}=${cookie.value}` : cookie.value
 			)
 			.join("; ");
+		this.cached = {
+			hostname,
+			pathname,
+			fromJs,
+			sameSiteContext,
+			result,
+			computedAt: now,
+			validUntil,
+		};
+		return result;
 	}
 
 	load(cookies: string | Record<string, Cookie>) {
+		this.invalidate();
 		if (typeof cookies === "object") {
 			console.error("??");
 			return;
@@ -189,6 +231,7 @@ export class CookieJar {
 	}
 
 	clear() {
+		this.invalidate();
 		this.cookies = {};
 		this.byDomain.clear();
 	}

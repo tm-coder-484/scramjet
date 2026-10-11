@@ -4,6 +4,7 @@ import { QP } from "@/fetch/parse";
 
 import {
 	TextEncoder_encode,
+	_Map,
 	_URL,
 	_URLSearchParams,
 	atob,
@@ -234,8 +235,17 @@ export function rewriteUrl(
 	}
 }
 
+// results of unrewriting http(s) urls, for repeated reads of the same links (a.href and friends). an
+// entry depends only on the url, the proxy prefix and the codec, so the table is dropped when the
+// prefix changes and when it fills up
+const unrewriteMemo = new _Map<string, string>();
+let unrewriteMemoPrefix: string | undefined;
+const UNREWRITE_MEMO_LIMIT = 512;
+
 export function unrewriteUrl(url: string | URL, context: ScramjetContext) {
 	url = String(url);
+	// an empty href (the common case for a.href on a bare anchor) matches no branch below and comes back as is
+	if (url === "") return url;
 	if (String_startsWith(url, "javascript:")) {
 		//TODO
 		return url;
@@ -255,6 +265,13 @@ export function unrewriteUrl(url: string | URL, context: ScramjetContext) {
 		String_startsWith(url, "http:") ||
 		String_startsWith(url, "https:")
 	) {
+		if (unrewriteMemoPrefix !== context.prefix.href) {
+			unrewriteMemo.clear();
+			unrewriteMemoPrefix = context.prefix.href;
+		}
+		const memoized = unrewriteMemo.get(url);
+		if (memoized !== undefined) return memoized;
+
 		const realUrl = tryCanParseURL(url);
 		if (!realUrl) return url;
 		if (realUrl.protocol != "http:" && realUrl.protocol != "https:") {
@@ -270,11 +287,13 @@ export function unrewriteUrl(url: string | URL, context: ScramjetContext) {
 		realUrl.hash = "";
 		realUrl.search = "";
 
-		return (
+		const result =
 			context.interface.codecDecode(
 				realUrl.href.slice(context.prefix.href.length)
-			) + realHash
-		);
+			) + realHash;
+		if (unrewriteMemo.size >= UNREWRITE_MEMO_LIMIT) unrewriteMemo.clear();
+		unrewriteMemo.set(url, result);
+		return result;
 	} else if (url == "") {
 		return url;
 	} else {

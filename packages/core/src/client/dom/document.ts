@@ -87,7 +87,7 @@ export default function (client: ScramjetClient, _self: Self) {
 
 	client.Trap("Document.prototype.domain", {
 		get() {
-			return client.url.hostname;
+			return client.peekUrl().hostname;
 		},
 		set() {
 			return false;
@@ -96,7 +96,7 @@ export default function (client: ScramjetClient, _self: Self) {
 
 	client.Trap("Document.prototype.documentURI", {
 		get() {
-			return client.url.href;
+			return client.peekUrl().href;
 		},
 		set() {
 			return false;
@@ -105,7 +105,7 @@ export default function (client: ScramjetClient, _self: Self) {
 
 	client.Trap("Document.prototype.URL", {
 		get() {
-			return client.url.href;
+			return client.peekUrl().href;
 		},
 		set() {
 			return false;
@@ -127,10 +127,16 @@ export default function (client: ScramjetClient, _self: Self) {
 		},
 	});
 
+	// the rewrite below needs a word character directly before "[src", "[href" or "[data-href", so a
+	// string that doesn't have one is left as it is (a string argument is the same value either way)
+	const selectorMayRewrite = /\w\[(?:src|href|data-href)/;
 	client.Proxy(
 		["Document.prototype.querySelector", "Document.prototype.querySelectorAll"],
 		{
 			apply(ctx) {
+				const selector = ctx.args[0];
+				if (typeof selector === "string" && !selectorMayRewrite.test(selector))
+					return;
 				ctx.args[0] = String(ctx.args[0]).replace(
 					/((?:^|\s)\b\w+\[(?:src|href|data-href))[\^]?(=['"]?(?:https?[:])?\/\/)/,
 					"$1*$2"

@@ -187,9 +187,20 @@ export default function (client: ScramjetClient, self: Self) {
 		return proxied;
 	}
 
+	// a wrapper only changes what a listener sees for the types in handlers (trusted events are
+	// rewritten), and it tracks currentEvent for window.event. window has a native window.event, so
+	// other types need no wrapper there. add and remove decide by the same type, so a listener is
+	// wrapped and unwrapped consistently
+	const wrapEveryType = !iswindow || !("event" in self);
+	const needsWrap = (args: unknown[]) => {
+		const type = args[0];
+		return wrapEveryType || typeof type !== "string" || type in handlers;
+	};
+
 	client.Proxy("EventTarget.prototype.addEventListener", {
 		apply(ctx) {
 			if (typeof ctx.args[1] !== "function") return;
+			if (!needsWrap(ctx.args)) return;
 
 			ctx.args[1] = wraplistener(ctx.args[1]);
 		},
@@ -198,6 +209,7 @@ export default function (client: ScramjetClient, self: Self) {
 	client.Proxy("EventTarget.prototype.removeEventListener", {
 		apply(ctx) {
 			if (typeof ctx.args[1] !== "function") return;
+			if (!needsWrap(ctx.args)) return;
 
 			// keep capture/options in args[2] untouched: the native call matches on them
 			ctx.args[1] = proxiedListeners.get(ctx.args[1]) ?? ctx.args[1];

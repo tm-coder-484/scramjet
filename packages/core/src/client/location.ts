@@ -44,7 +44,8 @@ export function createLocationProxy(client: ScramjetClient, self: GlobalThis) {
 		if (native.get) {
 			desc.get = new Proxy(native.get, {
 				apply() {
-					return client.url[prop];
+					// string reads only, so the cached parsed url is safe to read from
+					return client.peekUrl()[prop];
 				},
 			});
 		}
@@ -83,7 +84,7 @@ export function createLocationProxy(client: ScramjetClient, self: GlobalThis) {
 	// functions
 	fakeLocation.toString = new Proxy(self.location.toString, {
 		apply() {
-			return client.url.href;
+			return client.peekUrl().href;
 		},
 	});
 

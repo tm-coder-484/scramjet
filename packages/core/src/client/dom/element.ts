@@ -6,6 +6,7 @@ import {
 	Object_keys,
 	Object_defineProperty,
 	atob,
+	_Set,
 } from "@/shared/snapshot";
 import { bytesToBase64 } from "@/shared/util";
 import { rewriteCss, unrewriteCss } from "@rewriters/css";
@@ -21,6 +22,32 @@ import {
 	isScriptType,
 } from "@/shared/mime";
 import { eventAttributes, ForeignContext } from "@/shared/rewriters/html";
+
+// lowercase attribute names that an htmlRules entry can apply to: a "*" or a tag list. the rule lookup
+// on any other name finds nothing. __proto__ is in the set anyway: its lookup is not a tag list and
+// throws, so it keeps the slow path
+const ruleAttributeNames = new _Set<string>(["__proto__"]);
+for (const rule of htmlRules) {
+	for (const key of Object_keys(rule)) {
+		const r = rule[key];
+		if (r === "*" || Array_isArray(r)) ruleAttributeNames.add(key);
+	}
+}
+const eventAttributeNames = new _Set<string>(eventAttributes);
+
+// unrewriteHtml changes a serialized string unless it is one of the forms below. a native
+// serialization that has none of them comes back from unrewriteHtml unchanged:
+// - scramjet-attr-* read-backs are renamed, and script sources are decoded
+// - entities (&) are re-encoded, and an empty attribute (x="") comes back as a bare name (x)
+// - foreign content (svg, math) and uppercase tag or attribute names are case-folded by the parser
+// - raw text elements, comments and doctypes are re-tokenized
+// the first regex matches case-insensitively, the second is case-sensitive on purpose
+const htmlNeedsUnrewrite = (html: string) =>
+	/scramjet-attr-|&|=""|<!|<\/?(?:svg|math|noscript|iframe|noembed|noframes|xmp|plaintext)/i.test(
+		html
+	) ||
+	/<[a-z0-9-]*[A-Z]| [^ =<>]*[A-Z][^ =<>]*=/.test(html) ||
+	html.indexOf("\u0000") !== -1;
 
 function isScriptElement(client: ScramjetClient, element: Element): boolean {
 	return (
@@ -40,7 +67,7 @@ function decodeScriptSource(base64: string): string {
 }
 
 function isEventAttributeName(name: string): boolean {
-	return eventAttributes.includes(name.toLowerCase());
+	return eventAttributeNames.has(name.toLowerCase());
 }
 
 // Copies an Attr through the element's setAttribute so the attribute rules run; returns the replaced Attr.
@@ -356,7 +383,9 @@ export default function (client: ScramjetClient, self: typeof window) {
 
 	const attrs = Object_keys(attrObject);
 
+	const urlAttrs = ["src", "data", "href", "action", "formaction"];
 	for (const attr of attrs) {
+		const isUrlAttr = urlAttrs.includes(attr);
 		for (const element of attrObject[attr]) {
 			const descriptor = client.natives.call(
 				"Object.getOwnPropertyDescriptor",
@@ -366,7 +395,7 @@ export default function (client: ScramjetClient, self: typeof window) {
 			);
 			Object_defineProperty(element.prototype, attr, {
 				get() {
-					if (["src", "data", "href", "action", "formaction"].includes(attr)) {
+					if (isUrlAttr) {
 						return unrewriteUrl(descriptor.get.call(this), client.context);
 					}
 
@@ -446,6 +475,15 @@ export default function (client: ScramjetClient, self: typeof window) {
 		},
 	});
 
+	// a name can only have a scramjet-attr-* read-back if some write created one: the setAttribute and
+	// setAttributeNS hooks create them for rule and event names only, and a page that writes a
+	// scramjet-attr-* name itself (or markup containing one) sets forgedReadBack, which disables this
+	let forgedReadBack = false;
+	const mayHaveReadBack = (lowerName: string) =>
+		ruleAttributeNames.has(lowerName) ||
+		eventAttributeNames.has(lowerName) ||
+		lowerName === "script-source-src";
+
 	client.Proxy("Element.prototype.getAttribute", {
 		apply(ctx) {
 			const [name] = ctx.args;
@@ -453,6 +491,9 @@ export default function (client: ScramjetClient, self: typeof window) {
 			if (name.startsWith("scramjet-attr")) {
 				return ctx.return(null);
 			}
+
+			// no read-back can exist for this name, so the native getAttribute answers
+			if (!forgedReadBack && !mayHaveReadBack(name.toLowerCase())) return;
 
 			if (
 				client.natives.call(
@@ -512,10 +553,20 @@ export default function (client: ScramjetClient, self: typeof window) {
 	client.Proxy("Element.prototype.setAttribute", {
 		apply(ctx) {
 			let [name, value] = ctx.args;
-			const tagName = ctx.this.tagName.toLowerCase();
 
 			if (value != null) value = String(value);
 			ctx.args[1] = value;
+
+			// no rule and no inline-handler rewrite applies to this name, so the native call stands
+			const lowerName = name.toLowerCase();
+			if (lowerName.startsWith("scramjet-attr")) forgedReadBack = true;
+			if (
+				!ruleAttributeNames.has(lowerName) &&
+				!(value != null && eventAttributeNames.has(lowerName))
+			)
+				return;
+
+			const tagName = ctx.this.tagName.toLowerCase();
 
 			const ruleList = htmlRules.find((rule) => {
 				const r = rule[name.toLowerCase()];
@@ -573,6 +624,7 @@ export default function (client: ScramjetClient, self: typeof window) {
 			// TODO: this could leak by like calling stringify twice or some dumb shit lol
 			const name = String(ctx.args[1]);
 			const value = String(ctx.args[2]);
+			if (name.toLowerCase().startsWith("scramjet-attr")) forgedReadBack = true;
 
 			const ruleList = htmlRules.find((rule) => {
 				const r = rule[String(name).toLowerCase()];
@@ -723,6 +775,7 @@ export default function (client: ScramjetClient, self: typeof window) {
 			// null specifically becomes "" and not "null". undefined does not
 			if (value === null) return;
 			const html = String(value);
+			if (/scramjet-attr-/i.test(html)) forgedReadBack = true;
 			let newval;
 			const scriptBlockType = client.box.instanceof(
 				ctx.this,
@@ -783,10 +836,17 @@ export default function (client: ScramjetClient, self: typeof window) {
 				return ctx.get();
 			}
 
-			return unrewriteHtml(
-				ctx.get(),
-				foreignContextForElement(client, ctx.this)
-			);
+			const html = ctx.get();
+			const foreign = foreignContextForElement(client, ctx.this);
+			// the browser's serialization is what unrewriteHtml would return for these
+			if (
+				foreign === "html" &&
+				typeof html === "string" &&
+				!htmlNeedsUnrewrite(html)
+			)
+				return html;
+
+			return unrewriteHtml(html, foreign);
 		},
 	});
 
@@ -1066,6 +1126,7 @@ export default function (client: ScramjetClient, self: typeof window) {
 	client.Trap("Element.prototype.outerHTML", {
 		set(ctx, value: string) {
 			const html = String(value);
+			if (/scramjet-attr-/i.test(html)) forgedReadBack = true;
 			ctx.set(
 				rewriteHtml(html, client.context, client.meta, {
 					loadScripts: false,
@@ -1077,7 +1138,16 @@ export default function (client: ScramjetClient, self: typeof window) {
 			);
 		},
 		get(ctx) {
-			return unrewriteHtml(ctx.get(), insideForeignContext(client, ctx.this));
+			const html = ctx.get();
+			const foreign = insideForeignContext(client, ctx.this);
+			if (
+				foreign === "html" &&
+				typeof html === "string" &&
+				!htmlNeedsUnrewrite(html)
+			)
+				return html;
+
+			return unrewriteHtml(html, foreign);
 		},
 	});
 

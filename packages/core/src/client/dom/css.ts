@@ -1,11 +1,23 @@
 import { rewriteCss, unrewriteCss } from "@rewriters/css";
 import { ScramjetClient } from "@client/index";
-import { Reflect_apply, Reflect_get, Reflect_set } from "@/shared/snapshot";
+import {
+	Reflect_apply,
+	Reflect_get,
+	Reflect_set,
+	_WeakMap,
+} from "@/shared/snapshot";
+
+// rewriteCss only changes url(...) and @import (and backslash escapes could hide one from it), so a
+// string without any of these is returned as it is. the image functions are checked too, to be safe
+const cssMayNeedRewrite = (value: string) =>
+	/url\(|image-set\(|image\(|src\(|@import|\\/i.test(value);
 
 export default function (client: ScramjetClient) {
 	client.Proxy("CSSStyleDeclaration.prototype.setProperty", {
 		apply(ctx) {
 			if (!ctx.args[1]) return;
+			const value = ctx.args[1];
+			if (typeof value === "string" && !cssMayNeedRewrite(value)) return;
 			ctx.args[1] = rewriteCss(ctx.args[1], client.context, client.meta);
 		},
 	});
@@ -61,14 +73,19 @@ export default function (client: ScramjetClient) {
 		},
 	});
 
+	// one wrapper per style object, so repeated reads of el.style don't allocate and stay equal
+	const styleProxies = new _WeakMap<CSSStyleDeclaration, CSSStyleDeclaration>();
+
 	client.Trap("HTMLElement.prototype.style", {
 		get(ctx) {
 			// unfortunate and dumb hack. we have to trap every property of this
 			// since the prototype chain is fucked
 
 			const style = ctx.get() as CSSStyleDeclaration;
+			const existing = styleProxies.get(style);
+			if (existing) return existing;
 
-			return new Proxy(style, {
+			const proxy = new Proxy(style, {
 				get(target, prop) {
 					const value = Reflect_get(target, prop);
 
@@ -91,6 +108,8 @@ export default function (client: ScramjetClient) {
 					if (prop == "cssText" || value == "" || typeof value !== "string") {
 						return Reflect_set(target, prop, value);
 					}
+					if (!cssMayNeedRewrite(value))
+						return Reflect_set(target, prop, value);
 
 					return Reflect_set(
 						target,
@@ -99,6 +118,8 @@ export default function (client: ScramjetClient) {
 					);
 				},
 			});
+			styleProxies.set(style, proxy);
+			return proxy;
 		},
 		set(ctx, value: string) {
 			// this will actually run the trap for cssText. don't rewrite it here
