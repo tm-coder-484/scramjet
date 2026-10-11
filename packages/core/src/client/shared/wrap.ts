@@ -200,20 +200,33 @@ export default function (client: ScramjetClient, self: GlobalThis) {
 	});
 	Object_defineProperty(self, client.config.globals.wrappropertyfn, {
 		// receiver is only passed for `receiver[key]`, where it is a plain identifier or `this`
+		// every computed member access in rewritten code goes through this (obj[$prop(key, obj)]),
+		// so the common case has to be cheap: a key that isn't a string, or is a string of another
+		// length, returns after one typeof and one length check. call sites see every type of key,
+		// and four plain === tests against such keys cost about twice as much
 		value: function (str: any, receiver?: any) {
-			if (
-				str === "location" ||
-				str === "parent" ||
-				str === "top" ||
-				str === "eval"
-			) {
-				const alias = client.config.globals.wrappropertybase + str;
-				if (isNullProtoDictionary(receiver, alias)) return str;
-
-				return alias;
+			if (typeof str !== "string") return str;
+			switch (str.length) {
+				case 8:
+					if (str !== "location") return str;
+					break;
+				case 6:
+					if (str !== "parent") return str;
+					break;
+				case 3:
+					if (str !== "top") return str;
+					break;
+				case 4:
+					if (str !== "eval") return str;
+					break;
+				default:
+					return str;
 			}
 
-			return str;
+			const alias = client.config.globals.wrappropertybase + str;
+			if (isNullProtoDictionary(receiver, alias)) return str;
+
+			return alias;
 		},
 		writable: false,
 		configurable: false,
