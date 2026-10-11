@@ -84,6 +84,8 @@
 								credential: "runway",
 							},
 						],
+						// the rewrite cache is off for /nocache/ paths (tests/adversarial/modules.ts)
+						siteFlags: { "/nocache/": { rewriteCache: false } },
 					},
 				});
 				window.__runwayController = controller;

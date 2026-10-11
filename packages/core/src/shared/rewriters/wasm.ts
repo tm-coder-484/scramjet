@@ -13,6 +13,13 @@ export function setWasm(u8: Uint8Array | ArrayBuffer) {
 	wasm_u8 = u8 instanceof Uint8Array ? u8 : new Uint8Array(u8);
 }
 
+// the rewriter binary, for versioning the rewrite cache
+export function getWasmBytes(): Uint8Array {
+	if (!wasm_u8)
+		throw new Error("rewriter wasm not found (was setWasm called?)");
+	return wasm_u8;
+}
+
 const MAGIC = "\0asm".split("").map((x) => x.charCodeAt(0));
 
 let wasmInitialized = false;

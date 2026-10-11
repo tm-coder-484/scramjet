@@ -31,6 +31,8 @@ const flagDescriptions: Record<keyof ScramjetFlags, string> = {
 		"wrap web worker scripts in data urls to prevent scope issues (potentially buggy)",
 	viewTransitions:
 		"allow view transition animations (chromium can crash the tab running these in an iframe, e.g. youtube)",
+	rewriteCache:
+		"cache rewritten scripts in the browser, so repeat loads skip the rewriter",
 	scramitize:
 		"Trigger debugger whenever the string 'scramjet' or the real location is detected in attacker code (debug feature)",
 	rewriterLogs: "Enable rewriter logging (debug feature)",

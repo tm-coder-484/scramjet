@@ -11,7 +11,7 @@ import {
 	isJavascriptMimeType,
 	rewriteCss,
 	rewriteHtml,
-	rewriteJs,
+	rewriteJsCached,
 	rewriteWorkers,
 } from "@/shared";
 import { sniffEncoding } from "@/shared/sniffEncoding";
@@ -55,7 +55,7 @@ export async function rewriteBody(
 					return response.body;
 				}
 
-				let rewritten = rewriteJs(
+				let rewritten = await rewriteJsCached(
 					new Uint8Array(await response.arrayBuffer()),
 					response.url,
 					handler.context,
@@ -80,7 +80,7 @@ export async function rewriteBody(
 			return rewriteCss(await response.text(), handler.context, parsed.meta);
 		case "sharedworker":
 		case "worker":
-			return rewriteWorkers(
+			return await rewriteWorkers(
 				new Uint8Array(await response.arrayBuffer()),
 				response.url,
 				handler.context,

@@ -29,6 +29,7 @@ export type ScramjetFlags = {
 	debugSourceURL: boolean;
 	encapsulateWorkers: boolean;
 	viewTransitions: boolean;
+	rewriteCache: boolean;
 };
 
 export interface ScramjetConfig {
