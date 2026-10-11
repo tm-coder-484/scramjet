@@ -4,8 +4,10 @@ import "./worker-bootstrap";
 import { Controller, type Frame } from "./index";
 import {
 	setJsRewriteOffload,
+	warmUpRewriter,
 	type RewriterResult,
 	type ScramjetConfig,
+	type ScramjetContext,
 } from "@mercuryworkshop/scramjet";
 
 // the worker's $scramjetController is the same API, so scripts loaded into the worker (plugins
@@ -103,6 +105,32 @@ function startRewriterPool(controller: Controller) {
 		},
 	};
 }
+// the first document would otherwise be rewritten by cold code (see warmUpRewriter), while the
+// requests for its stylesheets wait behind it. ~20-40ms, once, before the controller says it's ready
+async function warmUp(controller: Controller) {
+	const prefix = new URL(controller.prefix + "warmup/", location.href);
+	const { encode, decode } = controller.config.codec;
+	const context = {
+		config: controller.scramjetConfig,
+		prefix,
+		cookieJar: controller.cookieJar,
+		interface: {
+			getInjectScripts: (_meta, _handler, _htmlcontext, script) => [
+				script(controller.config.scramjetPath),
+				script(controller.config.injectPath),
+			],
+			getWorkerInjectScripts: () => "",
+			codecEncode: encode,
+			codecDecode: decode,
+		},
+	} as ScramjetContext;
+	try {
+		await warmUpRewriter(context);
+	} catch {
+		// only a missed speedup
+	}
+}
+
 let setupFrame: ((frame: Frame) => void) | null = null;
 // messages that arrive before the controller exists, i.e. while scripts load
 const early: any[] = [];
@@ -154,8 +182,9 @@ self.addEventListener("message", (e: MessageEvent) => {
 		});
 		for (const m of early.splice(0)) handle(m);
 		controller.wait().then(
-			() => {
+			async () => {
 				pool = startRewriterPool(controller!);
+				await warmUp(controller!);
 				self.postMessage({ $worker$ready: true });
 			},
 			(err) => self.postMessage({ $worker$error: String(err) })

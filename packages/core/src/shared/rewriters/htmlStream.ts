@@ -576,6 +576,25 @@ function concatBytes(chunks: Uint8Array[], length: number): Uint8Array {
 	return out;
 }
 
+// the stream's chunks are read in microtasks, one after another while they are queued, so a
+// document arriving faster than it is rewritten would hold the thread (the controller's, which also
+// answers the page's other requests) until its end. after this much work, the rewrite waits for a
+// task, so the requests queued meanwhile (the stylesheets the document needs first) go through.
+// a cold first document can take 100ms+ to rewrite
+const SLICE_MS = 4;
+const _MessageChannel = globalThis.MessageChannel;
+
+function yieldToTasks(): Promise<void> {
+	return new Promise((resolve) => {
+		const { port1, port2 } = new _MessageChannel();
+		port1.onmessage = () => {
+			port1.close();
+			resolve();
+		};
+		port2.postMessage(null);
+	});
+}
+
 /**
  * Whether documents can be streamed: the html pre/post hooks see the whole tree, so any plugin
  * on them keeps the buffered path.
@@ -608,12 +627,22 @@ export function rewriteHtmlStream(
 		rewriter = new HtmlStreamRewriter(context, meta, htmlcontext);
 	};
 
+	// when this run of work started: reset by a yield, or by a read that had to wait for data
+	let sliceStart = Performance_now();
+
 	return new _ReadableStream<Uint8Array>({
 		async pull(controller) {
 			try {
 				/* eslint-disable no-await-in-loop */
 				for (;;) {
+					if (_MessageChannel && Performance_now() - sliceStart > SLICE_MS) {
+						await yieldToTasks();
+						sliceStart = Performance_now();
+					}
+					const before = Performance_now();
 					const { done, value } = await reader.read();
+					const after = Performance_now();
+					if (after - before > 1) sliceStart = after;
 
 					if (done) {
 						if (!rewriter) {
