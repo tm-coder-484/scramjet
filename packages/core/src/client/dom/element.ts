@@ -980,6 +980,17 @@ export default function (client: ScramjetClient, self: typeof window) {
 					client.init.hookSubcontext(realwin, ctx.this);
 				}
 
+				// every proxied site shares one real origin, so the browser's same-origin check
+				// passes for another site's frame. refuse it here, as the browser would
+				const framed = (realwin as Self)[SCRAMJETCLIENT];
+				if (
+					framed &&
+					framed.url.protocol.startsWith("http") &&
+					framed.url.origin !== client.url.origin
+				) {
+					return null;
+				}
+
 				return realwin.document;
 			},
 		}

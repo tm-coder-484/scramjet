@@ -75,6 +75,7 @@ export async function doHandleFetch(
 		// for document.referer
 		parsed.trackedClient?.history.push({
 			url: parsed.url.href,
+			referrer: newheaders.get("Referer") ?? "",
 			refererPolicy: ScramjetHeaders.fromRawHeaders(response.rawHeaders).get(
 				"referrer-policy"
 			),

@@ -239,4 +239,16 @@ export default [
 			localStorage.removeItem("pw");
 		`,
 	}),
+	basicTest({
+		name: "storage-event-constructor-storagearea",
+		js: `
+			// a synthetic StorageEvent may name the page's own Storage as its storageArea
+			const ev = new StorageEvent("storage", { key: "k", newValue: "v", storageArea: localStorage });
+			assertEqual(ev.key, "k", "event.key");
+			assertEqual(ev.newValue, "v", "event.newValue");
+			assert(ev.storageArea === localStorage, "storageArea should be the page's localStorage");
+			const s = new StorageEvent("storage", { storageArea: sessionStorage });
+			assert(s.storageArea === sessionStorage, "storageArea should be the page's sessionStorage");
+		`,
+	}),
 ];

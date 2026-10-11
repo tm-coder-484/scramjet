@@ -1,7 +1,7 @@
 import { iswindow } from "@client/entry";
 import { SCRAMJETCLIENT } from "@/symbols";
 import { ScramjetClient } from "@client/index";
-import { Object_defineProperty } from "@/shared/snapshot";
+import { Object_defineProperty, String } from "@/shared/snapshot";
 import { POLLUTANT } from "./realm";
 
 export default function (client: ScramjetClient, self: Self) {
@@ -73,12 +73,40 @@ export default function (client: ScramjetClient, self: Self) {
 			},
 		});
 
+	// every proxied site shares one real origin, so channel names are namespaced per proxied origin.
+	// an about: frame (e.g. an iframe without src) has no origin of its own, so it uses its creator's
+	const channelOrigin = () => {
+		if (client.url.protocol === "about:" && self.parent !== self) {
+			try {
+				const parent = (self.parent as Self)[SCRAMJETCLIENT];
+				if (parent) return parent.url.origin;
+			} catch {
+				// a real cross-origin parent: keep this frame's own origin
+			}
+		}
+		return client.url.origin;
+	};
+
+	client.Proxy("BroadcastChannel", {
+		construct(ctx) {
+			if (ctx.args.length === 0) return;
+			ctx.args[0] = `${channelOrigin()}@${String(ctx.args[0])}`;
+		},
+	});
+
+	client.Trap("BroadcastChannel.prototype.name", {
+		get(ctx) {
+			const name = String(ctx.get());
+			return name.substring(name.indexOf("@") + 1);
+		},
+	});
+
 	client.Proxy("BroadcastChannel.prototype.postMessage", {
 		apply(ctx) {
 			ctx.args[0] = {
 				$scramjet$messagetype: "window",
 				// TODO: need to actually look up the broadcastchannel itself in box i think
-				$scramjet$origin: client.url.origin,
+				$scramjet$origin: channelOrigin(),
 				$scramjet$data: ctx.args[0],
 			};
 		},

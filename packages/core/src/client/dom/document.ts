@@ -115,7 +115,8 @@ export default function (client: ScramjetClient, _self: Self) {
 	client.Trap("Document.prototype.referrer", {
 		get() {
 			if (!client.history) return "";
-			if (client.history.length < 2) return "";
+			// the first document of a frame or tab has no previous page, so use the navigation's referrer
+			if (client.history.length < 2) return client.history[0]?.referrer ?? "";
 			const lastState = client.history[client.history.length - 2];
 			const referrerURL = new _URL(lastState.url);
 			return createReferrerString(

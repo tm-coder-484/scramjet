@@ -434,8 +434,17 @@ class ExecutionContextWrapper {
 			sendSetCookie: async (cookies, options) => {
 				await this.transport.sendSetCookie(cookies, options);
 			},
-			shouldBlockMessageEvent: () => {
-				return false;
+			shouldBlockMessageEvent: (ev) => {
+				// a BroadcastChannel message has no source, and its envelope names the sender's proxied origin.
+				// channel names already keep proxied sites apart, so this only refuses a mismatch that gets through.
+				// about: frames take their origin from their creator, so they are not checked here
+				const data: unknown = ev.data;
+				if (ev.source !== null || typeof data !== "object" || data === null)
+					return false;
+				if (!("$scramjet$origin" in data) || !("$scramjet$messagetype" in data))
+					return false;
+				if (this.client.url.protocol === "about:") return false;
+				return data.$scramjet$origin !== this.client.url.origin;
 			},
 			createWorkerTransport: () => this.transport.fork(),
 			hookSubcontext: (frameself) => {
