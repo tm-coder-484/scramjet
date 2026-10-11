@@ -48,6 +48,7 @@ export type Config = {
 	scramjetPath: string;
 	injectPath: string;
 	workerPath: string;
+	rewriterPath: string;
 	wasmPath: string;
 	virtualWasmPath: string;
 	codec: Record<"encode" | "decode", (input: string) => string>;
@@ -58,6 +59,7 @@ export const config: Config = {
 	scramjetPath: "/scramjet/scramjet.js",
 	injectPath: "/controller/controller.inject.js",
 	workerPath: "/controller/controller.worker.js",
+	rewriterPath: "/controller/controller.rewriter.js",
 	wasmPath: "/scramjet/scramjet.wasm",
 	virtualWasmPath: "scramjet.wasm.js",
 	codec: {

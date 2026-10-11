@@ -2,6 +2,11 @@
 // it handles every proxied request (transport, cookies, rewriting) off that page's main thread
 import "./worker-bootstrap";
 import { Controller, type Frame } from "./index";
+import {
+	setJsRewriteOffload,
+	type RewriterResult,
+	type ScramjetConfig,
+} from "@mercuryworkshop/scramjet";
 
 // the worker's $scramjetController is the same API, so scripts loaded into the worker (plugins
 // from scramjet-utils, say) can use it
@@ -23,6 +28,81 @@ type WorkerInitMessage = {
 const revive = (source: string) => new Function(`return (${source})`)();
 
 let controller: Controller | null = null;
+let pool: { updateConfig(config: ScramjetConfig): void } | null = null;
+
+// big scripts are rewritten on a few rewriter threads (controller.rewriter.js) instead of this
+// one, so this thread keeps answering requests while a bundle is rewritten, and bundles that
+// arrive together are rewritten in parallel. they share the compiled rewriter module
+function startRewriterPool(controller: Controller) {
+	const module = (self as any)[Symbol.for("scramjet wasm module")];
+	if (!module) return null;
+	const digest = (self as any)[Symbol.for("scramjet wasm digest")];
+	const size = Math.max(
+		1,
+		Math.min(3, (navigator.hardwareConcurrency || 2) - 1)
+	);
+	const url = new URL(controller.config.rewriterPath, location.href);
+	url.searchParams.set(
+		"scramjet",
+		new URL(location.href).searchParams.get("scramjet")!
+	);
+	const { encode, decode } = controller.config.codec;
+
+	type Slot = { worker: Worker; busy: number };
+	const pending = new Map<
+		number,
+		{ resolve: (r: RewriterResult) => void; reject: (e: Error) => void; slot: Slot }
+	>();
+	let nextId = 1;
+	const slots: Slot[] = [];
+	for (let i = 0; i < size; i++) {
+		const worker = new Worker(url, { name: "scramjet rewriter" });
+		worker.postMessage({
+			$rewriter$init: {
+				module,
+				digest,
+				config: controller.scramjetConfig,
+				codec: { encode: encode.toString(), decode: decode.toString() },
+			},
+		});
+		worker.addEventListener("message", (e) => {
+			const job = pending.get(e.data.id);
+			if (!job) return;
+			pending.delete(e.data.id);
+			job.slot.busy--;
+			if (e.data.error !== undefined) job.reject(new Error(e.data.error));
+			else job.resolve(e.data.res);
+		});
+		slots.push({ worker, busy: 0 });
+	}
+
+	setJsRewriteOffload((js, scriptUrl, context, meta, isModule) => {
+		const slot = slots.reduce((a, b) => (b.busy < a.busy ? b : a));
+		slot.busy++;
+		const id = nextId++;
+		return new Promise<RewriterResult>((resolve, reject) => {
+			pending.set(id, { resolve, reject, slot });
+			slot.worker.postMessage({
+				$rewriter$job: {
+					id,
+					js,
+					url: scriptUrl,
+					prefix: context.prefix.href,
+					origin: meta.origin.href,
+					base: meta.base.href,
+					isModule,
+				},
+			});
+		});
+	});
+
+	return {
+		updateConfig(config: ScramjetConfig) {
+			for (const slot of slots)
+				slot.worker.postMessage({ $rewriter$config: config });
+		},
+	};
+}
 let setupFrame: ((frame: Frame) => void) | null = null;
 // messages that arrive before the controller exists, i.e. while scripts load
 const early: any[] = [];
@@ -39,6 +119,7 @@ function handle(data: any) {
 	} else if (data.$worker$config) {
 		// frames read the config through the controller, so updating it in place is enough
 		Object.assign(controller.scramjetConfig, data.$worker$config);
+		pool?.updateConfig(controller.scramjetConfig);
 	}
 }
 
@@ -73,7 +154,10 @@ self.addEventListener("message", (e: MessageEvent) => {
 		});
 		for (const m of early.splice(0)) handle(m);
 		controller.wait().then(
-			() => self.postMessage({ $worker$ready: true }),
+			() => {
+				pool = startRewriterPool(controller!);
+				self.postMessage({ $worker$ready: true });
+			},
 			(err) => self.postMessage({ $worker$error: String(err) })
 		);
 	} catch (err) {

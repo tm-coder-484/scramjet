@@ -548,6 +548,7 @@ const controllerConfig = createGenericConfig({
 		inject: join(controllerdir, "src/inject.ts"),
 		sw: join(controllerdir, "src/sw.ts"),
 		worker: join(controllerdir, "src/worker.ts"),
+		rewriter: join(controllerdir, "src/rewriter.ts"),
 	},
 	output: {
 		filename: "controller.[name].js",

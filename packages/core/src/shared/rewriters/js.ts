@@ -16,7 +16,7 @@ import {
 	String_startsWith,
 } from "../snapshot";
 
-type RewriterResult = {
+export type RewriterResult = {
 	js: string | Uint8Array;
 	map: Uint8Array | null;
 	tag: string;
@@ -203,6 +203,25 @@ export function rewriteJs(
 	}
 }
 
+/**
+ * Rewrites a script somewhere else (the controller's rewriter pool), so the thread handling
+ * requests isn't blocked while a big bundle is rewritten. Same inputs and result as rewriteJsInner.
+ */
+export type JsRewriteOffload = (
+	js: Uint8Array,
+	url: string | null,
+	context: ScramjetContext,
+	meta: URLMeta,
+	isModule: boolean
+) => Promise<RewriterResult>;
+
+let jsRewriteOffload: JsRewriteOffload | null = null;
+
+/** routes the rewrites of big scripts (the ones rewriteJsCached handles) through `offload` */
+export function setJsRewriteOffload(offload: JsRewriteOffload | null) {
+	jsRewriteOffload = offload;
+}
+
 // scripts under this size are rewritten every time. a small rewrite takes about 1ms, less than a
 // lookup in the disk store, which also waits for the database to open in a fresh page
 const MIN_CACHED_BYTES = 64 * 1024;
@@ -265,7 +284,9 @@ export async function rewriteJsCached(
 
 	let res: RewriterResult;
 	try {
-		res = rewriteJsInner(js, url, context, meta, isModule);
+		res = jsRewriteOffload
+			? await jsRewriteOffload(js, url, context, meta, isModule)
+			: rewriteJsInner(js, url, context, meta, isModule);
 	} catch (err) {
 		// a failed rewrite is never cached
 		return failRewrite(err, js, url, context, meta);
