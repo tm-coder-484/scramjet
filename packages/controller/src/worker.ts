@@ -66,6 +66,11 @@ self.addEventListener("message", (e: MessageEvent) => {
 					self.postMessage({ $worker$toSW: message }, { transfer }),
 			},
 		});
+		// for debugging and instrumentation from devtools
+		Object.defineProperty(self, Symbol.for("scramjet controller"), {
+			value: controller,
+			configurable: true,
+		});
 		for (const m of early.splice(0)) handle(m);
 		controller.wait().then(
 			() => self.postMessage({ $worker$ready: true }),
