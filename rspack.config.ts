@@ -2,6 +2,7 @@ import { readFileSync, writeFileSync, chmodSync } from "node:fs";
 import { readFile } from "node:fs/promises";
 import { join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { createRequire } from "node:module";
 const __dirname = fileURLToPath(new URL(".", import.meta.url));
 import { exec, execSync } from "node:child_process";
 const execAsync = promisify(exec);
@@ -333,6 +334,10 @@ const createScramjetConfig = (options: ScramjetBuildConfig) => {
 				"@rewriters": join(scramjetdir, "src/shared/rewriters"),
 				"@client": join(scramjetdir, "src/client"),
 				"@": join(scramjetdir, "src"),
+				// dom-serializer only uses entities' escapers, but importing the package root pulled in
+				// entities@4's decode tables too, which are built when the bundle loads: ~4ms in every
+				// proxied document. htmlparser2 decodes with entities@8 ("entities/decode"), unaffected
+				entities$: entitiesEscape,
 			},
 		},
 		output,
@@ -381,6 +386,15 @@ const createScramjetConfig = (options: ScramjetBuildConfig) => {
 		...extraConfig,
 	});
 };
+
+// entities@4's lib/esm/escape.js, resolved from dom-serializer (the package's exports map hides
+// the file, so go through its main entry)
+const entitiesEscape = join(
+	createRequire(
+		createRequire(join(scramjetdir, "package.json")).resolve("dom-serializer")
+	).resolve("entities"),
+	"../esm/escape.js"
+);
 
 const sjpackagemeta = JSON.parse(
 	await readFile(join(scramjetdir, "package.json"), "utf-8")
