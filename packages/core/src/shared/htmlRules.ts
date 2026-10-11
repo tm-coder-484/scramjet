@@ -171,6 +171,7 @@ export const htmlRules: {
 		},
 		href: [
 			"use",
+			"script",
 			"textPath",
 			"mpath",
 			"feImage",

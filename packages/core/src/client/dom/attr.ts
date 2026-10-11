@@ -12,9 +12,16 @@ export default function (client: ScramjetClient) {
 	client.Trap("Element.prototype.attributes", {
 		get(ctx) {
 			const map = ctx.get() as NamedNodeMap;
+			const owner = ctx.this as Element;
 			const proxy = new Proxy(map, {
 				get(target, prop, _receiver) {
 					const value = Reflect_get(target, prop);
+
+					// setNamedItem would write the raw attribute map, so go through the element's setAttributeNode
+					if (prop === "setNamedItem") {
+						// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value -- the page's own element; its hooked setAttributeNode applies the rules
+						return (attr: Attr) => owner.setAttributeNode(attr);
+					}
 
 					if (prop === "length") {
 						return Object_keys(proxy).length;

@@ -499,7 +499,7 @@ export function rewriteSrcset(
 // 	return Uint8Array.from(binString, (m) => m.codePointAt(0));
 // }
 
-const eventAttributes = [
+export const eventAttributes = [
 	"onbeforexrselect",
 	"onabort",
 	"onbeforeinput",

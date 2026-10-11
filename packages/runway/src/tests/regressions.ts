@@ -3,6 +3,45 @@ import { basicTest, serverTest } from "../testcommon.ts";
 
 export default [
 	// scramjet/core
+	// non-JS <script> data islands (Spotify, GitHub) read undefined from textContent/innerText
+	// because HTMLScriptElement.prototype had a trap with no own accessor to read from
+	basicTest({
+		name: "regression-script-data-island-textcontent",
+		js: `
+			const json = document.createElement("script");
+			json.type = "application/json";
+			json.textContent = '{"a":1,"b":[2,3]}';
+			document.head.appendChild(json);
+			assertEqual(json.textContent, '{"a":1,"b":[2,3]}', "json textContent");
+			assertEqual(json.innerText, '{"a":1,"b":[2,3]}', "json innerText");
+			assertEqual(JSON.parse(json.textContent).b[1], 3, "json parses");
+
+			const plain = document.createElement("script");
+			plain.type = "text/plain";
+			plain.id = "plain-island";
+			plain.textContent = "hello island";
+			document.head.appendChild(plain);
+			assertEqual(document.getElementById("plain-island").textContent, "hello island", "plain textContent");
+
+			const js = document.createElement("script");
+			js.textContent = "window.__r4Ran = 7;";
+			document.head.appendChild(js);
+			assertEqual(js.textContent, "window.__r4Ran = 7;", "js textContent returns source");
+			assertEqual(js.text, "window.__r4Ran = 7;", "js text returns source");
+			assertEqual(window.__r4Ran, 7, "js script ran");
+
+			js.textContent = "window.__r4Ran = 8;";
+			assertEqual(js.text, "window.__r4Ran = 8;", "text set after creation reads back");
+
+			const s = document.createElement("script");
+			s.type = "text/plain";
+			s.textContent = "before";
+			s.textContent = "after";
+			assertEqual(s.textContent, "after", "second write on non-JS script");
+		`,
+	}),
+
+	// scramjet/core
 	// introduced by: ?
 	// fixed by: https://github.com/HeyPuter/browser.js/commit/1715a6aeb072284b58ce38f807f1b14f5151dd7a
 	basicTest({

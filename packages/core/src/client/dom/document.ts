@@ -73,7 +73,7 @@ export default function (client: ScramjetClient, _self: Self) {
 		},
 	});
 
-	client.Proxy("Document.prototype.parseHTMLUnsafe", {
+	client.Proxy("Document.parseHTMLUnsafe", {
 		apply(ctx) {
 			const html = String(ctx.args[0]);
 			ctx.args[0] = rewriteHtml(html, client.context, client.meta, {
