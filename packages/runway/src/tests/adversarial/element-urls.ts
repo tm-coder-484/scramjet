@@ -87,6 +87,26 @@ export default [
 		`,
 	}),
 	basicTest({
+		// URLs in a srcset may contain commas; every candidate must survive rewriting, or the
+		// browser picks a different (often far larger) image
+		name: "elurls-srcset-commas-in-urls",
+		js: `
+			const set = "/big.png?w=4000 4000w, /img.png?resize=300,225 300w, /img.png?resize=768,576 768w, /data,with,commas.png 1000w";
+			const img = document.createElement("img");
+			img.sizes = "300px";
+			img.srcset = set;
+			assertEqual(img.getAttribute("srcset"), set, "srcset attribute");
+			const d = document.createElement("div");
+			d.innerHTML = '<img sizes="300px" srcset="' + set + '">';
+			document.body.appendChild(d);
+			const parsed = d.querySelector("img");
+			assertEqual(parsed.getAttribute("srcset"), set, "parsed srcset attribute");
+			await new Promise((r) => { parsed.onload = parsed.onerror = r; setTimeout(r, 1000); });
+			assert(String(parsed.currentSrc).includes("resize=300") || String(parsed.currentSrc).includes("resize%3D300"),
+				"the 300w candidate was selected: " + parsed.currentSrc);
+		`,
+	}),
+	basicTest({
 		name: "elurls-parsed-from-html",
 		js: `
 			const d = document.createElement("div");

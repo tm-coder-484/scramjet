@@ -1,6 +1,7 @@
 import { htmlRules } from "@/shared/htmlRules";
 import {
 	String,
+	Array_isArray,
 	TextEncoder_encode,
 	Object_keys,
 	Object_defineProperty,
@@ -26,6 +27,16 @@ function isScriptElement(client: ScramjetClient, element: Element): boolean {
 		client.box.instanceof(element, "HTMLScriptElement") ||
 		client.box.instanceof(element, "SVGScriptElement")
 	);
+}
+
+// reverses the storage of script source: UTF-8 bytes, base64 encoded
+function decodeScriptSource(base64: string): string {
+	const binary = atob(base64);
+	let escaped = "";
+	for (let i = 0; i < binary.length; i++) {
+		escaped += "%" + binary.charCodeAt(i).toString(16).padStart(2, "0");
+	}
+	return decodeURIComponent(escaped);
 }
 
 function isEventAttributeName(name: string): boolean {
@@ -138,9 +149,9 @@ function collectAttributeMap(
 function findRule(name: string, tagName: string) {
 	return htmlRules.find((rule) => {
 		const r = rule[name.toLowerCase()];
-		if (!r) return false;
 		if (r === "*") return true;
-		if (typeof r === "function") return false; // this can't happen but ts
+		// only tag lists are rules: this also skips the fn key and Object.prototype keys such as __proto__
+		if (!Array_isArray(r)) return false;
 
 		return r.includes(tagName.toLowerCase());
 	});
@@ -152,6 +163,130 @@ function isDownloadAttribute(element: Element, name: string) {
 		String(name).toLowerCase() === "download" &&
 		(tagName === "a" || tagName === "area")
 	);
+}
+
+// Attributes of a node that the parser built without the HTML rewriter: the originals go to
+// scramjet-attr-*, the same way setAttribute stores them, so reads still return the original.
+// Natives are used so the rewritten values are not rewritten again by the hooks.
+function setParsedAttribute(
+	client: ScramjetClient,
+	element: Element,
+	name: string,
+	value: string,
+	rewritten: string | null
+) {
+	if (rewritten === null) {
+		client.natives.call("Element.prototype.removeAttribute", element, name);
+	} else {
+		const attr = client.natives.call(
+			"Element.prototype.getAttributeNode",
+			element,
+			name
+		) as Attr | null;
+		// keep the namespace, so xlink:href and friends stay namespaced
+		client.natives.call(
+			"Element.prototype.setAttributeNS",
+			element,
+			attr?.namespaceURI ?? null,
+			name,
+			rewritten
+		);
+	}
+	client.natives.call(
+		"Element.prototype.setAttribute",
+		element,
+		`scramjet-attr-${name}`,
+		value
+	);
+}
+
+function rewriteParsedScript(client: ScramjetClient, element: Element) {
+	const scriptBlockType = scriptBlockTypeForElement(client, element);
+	if (!isScriptType(scriptBlockType)) return;
+
+	// the whole text, across every text and CDATA child, is the script source
+	const source = client.descriptors.get(
+		"Node.prototype.textContent",
+		element
+	) as string;
+	if (!source) return;
+
+	client.natives.call(
+		"Element.prototype.setAttribute",
+		element,
+		"scramjet-attr-script-source-src",
+		bytesToBase64(TextEncoder_encode(source))
+	);
+	// the native setter replaces the children with one text node holding the rewritten source
+	client.descriptors.set(
+		"Node.prototype.textContent",
+		element,
+		rewriteJs(
+			source,
+			"(anonymous script element)",
+			client.context,
+			client.meta,
+			isModuleScriptType(scriptBlockType)
+		) as string
+	);
+}
+
+// Rewrites an element parsed outside the HTML path (XML/XHTML documents, XHR documents, XSLT output),
+// with the same attribute rules the HTML rewriter applies
+function rewriteParsedElement(client: ScramjetClient, element: Element) {
+	const names = client.natives.call(
+		"Element.prototype.getAttributeNames",
+		element
+	) as string[];
+	for (const name of names) {
+		const lower = name.toLowerCase();
+		const rule = findRule(lower, element.tagName);
+		if (!rule && !isEventAttributeName(lower)) continue;
+
+		const value = client.natives.call(
+			"Element.prototype.getAttribute",
+			element,
+			name
+		) as string;
+		if (rule) {
+			const rewritten = rule.fn(
+				value,
+				client.context,
+				client.meta,
+				collectAttributeMap(client, element, name, value)
+			);
+			setParsedAttribute(client, element, name, value, rewritten);
+		} else {
+			// inline handlers such as onerror have no htmlRules entry
+			setParsedAttribute(
+				client,
+				element,
+				name,
+				value,
+				rewriteJs(
+					value,
+					`(inline ${name} on element)`,
+					client.context,
+					client.meta
+				) as string
+			);
+		}
+	}
+
+	if (isScriptElement(client, element)) rewriteParsedScript(client, element);
+}
+
+// The HTML path rewrites its parsed tree as a string; documents from DOMParser (XML types), XHR
+// responses and XSLT results are already DOM trees, so this walks them once after they are built.
+// Only the parse APIs call this, never the normal DOM operations.
+export function rewriteParsedDocument(
+	client: ScramjetClient,
+	root: Document | DocumentFragment
+) {
+	const elements = root.querySelectorAll("*");
+	for (let i = 0; i < elements.length; i++) {
+		rewriteParsedElement(client, elements[i]);
+	}
 }
 
 export default function (client: ScramjetClient, self: typeof window) {
@@ -610,7 +745,7 @@ export default function (client: ScramjetClient, self: typeof window) {
 					"Element.prototype.setAttribute",
 					ctx.this,
 					"scramjet-attr-script-source-src",
-					bytesToBase64(TextEncoder_encode(newval))
+					bytesToBase64(TextEncoder_encode(html))
 				);
 			} else if (client.box.instanceof(ctx.this, "HTMLStyleElement")) {
 				newval = rewriteCss(html, client.context, client.meta);
@@ -639,7 +774,7 @@ export default function (client: ScramjetClient, self: typeof window) {
 				);
 
 				if (scriptSource) {
-					return atob(scriptSource);
+					return decodeScriptSource(scriptSource);
 				}
 
 				return ctx.get();
@@ -689,7 +824,7 @@ export default function (client: ScramjetClient, self: typeof window) {
 				element,
 				"scramjet-attr-script-source-src"
 			);
-			if (scriptSource) return atob(scriptSource);
+			if (scriptSource) return decodeScriptSource(scriptSource);
 			return text;
 		}
 		if (client.box.instanceof(element, "HTMLStyleElement")) {
@@ -704,6 +839,170 @@ export default function (client: ScramjetClient, self: typeof window) {
 			? client.descriptors.get("Node.prototype.parentElement", node)
 			: (node as Element);
 
+	// Script text. A JS script keeps its original source in scramjet-attr-script-source-src, and its
+	// children hold the rewritten output. A change to the text rewrites the whole source once: the
+	// stored source stands in for the carrier Text child, an edited node contributes its new value,
+	// and other children contribute their raw text. Non-JS scripts are left alone.
+	const isText = (node: unknown): node is Text =>
+		client.box.instanceof(node, "Text");
+
+	const isJsScript = (node: Element): boolean =>
+		isScriptElement(client, node) &&
+		isScriptType(scriptBlockTypeForElement(client, node));
+
+	const parentElementOf = (node: Node): Element | null =>
+		client.descriptors.get("Node.prototype.parentElement", node);
+
+	// the stored original source, or null when the script's text was never rewritten
+	const storedScriptSource = (script: Element): string | null => {
+		const stored = client.natives.call(
+			"Element.prototype.getAttribute",
+			script,
+			"scramjet-attr-script-source-src"
+		);
+		return stored === null ? null : decodeScriptSource(stored);
+	};
+
+	const scriptChildren = (script: Element): Node[] => {
+		const children: Node[] = [];
+		for (
+			let child = client.descriptors.get("Node.prototype.firstChild", script);
+			child;
+			child = client.descriptors.get("Node.prototype.nextSibling", child)
+		) {
+			children.push(child);
+		}
+		return children;
+	};
+
+	// the text a child adds to its script; comments and processing instructions add none
+	const childText = (node: Node): string => {
+		const type = client.descriptors.get("Node.prototype.nodeType", node);
+		if (type === 7 || type === 8) return "";
+		return client.descriptors.get("Node.prototype.textContent", node) ?? "";
+	};
+
+	const firstText = (children: Node[]): Text | null =>
+		children.find(isText) ?? null;
+
+	// the script source after a change: the stored source stands for `carrier`, and `edited` takes `editedText`
+	const sourceAfter = (
+		children: Node[],
+		carrier: Node | null,
+		prior: string,
+		edited: Node | null,
+		editedText: string
+	): string => {
+		let source = "";
+		for (const child of children) {
+			if (child === edited) source += editedText;
+			else if (child === carrier) source += prior;
+			else source += childText(child);
+		}
+		return source;
+	};
+
+	// rewrites the whole source once and stores it, then leaves one Text child holding the output.
+	// `keep` keeps its identity while it is still a child, so later edits through it still reach the script
+	const commitScript = (
+		script: Element,
+		children: Node[],
+		source: string,
+		keep: Node | null
+	) => {
+		const rewritten = rewriteTextForElement(script, source);
+		const kept = keep && children.includes(keep) ? keep : firstText(children);
+		for (const child of children) {
+			if (child !== kept)
+				client.natives.call("Node.prototype.removeChild", script, child);
+		}
+		if (kept) {
+			const current = childText(kept);
+			if (current !== rewritten) {
+				client.natives.call(
+					"CharacterData.prototype.replaceData",
+					kept,
+					0,
+					current.length,
+					rewritten
+				);
+			}
+		} else if (rewritten) {
+			const doc = client.descriptors.get(
+				"Node.prototype.ownerDocument",
+				script
+			);
+			client.natives.call(
+				"Node.prototype.appendChild",
+				script,
+				client.natives.call("Document.prototype.createTextNode", doc, rewritten)
+			);
+		}
+	};
+
+	// runs a native insertion into a JS script, then rewrites the script's whole source
+	const insertIntoScript = <R>(
+		script: Element,
+		insert: () => R,
+		inserted: unknown[]
+	): R => {
+		const stored = storedScriptSource(script);
+		const prior = stored ?? "";
+		const carrier = stored === null ? null : firstText(scriptChildren(script));
+		const result = insert();
+		const children = scriptChildren(script);
+		const keep =
+			inserted.find(
+				(node): node is Text => isText(node) && children.includes(node)
+			) ?? null;
+		commitScript(
+			script,
+			children,
+			sourceAfter(children, carrier, prior, null, ""),
+			keep
+		);
+		return result;
+	};
+
+	// edits one Text child of a JS script; `next` maps the child's old logical text to its new text
+	const editScriptText = (
+		text: Text,
+		script: Element,
+		next: (current: string) => string
+	) => {
+		const stored = storedScriptSource(script);
+		const prior = stored ?? "";
+		const children = scriptChildren(script);
+		const carrier = stored === null ? null : firstText(children);
+		const current = text === carrier ? prior : childText(text);
+		commitScript(
+			script,
+			children,
+			sourceAfter(children, carrier, prior, text, next(current)),
+			text
+		);
+	};
+
+	// a CharacterData method run on a detached copy of the logical text, so argument errors throw as natively
+	const editTextOnScript = (
+		text: Text,
+		script: Element,
+		run: (scratch: Text) => void
+	) =>
+		editScriptText(text, script, (current) => {
+			const doc = client.descriptors.get(
+				"Node.prototype.ownerDocument",
+				script
+			);
+			const scratch = client.natives.call(
+				"Document.prototype.createTextNode",
+				doc,
+				current
+			);
+			run(scratch);
+			return childText(scratch);
+		});
+
 	// Only prototypes that own the accessor can be trapped: HTMLScriptElement.prototype
 	// has no own textContent/innerText, so a trap there would read undefined from ctx.get().
 	// Node.prototype.textContent and HTMLElement.prototype.innerText already cover scripts.
@@ -712,6 +1011,12 @@ export default function (client: ScramjetClient, self: typeof window) {
 		{
 			set(ctx, value) {
 				const text = String(value);
+				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+				const node = ctx.this;
+				const parent = isText(node) ? parentElementOf(node) : null;
+				if (isText(node) && parent && isJsScript(parent)) {
+					return editScriptText(node, parent, () => text);
+				}
 				// the raw node is passed only to client helpers, as rewriteTextForElement(ctx.this) already is
 				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
 				const owner = textOwnerFor(ctx.this);
@@ -730,11 +1035,14 @@ export default function (client: ScramjetClient, self: typeof window) {
 		set(ctx, value) {
 			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
 			const node = ctx.this;
-			if (!client.box.instanceof(node, "Text")) return ctx.set(value);
+			if (!isText(node)) return ctx.set(value);
 			const text = String(value);
-			const owner = textOwnerFor(node);
-			if (!owner) return ctx.set(text);
-			return ctx.set(rewriteTextForElement(owner, text));
+			const parent = parentElementOf(node);
+			if (parent && isJsScript(parent)) {
+				return editScriptText(node, parent, () => text);
+			}
+			if (!parent) return ctx.set(text);
+			return ctx.set(rewriteTextForElement(parent, text));
 		},
 		get(ctx) {
 			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
@@ -835,40 +1143,73 @@ export default function (client: ScramjetClient, self: typeof window) {
 		},
 	});
 
-	// TODO: this needs to be done for all insert methods
-	// client.Proxy(["Element.prototype.appendChild", "Element.prototype.append"], {
-	// 	apply(ctx) {
-	// 		if (ctx.this instanceof self.HTMLStyleElement) {
-	// 			for (const node of ctx.args) {
-	// 				if (node instanceof self.Text) {
-	// 					node.data = rewriteCss(
-	// 						ctx.args[0].data,
-	// 						client.context,
-	// 						client.meta
-	// 					);
-	// 				}
-	// 			}
-	// 		} else if (ctx.this instanceof self.HTMLScriptElement) {
-	// 			for (const node of ctx.args) {
-	// 				if (node instanceof self.Text) {
-	// 					const newval: string = rewriteJs(
-	// 						node.data,
-	// 						"(anonymous script element)",
-	// 						client.context,
-	// 						client.meta
-	// 					) as string;
-	// 					client.natives.call(
-	// 						"Element.prototype.setAttribute",
-	// 						ctx.this,
-	// 						"scramjet-attr-script-source-src",
-	// 						bytesToBase64(encoder.encode(newval))
-	// 					);
-	// 					node.data = newval;
-	// 				}
-	// 			}
-	// 		}
-	// 	},
-	// });
+	// Insertions into a script. The target check runs first, so other nodes pay only the tag check.
+	// nodeName is "SCRIPT" for HTML and "script" for SVG; the native getter is cheaper than the realm-wide
+	// instanceof walks, and the full check runs only when the name matches
+	const nodeNameGetter =
+		client.descriptors.store["Node.prototype.nodeName"].get!;
+	const isJsScriptNode = (node: any): boolean => {
+		const name = nodeNameGetter.call(node);
+		return (
+			(name === "SCRIPT" || name === "script") &&
+			isScriptElement(client, node) &&
+			isJsScript(node)
+		);
+	};
+
+	client.Proxy("Node.prototype.appendChild", {
+		apply(ctx) {
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			if (!isJsScriptNode(ctx.this)) return;
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			ctx.return(insertIntoScript(ctx.this, () => ctx.call(), [ctx.args[0]]));
+		},
+	});
+	client.Proxy("Node.prototype.insertBefore", {
+		apply(ctx) {
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			if (!isJsScriptNode(ctx.this)) return;
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			ctx.return(insertIntoScript(ctx.this, () => ctx.call(), [ctx.args[0]]));
+		},
+	});
+	client.Proxy("Node.prototype.replaceChild", {
+		apply(ctx) {
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			if (!isJsScriptNode(ctx.this)) return;
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			ctx.return(insertIntoScript(ctx.this, () => ctx.call(), [ctx.args[0]]));
+		},
+	});
+	client.Proxy(
+		[
+			"Element.prototype.append",
+			"Element.prototype.prepend",
+			"Element.prototype.replaceChildren",
+		],
+		{
+			apply(ctx) {
+				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+				if (!isJsScriptNode(ctx.this)) return;
+				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+				ctx.return(insertIntoScript(ctx.this, () => ctx.call(), ctx.args));
+			},
+		}
+	);
+	client.Proxy("Element.prototype.insertAdjacentText", {
+		apply(ctx) {
+			// beforebegin and afterend insert into the parent, the other positions into the element
+			const position = String(ctx.args[0]).toLowerCase();
+			const target =
+				position === "beforebegin" || position === "afterend"
+					? // eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+						client.descriptors.get("Node.prototype.parentNode", ctx.this)
+					: // eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+						ctx.this;
+			if (!target || !isJsScriptNode(target)) return;
+			ctx.return(insertIntoScript(target, () => ctx.call(), []));
+		},
+	});
 
 	client.Proxy("Audio", {
 		construct(ctx) {
@@ -877,34 +1218,55 @@ export default function (client: ScramjetClient, self: typeof window) {
 	});
 	client.Proxy("Text.prototype.appendData", {
 		apply(ctx) {
-			const text = String(ctx.args[0]);
-			const parent = client.descriptors.get(
-				"Node.prototype.parentElement",
-				ctx.this
-			);
-			ctx.args[0] = rewriteTextForElement(parent, text);
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			const parent = parentElementOf(ctx.this);
+			if (parent && isJsScript(parent)) {
+				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+				const args = ctx.args;
+				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+				editTextOnScript(ctx.this, parent, (s) =>
+					// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+					client.natives.call("CharacterData.prototype.appendData", s, ...args)
+				);
+				return ctx.return(undefined);
+			}
+			ctx.args[0] = rewriteTextForElement(parent, String(ctx.args[0]));
 		},
 	});
 
 	client.Proxy("Text.prototype.insertData", {
 		apply(ctx) {
-			const text = String(ctx.args[1]);
-			const parent = client.descriptors.get(
-				"Node.prototype.parentElement",
-				ctx.this
-			);
-			ctx.args[1] = rewriteTextForElement(parent, text);
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			const parent = parentElementOf(ctx.this);
+			if (parent && isJsScript(parent)) {
+				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+				const args = ctx.args;
+				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+				editTextOnScript(ctx.this, parent, (s) =>
+					// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+					client.natives.call("CharacterData.prototype.insertData", s, ...args)
+				);
+				return ctx.return(undefined);
+			}
+			ctx.args[1] = rewriteTextForElement(parent, String(ctx.args[1]));
 		},
 	});
 
 	client.Proxy("Text.prototype.replaceData", {
 		apply(ctx) {
-			const text = String(ctx.args[2]);
-			const parent = client.descriptors.get(
-				"Node.prototype.parentElement",
-				ctx.this
-			);
-			ctx.args[2] = rewriteTextForElement(parent, text);
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			const parent = parentElementOf(ctx.this);
+			if (parent && isJsScript(parent)) {
+				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+				const args = ctx.args;
+				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+				editTextOnScript(ctx.this, parent, (s) =>
+					// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+					client.natives.call("CharacterData.prototype.replaceData", s, ...args)
+				);
+				return ctx.return(undefined);
+			}
+			ctx.args[2] = rewriteTextForElement(parent, String(ctx.args[2]));
 		},
 	});
 
@@ -912,16 +1274,19 @@ export default function (client: ScramjetClient, self: typeof window) {
 		get(ctx) {
 			const parent = client.descriptors.get(
 				"Node.prototype.parentElement",
+				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
 				ctx.this
 			);
 			return getTextForElement(parent, ctx.get());
 		},
 		set(ctx, v) {
 			const text = String(v);
-			const parent = client.descriptors.get(
-				"Node.prototype.parentElement",
-				ctx.this
-			);
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			const parent = parentElementOf(ctx.this);
+			if (parent && isJsScript(parent)) {
+				// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+				return editScriptText(ctx.this, parent, () => text);
+			}
 			return ctx.set(rewriteTextForElement(parent, text));
 		},
 	});
@@ -1017,8 +1382,12 @@ export default function (client: ScramjetClient, self: typeof window) {
 		apply(ctx) {
 			const html = String(ctx.args[0]);
 			const mime = String(ctx.args[1]);
-			// TODO: what do we do if it's xml/svg?
-			if (!isHtmlMimeType(mime)) return;
+			if (!isHtmlMimeType(mime)) {
+				// xml and xhtml are parsed by the browser, so rewrite the resulting tree instead
+				const doc = ctx.call();
+				rewriteParsedDocument(client, doc);
+				return ctx.return(doc);
+			}
 			ctx.args[0] = rewriteHtml(html, client.context, client.meta, {
 				loadScripts: false,
 				inline: true,
@@ -1027,4 +1396,18 @@ export default function (client: ScramjetClient, self: typeof window) {
 			});
 		},
 	});
+
+	client.Proxy(
+		[
+			"XSLTProcessor.prototype.transformToDocument",
+			"XSLTProcessor.prototype.transformToFragment",
+		],
+		{
+			apply(ctx) {
+				const result = ctx.call();
+				if (result) rewriteParsedDocument(client, result);
+				return ctx.return(result);
+			},
+		}
+	);
 }

@@ -1,6 +1,8 @@
 import { getFlag, ScramjetContext } from "@/shared";
 import { rewriteUrl, unrewriteUrl, URLMeta } from "@rewriters/url";
 import { ScramjetClient } from "@client/index";
+import { rewriteParsedDocument } from "@client/dom/element";
+import { _WeakMap } from "@/shared/snapshot";
 
 export default function (client: ScramjetClient, self: Self) {
 	let worker;
@@ -117,6 +119,33 @@ export default function (client: ScramjetClient, self: Self) {
 			});
 
 			ctx.return(undefined);
+		},
+	});
+
+	// document responses are built by the browser from the raw body, so they are walked once per XHR
+	const walkedDocuments = new _WeakMap() as WeakMap<XMLHttpRequest, Document>;
+	const rewriteResponseDocument = (xhr: XMLHttpRequest, value: unknown) => {
+		if (
+			client.box.instanceof(value, "Document") &&
+			walkedDocuments.get(xhr) !== value
+		) {
+			walkedDocuments.set(xhr, value as Document);
+			rewriteParsedDocument(client, value as Document);
+		}
+		return value;
+	};
+
+	// the raw xhr and document are only passed to client helpers, which read them through natives
+	client.Trap("XMLHttpRequest.prototype.responseXML", {
+		get(ctx) {
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			return rewriteResponseDocument(ctx.this, ctx.get());
+		},
+	});
+	client.Trap("XMLHttpRequest.prototype.response", {
+		get(ctx) {
+			// eslint-disable-next-line scramjet-core/no-poisoned-ctx-value
+			return rewriteResponseDocument(ctx.this, ctx.get());
 		},
 	});
 

@@ -40,6 +40,7 @@ export type Config = {
 	prefix: string;
 	scramjetPath: string;
 	injectPath: string;
+	workerPath: string;
 	wasmPath: string;
 	virtualWasmPath: string;
 	codec: Record<"encode" | "decode", (input: string) => string>;
@@ -49,6 +50,7 @@ export const config: Config = {
 	prefix: DEFAULT_PREFIX,
 	scramjetPath: "/scramjet/scramjet.js",
 	injectPath: "/controller/controller.inject.js",
+	workerPath: "/controller/controller.worker.js",
 	wasmPath: "/scramjet/scramjet.wasm",
 	virtualWasmPath: "scramjet.wasm.js",
 	codec: {
@@ -202,15 +204,41 @@ function makeId(): string {
 
 const deepMerge = deepmerge();
 
+/**
+ * Run request handling (the transport, cookies and all rewriting) in a dedicated worker
+ * instead of on this page's main thread. Proxied frames are same-origin with this page, so
+ * they share its main thread: without a worker, every request waits whenever the proxied
+ * site runs script or lays out. Fetch hooks tapped on this page's frames are not called in
+ * this mode; install them in the worker with `setupFrame`.
+ */
+export type ControllerWorkerInit = {
+	/** classic scripts the worker loads first, e.g. the transport implementation */
+	scripts?: string[];
+	/** creates the transport inside the worker; serialized with toString, so it can't close over anything */
+	transport: (() => ProxyTransport) | string;
+	/** runs in the worker for each frame, e.g. to install plugins on its fetch hooks; serialized like `transport` */
+	setupFrame?: ((frame: Frame) => void) | string;
+	/** the worker script, defaults to config.workerPath */
+	path?: string;
+};
+
 type ControllerInit = {
-	serviceworker: ServiceWorker;
-	transport: ProxyTransport;
+	serviceworker?: ServiceWorker;
+	transport?: ProxyTransport;
 	config?: Partial<Config>;
 	scramjetConfig?: Partial<ScramjetConfig>;
+	worker?: ControllerWorkerInit;
+	/** @internal set by the worker: the facade's id, and how to reach the service worker */
+	headless?: {
+		id: string;
+		postToServiceWorker: (message: any, transfer: Transferable[]) => void;
+	};
 };
 
 type FrameOptions = {
-	plugins: ManagedPlugin[];
+	plugins?: ManagedPlugin[];
+	/** @internal the worker reuses the facade's frame ids */
+	id?: string;
 };
 
 export class Controller {
@@ -272,7 +300,7 @@ export class Controller {
 		},
 		request: async (data) => {
 			const path = new URL(data.rawUrl).pathname;
-			const frame = this.frames.find((f) => path.startsWith(f.prefix));
+			const frame = await this.findFrame(path);
 			if (!frame) throw new Error("No frame found for request");
 			try {
 				// doesn't actually *load* every request, but hold up requests until the promise finishes
@@ -453,7 +481,7 @@ export class Controller {
 
 	constructor(public init: ControllerInit) {
 		assertRuntimeScramjetVersion();
-		this.id = makeId();
+		this.id = init.headless?.id ?? makeId();
 		this.config = deepMerge(config, init.config || {}) as Config;
 		this.scramjetConfig = deepMerge(scramjetConfig, scramjetDefaultConfig);
 		this.scramjetConfig = deepMerge(
@@ -461,7 +489,14 @@ export class Controller {
 			init.scramjetConfig || {}
 		) as ScramjetConfig;
 		this.prefix = this.config.prefix + this.id + "/";
-		this.serviceWorkerController = init.serviceworker;
+		this.serviceWorkerController = init.serviceworker!;
+		this.transport = init.transport!;
+
+		if (init.worker) {
+			this.ready = this.startWorker(init.worker);
+			this.rpc = null!;
+			return;
+		}
 
 		this.ready = Promise.all([
 			new Promise<void>((resolve) => {
@@ -481,7 +516,6 @@ export class Controller {
 				this.port.postMessage(data, transfer);
 			}
 		);
-		this.transport = init.transport;
 
 		this.cookieSyncChannel.addEventListener(
 			"message",
@@ -489,45 +523,117 @@ export class Controller {
 		);
 		this.setupMessagePort();
 
-		navigator.serviceWorker.addEventListener("message", (e) => {
-			if (
-				e.data?.$controller$setCookie &&
-				typeof e.data.$controller$setCookie === "object"
-			) {
-				const payload = e.data.$controller$setCookie as {
-					cookies?: SerializedCookieSyncEntry[];
-					options?: CookieSyncOptions;
-					id?: string;
-				};
+		// a headless controller (in the worker) gets these forwarded by its page
+		if (!init.headless) {
+			navigator.serviceWorker.addEventListener("message", (e) => {
+				this.handleServiceWorkerMessage(e.data);
+			});
+		}
+	}
 
-				if (payload.options?.clear) {
-					this.cookieJar.clear();
-				}
-				this.applyCookieSyncEntries(payload.cookies);
+	private postToServiceWorker(message: any, transfer: Transferable[] = []) {
+		if (this.init.headless) {
+			this.init.headless.postToServiceWorker(message, transfer);
+		} else {
+			this.serviceWorkerController.postMessage(message, transfer);
+		}
+	}
 
-				if (typeof payload.id === "string") {
-					this.serviceWorkerController.postMessage({
-						$sw$setCookieDone: {
-							id: payload.id,
-						},
-					});
-				}
+	/** @internal handles a message the service worker posted to this page */
+	handleServiceWorkerMessage(data: any) {
+		if (
+			data?.$controller$setCookie &&
+			typeof data.$controller$setCookie === "object"
+		) {
+			const payload = data.$controller$setCookie as {
+				cookies?: SerializedCookieSyncEntry[];
+				options?: CookieSyncOptions;
+				id?: string;
+			};
 
+			if (payload.options?.clear) {
+				this.cookieJar.clear();
+			}
+			this.applyCookieSyncEntries(payload.cookies);
+
+			if (typeof payload.id === "string") {
+				this.postToServiceWorker({
+					$sw$setCookieDone: {
+						id: payload.id,
+					},
+				});
+			}
+
+			return;
+		}
+
+		if (data?.$controller$swrevive) {
+			const known = data.$controller$swrevive.known;
+			if (Array.isArray(known)) {
+				if (known.includes(this.id)) return;
+			} else if (this.guardServiceWorkerRevive) {
+				// older service workers don't say who they know. if we just spawned it,
+				// it will send this even though it's not actually dead
 				return;
 			}
+			this.setupMessagePort();
+		}
+	}
 
-			if (e.data.$controller$swrevive) {
-				const known = e.data.$controller$swrevive.known;
-				if (Array.isArray(known)) {
-					if (known.includes(this.id)) return;
-				} else if (this.guardServiceWorkerRevive) {
-					// older service workers don't say who they know. if we just spawned it,
-					// it will send this even though it's not actually dead
-					return;
+	private worker: Worker | null = null;
+
+	// worker mode: this page keeps the frames and the API, a headless Controller in a worker
+	// does the rest. it talks to the service worker through this page, except for the request
+	// port, which goes straight from the service worker to the worker
+	private startWorker(workerInit: ControllerWorkerInit): Promise<void> {
+		const abs = (path: string) => new URL(path, location.href).href;
+		const url = new URL(abs(workerInit.path ?? this.config.workerPath));
+		url.searchParams.set("scramjet", abs(this.config.scramjetPath));
+		const worker = new Worker(url, { name: "scramjet controller" });
+		this.worker = worker;
+
+		const ready = new Promise<void>((resolve, reject) => {
+			worker.addEventListener("message", (e) => {
+				const data = e.data;
+				if (data?.$worker$ready) {
+					this.isReady = true;
+					resolve();
+				} else if (data?.$worker$error) {
+					reject(new Error(data.$worker$error));
+				} else if (data?.$worker$toSW) {
+					this.serviceWorkerController.postMessage(
+						data.$worker$toSW,
+						e.ports as unknown as Transferable[]
+					);
 				}
-				this.setupMessagePort();
+			});
+			worker.addEventListener("error", (e) =>
+				reject(new Error("controller worker failed to start: " + e.message))
+			);
+		});
+
+		navigator.serviceWorker.addEventListener("message", (e) => {
+			if (e.data?.$controller$setCookie || e.data?.$controller$swrevive) {
+				worker.postMessage({ $worker$sw: e.data });
 			}
 		});
+
+		const { encode, decode } = this.config.codec;
+		worker.postMessage({
+			$worker$init: {
+				id: this.id,
+				config: {
+					...this.config,
+					codec: { encode: encode.toString(), decode: decode.toString() },
+				},
+				scramjetConfig: this.scramjetConfig,
+				scripts: (workerInit.scripts ?? []).map(abs),
+				transport: workerInit.transport.toString(),
+				setupFrame: workerInit.setupFrame?.toString(),
+			},
+		});
+
+		return ready;
 	}
 
 	private setupMessagePort() {
@@ -546,7 +652,7 @@ export class Controller {
 		this.port.addEventListener("message", this.onTabChannelMessage);
 		this.port.start();
 
-		this.serviceWorkerController.postMessage(
+		this.postToServiceWorker(
 			{
 				$controller$init: {
 					prefix: this.prefix,
@@ -627,7 +733,28 @@ export class Controller {
 		});
 	}
 
+	private frameWaiters: (() => void)[] = [];
+
+	/** @internal the frame a proxied url belongs to. in a worker, the page may not have told us about it yet */
+	async findFrame(path: string): Promise<Frame | undefined> {
+		const deadline = Date.now() + 5000;
+		let frame = this.frames.find((f) => path.startsWith(f.prefix));
+		while (!frame && this.init.headless && Date.now() < deadline) {
+			await new Promise<void>((resolve) => {
+				this.frameWaiters.push(resolve);
+				setTimeout(resolve, deadline - Date.now());
+			});
+			frame = this.frames.find((f) => path.startsWith(f.prefix));
+		}
+		return frame;
+	}
+
 	setTransport(transport: ProxyTransport) {
+		if (this.worker) {
+			throw new Error(
+				"setTransport isn't supported for a controller running in a worker"
+			);
+		}
 		this.transport = transport;
 		for (const frame of this.frames) {
 			frame.controller.transport = transport;
@@ -644,6 +771,8 @@ export class Controller {
 		element ??= document.createElement("iframe");
 		const frame = new Frame(this, element, options);
 		this.frames.push(frame);
+		this.worker?.postMessage({ $worker$frame: { id: frame.id } });
+		for (const resolve of this.frameWaiters.splice(0)) resolve();
 		return frame;
 	}
 
@@ -772,7 +901,7 @@ export class Frame {
 		public element: HTMLIFrameElement,
 		public options: FrameOptions = {}
 	) {
-		this.id = makeId();
+		this.id = options.id ?? makeId();
 		this.prefix = this.controller.prefix + this.id + "/";
 
 		this.fetchHandler = new ScramjetFetchHandler({

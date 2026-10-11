@@ -474,26 +474,54 @@ function traverseParsedHtml(
 	return node;
 }
 
+// a srcset is a comma-separated list of candidates: a URL (a run of non-whitespace) and optional
+// descriptors. URLs may contain commas themselves (`img.png?resize=300,225 300w`), so this follows
+// the HTML parsing algorithm instead of splitting on commas: dropping candidates makes the browser
+// pick another one, often the full-size original
+const isSrcsetSpace = (c: string) =>
+	c === " " || c === "\t" || c === "\n" || c === "\f" || c === "\r";
+
 export function rewriteSrcset(
 	srcset: string,
 	context: ScramjetContext,
 	meta: URLMeta
 ) {
-	const sources = srcset.split(/ .*,/).map((src) => src.trim());
-	const rewrittenSources = sources.map((source) => {
-		// Split into URLs and descriptors (if any)
-		// e.g. url0, url1 1.5x, url2 2x
-		const [url, ...descriptors] = source.split(/\s+/);
+	const out: string[] = [];
+	const n = srcset.length;
+	let i = 0;
+	while (i < n) {
+		while (i < n && (isSrcsetSpace(srcset[i]) || srcset[i] === ",")) i++;
+		if (i >= n) break;
 
-		// Rewrite the URLs and keep the descriptors (if any)
-		const rewrittenUrl = rewriteUrl(url.trim(), context, meta);
+		const urlStart = i;
+		while (i < n && !isSrcsetSpace(srcset[i])) i++;
+		let url = srcset.slice(urlStart, i);
 
-		return descriptors.length > 0
-			? `${rewrittenUrl} ${descriptors.join(" ")}`
-			: rewrittenUrl;
-	});
+		let descriptors = "";
+		if (url.endsWith(",")) {
+			// a URL that ends in commas ends the candidate, and loses the commas
+			while (url.endsWith(",")) url = url.slice(0, -1);
+		} else {
+			// descriptors run to the next comma outside parentheses
+			const descStart = i;
+			let inParens = false;
+			while (i < n) {
+				const c = srcset[i];
+				if (c === "(") inParens = true;
+				else if (c === ")") inParens = false;
+				else if (c === "," && !inParens) break;
+				i++;
+			}
+			descriptors = srcset.slice(descStart, i).trim();
+			i++;
+		}
+		if (!url) continue;
 
-	return rewrittenSources.join(", ");
+		const rewrittenUrl = rewriteUrl(url, context, meta);
+		out.push(descriptors ? `${rewrittenUrl} ${descriptors}` : rewrittenUrl);
+	}
+
+	return out.join(", ");
 }
 
 // function base64ToBytes(base64) {

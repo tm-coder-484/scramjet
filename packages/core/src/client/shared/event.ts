@@ -1,4 +1,5 @@
 import { iswindow } from "@client/entry";
+import { SCRAMJETCLIENT } from "@/symbols";
 import { ScramjetClient } from "@client/index";
 import { getOwnPropertyDescriptorHandler } from "@client/helpers";
 import {
@@ -14,7 +15,39 @@ type Listener = (...args: any) => any;
 
 const realOnEvent = Symbol_for("scramjet original onevent function");
 
+// true for a window outside the proxy, e.g. the host page posting into the frame. such a window
+// must not reach the page, since its eval and other members are the real ones
+function isForeignWindow(source: any): boolean {
+	try {
+		if (source.window !== source) return false;
+
+		return !(SCRAMJETCLIENT in source);
+	} catch {
+		// a cross-origin window throws on the symbol check, and it is still foreign
+		return true;
+	}
+}
+
 export default function (client: ScramjetClient, self: Self) {
+	// the page gets one handle per foreign window, so repeated events from the same window compare equal
+	const foreignSources = new _WeakMap<object, object>();
+	function foreignSourceHandle(source: any): object {
+		let handle = foreignSources.get(source);
+		if (!handle) {
+			handle = {
+				// replies still reach the real window
+				postMessage(...args: any[]) {
+					return source.postMessage(...args);
+				},
+				// the page's own view of eval: the indirect eval rewrites its code, as `parent.eval` does
+				eval: client.indirectEval,
+			};
+			foreignSources.set(source, handle);
+		}
+
+		return handle;
+	}
+
 	const handlers = {
 		message: {
 			_init() {
@@ -31,9 +64,9 @@ export default function (client: ScramjetClient, self: Self) {
 			source() {
 				if (this.source === null) return null;
 
-				// const scram: ScramjetClient = this.source[SCRAMJETCLIENT];
-
-				// if (scram) return scram.globalProxy;
+				// messages between proxied windows keep the real window, as before
+				if (isForeignWindow(this.source))
+					return foreignSourceHandle(this.source);
 
 				return this.source;
 			},

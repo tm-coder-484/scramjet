@@ -2,9 +2,9 @@ import { flagEnabled, ScramjetContext } from "@/shared";
 import { URLMeta } from "@rewriters/url";
 
 import { getRewriter, JsRewriterOutput } from "@rewriters/wasm";
+import { bytesToBase64 } from "@/shared/util";
 import { getRewrite, openDb, rewriteKey, storeRewrite } from "./jscache";
 import {
-	Array_from,
 	JSON_stringify,
 	SyntaxError,
 	TextDecoder_decode,
@@ -15,9 +15,6 @@ import {
 	Performance_now,
 	String_startsWith,
 } from "../snapshot";
-
-// eslint-disable-next-line scramjet-core/no-globals
-Error.stackTraceLimit = 50;
 
 type RewriterResult = {
 	js: string | Uint8Array;
@@ -136,21 +133,22 @@ function finishRewrite(
 	if (flagEnabled("sourcemaps", context, meta.base)) {
 		const pushmap = globalThis[context.config.globals.pushsourcemapfn];
 		if (pushmap) {
-			pushmap(Array_from(res.map), res.tag);
+			pushmap(res.map, res.tag);
 		} else {
 			// TODO: how do we check instanceof here?
-			if (typeof newjs !== "string") {
-				newjs = TextDecoder_decode(newjs);
-			}
-			const sourcemapfn = `${context.config.globals.pushsourcemapfn}([${res.map.join(",")}], "${res.tag}");`;
+			let text: string =
+				typeof newjs === "string" ? newjs : TextDecoder_decode(newjs);
+			// base64 is a string literal, which parses far faster than a decimal array of the same bytes
+			const sourcemapfn = `${context.config.globals.pushsourcemapfn}("${bytesToBase64(res.map)}", "${res.tag}");`;
 
 			// don't put the sourcemap call before "use strict"
 			const strictMode = new _RegExp(/^\s*(['"])use strict\1;?/);
-			if (strictMode.test(newjs)) {
-				newjs = newjs.replace(strictMode, `$&\n${sourcemapfn}`);
+			if (strictMode.test(text)) {
+				text = text.replace(strictMode, `$&\n${sourcemapfn}`);
 			} else {
-				newjs = `${sourcemapfn}\n${newjs}`;
+				text = `${sourcemapfn}\n${text}`;
 			}
+			newjs = text;
 		}
 	}
 

@@ -4,8 +4,114 @@ import { ScramjetClient } from "@client/index";
 // import { argdbg } from "@client/shared/err";
 import {
 	Object_defineProperty,
+	Object_getOwnPropertyDescriptor,
 	Object_getPrototypeOf,
+	Reflect_apply,
+	Reflect_ownKeys,
+	Reflect_set,
 } from "@/shared/snapshot";
+
+// window.location and document.location are [LegacyUnforgeable] accessors, so they can't be redefined.
+// a write through Reflect.set or Object.assign runs the native setter, which would navigate to a
+// javascript: url without rewriting its code. those two entry points route the value through
+// client.url, the same path `location = x` takes after rewriting
+function hookLocationWrites(client: ScramjetClient, self: GlobalThis) {
+	const realWindow = self;
+	const realDocument = self.document;
+	const nativeAssign = self.Object.assign;
+	const nativeSet = self.Reflect.set;
+
+	// these are plain methods rather than client.Proxy or a Proxy trap. client.Proxy allocates a context
+	// object and closures per call, and a Proxy trap allocates an argument array per call; together that
+	// was about +70% on Object.assign and +87% on Reflect.set in the benchmark. a method has no
+	// prototype and is not constructible, like the natives. the common case is one identity check
+	// against the two cached objects, then a direct native call with no argument array
+	const { assign, set } = {
+		assign(target: any, source: any) {
+			if (target === realWindow || target === realDocument)
+				return assignIntoLocationTarget(client, nativeAssign, arguments);
+
+			switch (arguments.length) {
+				case 2:
+					return nativeAssign(target, source);
+				case 1:
+					return nativeAssign(target);
+				default:
+					return Reflect_apply(nativeAssign, undefined, arguments);
+			}
+		},
+		set(target: any, key: any, value: any) {
+			if (
+				(target === realWindow || target === realDocument) &&
+				key === "location" &&
+				(arguments.length < 4 || arguments[3] === target)
+			) {
+				client.url = value;
+
+				return true;
+			}
+
+			if (arguments.length < 4) return nativeSet(target, key, value);
+
+			return nativeSet(target, key, value, arguments[3]);
+		},
+	};
+
+	// the hooks report the native source text to Function.prototype.toString
+	client.box.unproxy.set(assign, nativeAssign);
+	client.box.unproxy.set(set, nativeSet);
+	Object_defineProperty(self.Object, "assign", {
+		value: assign,
+		writable: true,
+		enumerable: false,
+		configurable: true,
+	});
+	Object_defineProperty(self.Reflect, "set", {
+		value: set,
+		writable: true,
+		enumerable: false,
+		configurable: true,
+	});
+}
+
+// Object.assign(window, src) with a source that has an own enumerable `location` must not reach the
+// native location setter, so those sources are copied key by key like [[Set]] does
+function assignIntoLocationTarget(
+	client: ScramjetClient,
+	nativeAssign: (...args: any[]) => any,
+	args: ArrayLike<any>
+) {
+	let hasLocation = false;
+	for (let i = 1; i < args.length; i++) {
+		const source = args[i];
+		if (source === null || source === undefined) continue;
+		if (Object_getOwnPropertyDescriptor(source, "location")?.enumerable) {
+			hasLocation = true;
+			break;
+		}
+	}
+	if (!hasLocation) return Reflect_apply(nativeAssign, undefined, args);
+
+	const target = args[0];
+	for (let i = 1; i < args.length; i++) {
+		const source = args[i];
+		if (source === null || source === undefined) continue;
+		const from: any = Object(source);
+		for (const key of Reflect_ownKeys(from)) {
+			if (!Object_getOwnPropertyDescriptor(from, key)?.enumerable) continue;
+			const value = from[key];
+			if (key === "location") {
+				client.url = value;
+			} else if (!Reflect_set(target, key, value)) {
+				throw new TypeError(
+					`Cannot assign to read only property '${String(key)}' of object`
+				);
+			}
+		}
+	}
+
+	return target;
+}
 
 export function createWrapFn(client: ScramjetClient, self: GlobalThis) {
 	// the native eval as it was when scramjet loaded. page code may replace window.eval, and such a
@@ -224,4 +330,6 @@ export default function (client: ScramjetClient, self: GlobalThis) {
 		writable: false,
 		configurable: false,
 	});
+
+	if (iswindow) hookLocationWrites(client, self);
 }
