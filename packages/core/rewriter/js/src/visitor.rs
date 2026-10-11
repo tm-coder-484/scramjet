@@ -35,6 +35,14 @@ macro_rules! skip_field { ($($t:tt)*) => {}; }
 // maybe move this out of this lib?
 const UNSAFE_GLOBALS: &[&str] = &["parent", "top", "location", "eval"];
 
+// `(eval)(x)` and `((eval))(x)` are still direct evals: parentheses do not change the callee
+fn unwrap_parens<'a, 'data>(mut expr: &'a Expression<'data>) -> &'a Expression<'data> {
+	while let Expression::ParenthesizedExpression(p) = expr {
+		expr = &p.expression;
+	}
+	expr
+}
+
 pub struct Visitor<'alloc, 'data, E>
 where
 	E: UrlRewriter,
@@ -576,13 +584,20 @@ where
 	#[coverage_checked(CallExpression)]
 	fn visit_call_expression(&mut self, it: &CallExpression<'data>) {
 		audit_skip!(it.callee, "top(0): none of the unsafe globals can be called as functions, other than eval which we handle above");
-		if let Expression::Identifier(s) = &it.callee {
+		if let Expression::Identifier(s) = unwrap_parens(&it.callee) {
 			// if it's optional that actually makes it an indirect eval which is handled separately
 			if s.name == "eval" && !it.optional {
+				// the rewritten span starts at the first argument. the text between the callee and
+				// the argument list can be whitespace, comments or parentheses, so it cannot be
+				// found by offset from the callee
+				let inner_start = it
+					.arguments
+					.first()
+					.map_or(it.span.end - 1, |arg| arg.span().start);
 				self.jschanges.add(rewrite!(
 					it.span,
 					Eval {
-						inner: Span::new(s.span.end + 1, it.span.end - 1),
+						inner: Span::new(inner_start, it.span.end - 1),
 					}
 				));
 
@@ -849,6 +864,28 @@ where
 
 	#[coverage_checked(UnaryExpression)]
 	fn visit_unary_expression(&mut self, it: &UnaryExpression<'data>) {
+		// `delete o.parent` must delete the real key. the alias `$scramjet__parent` only exists on
+		// Object.prototype, so deleting it removes nothing and still reports success
+		if matches!(it.operator, UnaryOperator::Delete) {
+			match &it.argument {
+				Expression::StaticMemberExpression(s)
+					if UNSAFE_GLOBALS.contains(&s.property.name.as_str()) =>
+				{
+					audit_skip!(it.argument, "delete keeps the raw key, only the object can contain rewrites");
+					walk::walk_expression(self, &s.object);
+					return;
+				}
+				// any computed key, not just literal ones: `$prop` would map a runtime "top" to the
+				// alias too, so the key is kept raw and only the object and key expression are walked
+				Expression::ComputedMemberExpression(c) => {
+					audit_skip!(it.argument, "delete keeps the raw key, only the object and key can contain rewrites");
+					walk::walk_expression(self, &c.object);
+					walk::walk_expression(self, &c.expression);
+					return;
+				}
+				_ => {}
+			}
+		}
 		if matches!(it.operator, UnaryOperator::Typeof) {
 			match it.argument {
 				Expression::Identifier(_) => {

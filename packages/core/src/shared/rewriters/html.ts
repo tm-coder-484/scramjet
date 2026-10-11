@@ -50,6 +50,9 @@ export type HtmlContext = {
 const renderOptions = {
 	encodeEntities: "utf8" as const,
 	decodeEntities: false,
+	// dom-serializer self-closes empty elements inside <svg>/<math> (`<path/>`), but the HTML
+	// serialization that innerHTML and outerHTML must return is always `<path></path>`
+	selfClosingTags: false,
 };
 function serializeHtmlNode(node: ChildNode) {
 	return render(node, renderOptions);

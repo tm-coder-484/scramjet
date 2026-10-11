@@ -12,8 +12,8 @@ export function createLocationProxy(client: ScramjetClient, self: GlobalThis) {
 	const Location = iswindow ? self.Location : self.WorkerLocation;
 	// location cannot be Proxy()d
 	const fakeLocation: any = {};
+	// constructor is inherited from Location.prototype, so it must not be an own property
 	Object_setPrototypeOf(fakeLocation, Location.prototype);
-	fakeLocation.constructor = Location;
 
 	// for some reason it's on the object for Location and on the prototype for WorkerLocation??
 	const descriptorSource = iswindow ? self.location : Location.prototype;
@@ -133,7 +133,14 @@ export function createLocationProxy(client: ScramjetClient, self: GlobalThis) {
 			},
 		});
 
-	// TODO: ancestorOrigins
+	// the proxied page is only ever shown at top level from the page's point of view, so no ancestor
+	// origin is revealed. a real Location has this as an own property, and frame busters read its length
+	Object_defineProperty(fakeLocation, "ancestorOrigins", {
+		value: [],
+		writable: false,
+		enumerable: true,
+		configurable: false,
+	});
 
 	return fakeLocation;
 }

@@ -21,8 +21,9 @@ function handleCss(
 	meta?: URLMeta
 ) {
 	// regex from vk6 (https://github.com/ading2210)
+	// block comments are matched too, so that a url() inside one is left alone
 	const urlRegex =
-		/(?i:url)\((?:\s*"((?:\\.|[^"])+)"\s*|\s*'((?:\\.|[^'])+)'\s*|((?!\s*['"])(?!\s*\))(?:\\.|[^)])+?))\)/gm;
+		/\/\*[\s\S]*?\*\/|(?i:url)\((?:\s*"((?:\\.|[^"])+)"\s*|\s*'((?:\\.|[^'])+)'\s*|((?!\s*['"])(?!\s*\))(?:\\.|[^)])+?))\)/gm;
 	const Atruleregex =
 		/@import\s+((?i:url)\s*?\(.{0,9999}?\)|['"].{0,9999}?['"]|.{0,9999}?)($|\s|;)/gm;
 	css = String(css);
@@ -34,6 +35,7 @@ function handleCss(
 			singleQuotedUrl: string | undefined,
 			unquotedUrl: string | undefined
 		) => {
+			if (match.startsWith("/*")) return match;
 			const url = doubleQuotedUrl ?? singleQuotedUrl ?? unquotedUrl;
 			const encodedUrl =
 				type === "rewrite"

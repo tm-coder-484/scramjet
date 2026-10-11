@@ -8,6 +8,9 @@ import {
 } from "@/shared/snapshot";
 
 export function createWrapFn(client: ScramjetClient, self: GlobalThis) {
+	// the native eval as it was when scramjet loaded. page code may replace window.eval, and such a
+	// replacement must be honoured, so the check cannot compare against the current self.eval
+	const nativeEval = self.eval;
 	let wrappedParent: GlobalThis | null = null;
 	let wrappedTop: GlobalThis | null = null;
 	if (iswindow) {
@@ -44,7 +47,7 @@ export function createWrapFn(client: ScramjetClient, self: GlobalThis) {
 
 	return function (identifier: any) {
 		if (identifier === self.location) return client.locationProxy;
-		if (identifier === self.eval) {
+		if (identifier === nativeEval) {
 			return client.indirectEval;
 		}
 		if (iswindow) {
