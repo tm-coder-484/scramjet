@@ -733,6 +733,14 @@ export class Controller {
 		});
 	}
 
+	/**
+	 * In worker mode, sends `scramjetConfig` to the worker again after it was changed in place
+	 * (flags, webrtcRelay...). Pages loaded after this use the new config. A no-op otherwise.
+	 */
+	pushConfig() {
+		this.worker?.postMessage({ $worker$config: this.scramjetConfig });
+	}
+
 	private frameWaiters: (() => void)[] = [];
 
 	/** @internal the frame a proxied url belongs to. in a worker, the page may not have told us about it yet */

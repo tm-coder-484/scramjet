@@ -18,6 +18,7 @@ import {
 } from "./devlib.ts";
 import rspackConfig from "./rspack.config.ts";
 import { startTurnServer } from "./devturn.ts";
+import { createRelay } from "./devrelay.ts";
 
 const image = await fs.readFile("./assets/scramjet-mini-noalpha.png");
 
@@ -47,7 +48,10 @@ const wispserver = http.createServer((req, res) => {
 wisp.options.allow_private_ips = true;
 wisp.options.allow_loopback_ips = true;
 
+// the relay transport (devrelay.ts) shares the wisp port, at /relay
+const relay = createRelay();
 wispserver.on("upgrade", (req, socket, head) => {
+	if (relay(req, socket, head)) return;
 	wisp.routeRequest(req, socket, head);
 });
 
@@ -104,6 +108,11 @@ const lines = [
 	black()(
 		`${accent("wisp")} ${connector} ${urlColor(
 			process.env.VITE_WISP_URL ?? ""
+		)}`
+	),
+	black()(
+		`${accent("relay")} ${connector} ${urlColor(
+			new URL("relay", process.env.VITE_WISP_URL).href
 		)}`
 	),
 	...(process.env.VITE_TURN_URL

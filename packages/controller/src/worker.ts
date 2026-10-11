@@ -3,6 +3,10 @@
 import "./worker-bootstrap";
 import { Controller, type Frame } from "./index";
 
+// the worker's $scramjetController is the same API, so scripts loaded into the worker (plugins
+// from scramjet-utils, say) can use it
+export * from "./index";
+
 declare function importScripts(...urls: string[]): void;
 
 type WorkerInitMessage = {
@@ -32,6 +36,9 @@ function handle(data: any) {
 		setupFrame?.(frame);
 	} else if (data.$worker$sw) {
 		controller.handleServiceWorkerMessage(data.$worker$sw);
+	} else if (data.$worker$config) {
+		// frames read the config through the controller, so updating it in place is enough
+		Object.assign(controller.scramjetConfig, data.$worker$config);
 	}
 }
 

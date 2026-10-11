@@ -58,6 +58,7 @@ const FlagEditor: Component<
 	const toggleFlag = (flag: keyof ScramjetFlags, value: boolean) => {
 		flagStore[flag] = value;
 		Object.assign(controller.scramjetConfig.flags, flagStore);
+		controller.pushConfig();
 	};
 
 	const resetToDefaults = () => {
@@ -65,6 +66,7 @@ const FlagEditor: Component<
 			...defaultConfigDev.flags,
 		});
 		Object.assign(controller.scramjetConfig.flags, flagStore);
+		controller.pushConfig();
 	};
 
 	const bustCache = async () => {
@@ -83,6 +85,7 @@ const FlagEditor: Component<
 	cx.mount = async () => {
 		await controller.wait();
 		Object.assign(controller.scramjetConfig.flags, flagStore);
+		controller.pushConfig();
 	};
 
 	return (

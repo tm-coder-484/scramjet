@@ -80,6 +80,11 @@ export default {
 					src: "node_modules/@mercuryworkshop/scramjet-controller/dist/*",
 					dest: "controller",
 				},
+				// loaded into the controller worker for the relay transport and plugins
+				{
+					src: "node_modules/@mercuryworkshop/scramjet-utils/dist/*",
+					dest: "utils",
+				},
 			],
 			watch: {
 				reloadPageOnChange: true,

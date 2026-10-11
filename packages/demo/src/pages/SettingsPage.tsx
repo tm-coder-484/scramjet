@@ -52,7 +52,8 @@ const SettingsView: Component<
 			const nextHomeUrl = normalizeHomeUrl(this.homeUrlInput);
 			const nextMaxRequests = normalizeMaxRequests(this.maxRequestsInput);
 			const wispChanged = nextWispUrl !== demoSettingsStore.wispUrl;
-			const transportChanged = nextTransport !== demoSettingsStore.transport;
+			const previousTransport = demoSettingsStore.transport;
+			const transportChanged = nextTransport !== previousTransport;
 
 			demoSettingsStore.wispUrl = nextWispUrl;
 			demoSettingsStore.transport = nextTransport;
@@ -69,6 +70,17 @@ const SettingsView: Component<
 			this.homeUrlInput = nextHomeUrl;
 			this.maxRequestsInput = String(nextMaxRequests);
 
+			controller.pushConfig();
+			// the relay runs the controller in a worker, so switching to or from it (or changing the
+			// server it talks to) needs a new controller: reload. libcurl and epoxy switch in place
+			if (
+				(transportChanged || wispChanged) &&
+				(nextTransport === "relay" || previousTransport === "relay")
+			) {
+				this.status = "Settings saved. Reloading to switch transport...";
+				setTimeout(() => location.reload(), 300);
+				return;
+			}
 			if (wispChanged || transportChanged) {
 				controller.setTransport(getTransport());
 			}
