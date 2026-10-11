@@ -16,6 +16,10 @@ import {
 } from "@/shared";
 import { sniffEncoding } from "@/shared/sniffEncoding";
 import { _TextDecoder } from "@/shared/snapshot";
+import {
+	canStreamHtml,
+	rewriteHtmlStream,
+} from "@/shared/rewriters/htmlStream";
 
 export async function rewriteBody(
 	handler: ScramjetFetchHandler,
@@ -27,6 +31,23 @@ export async function rewriteBody(
 		case "iframe":
 		case "document":
 			if (isHtmlMimeType(response.headers.get("content-type") ?? "")) {
+				// stream the document unless a plugin needs the whole tree (see canStreamHtml)
+				if (response.body && canStreamHtml(handler.context)) {
+					return rewriteHtmlStream(
+						response.body,
+						response.headers.get("content-type"),
+						handler.context,
+						parsed.meta,
+						{
+							loadScripts: true,
+							inline: true,
+							source: parsed.url.href,
+							headers: response.rawHeaders,
+							history: parsed.trackedClient!.history,
+						}
+					);
+				}
+
 				const buf = await response.arrayBuffer();
 				const bytes = new Uint8Array(buf);
 				const encoding = sniffEncoding(

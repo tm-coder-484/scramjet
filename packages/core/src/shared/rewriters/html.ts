@@ -14,7 +14,7 @@ import { TrackedHistoryState } from "@/fetch";
 import {
 	Performance_now,
 	atob,
-	Object_entries,
+	Object_keys,
 	JSON_parse,
 	JSON_stringify,
 	TextEncoder_encode,
@@ -22,6 +22,8 @@ import {
 	String_fromCodePoint,
 	btoa,
 	_URL,
+	_Set,
+	_Map,
 } from "@/shared/snapshot";
 import { flagEnabled } from "..";
 import {
@@ -47,7 +49,7 @@ export type HtmlContext = {
 	history?: TrackedHistoryState[];
 };
 
-const renderOptions = {
+export const renderOptions = {
 	encodeEntities: "utf8" as const,
 	decodeEntities: false,
 	// dom-serializer self-closes empty elements inside <svg>/<math> (`<path/>`), but the HTML
@@ -344,48 +346,122 @@ export function unrewriteHtml(html: string, foreignContext?: ForeignContext) {
 	});
 }
 
-// i need to add the attributes in during rewriting
+type AttrRule = {
+	attr: string;
+	sel: "*" | string[];
+	fn: (typeof htmlRules)[number]["fn"];
+};
 
-function traverseParsedHtml(
+type AttrRuleIndex = {
+	// rules that apply to each tag named by some selector, in htmlRules order
+	byTag: Map<string, AttrRule[]>;
+	// rules that apply to every element ("*"), in htmlRules order
+	wildcard: AttrRule[];
+};
+
+let attrRuleIndex: AttrRuleIndex | undefined;
+
+// built on first use: htmlRules imports this module, so it may not be initialized when this file loads
+function getAttrRuleIndex(): AttrRuleIndex {
+	if (attrRuleIndex) return attrRuleIndex;
+
+	const rules: AttrRule[] = [];
+	const tags = new _Set<string>();
+	for (const rule of htmlRules) {
+		for (const attr in rule) {
+			const sel = rule[attr.toLowerCase()];
+			if (typeof sel === "function") continue;
+			rules.push({ attr, sel, fn: rule.fn });
+			if (sel !== "*") for (const tag of sel) tags.add(tag);
+		}
+	}
+
+	const byTag = new _Map<string, AttrRule[]>();
+	for (const tag of tags) {
+		byTag.set(
+			tag,
+			rules.filter((rule) => rule.sel === "*" || rule.sel.includes(tag))
+		);
+	}
+	attrRuleIndex = {
+		byTag,
+		wildcard: rules.filter((rule) => rule.sel === "*"),
+	};
+	return attrRuleIndex;
+}
+
+/**
+ * Rewrites one element's own attributes: <base>, the htmlRules attribute rules, event handlers
+ * and <meta http-equiv>. Only the element itself is touched, never its children.
+ *
+ * Returns a comment when the element must be replaced by one (CSP meta), otherwise null.
+ */
+export function rewriteElementAttributes(
+	name: string | undefined,
+	attribs: Record<string, string | undefined>,
+	context: ScramjetContext,
+	meta: URLMeta
+): Comment | null {
+	if (name === "base" && attribs.href !== undefined) {
+		meta.base = new _URL(attribs.href, meta.origin);
+	}
+
+	const index = getAttrRuleIndex();
+	const rules = (name !== undefined && index.byTag.get(name)) || index.wildcard;
+	for (const { attr, fn } of rules) {
+		if (attribs[attr] === undefined) continue;
+		const value = attribs[attr];
+		const v = fn(value!, context, meta, attribs);
+
+		if (v === null) delete attribs[attr];
+		else attribs[attr] = v;
+		attribs[`scramjet-attr-${attr}`] = value;
+	}
+
+	for (const attr of Object_keys(attribs)) {
+		if (!eventAttributeSet.has(attr)) continue;
+		const value = attribs[attr];
+		attribs[`scramjet-attr-${attr}`] = value;
+		attribs[attr] = rewriteJs(
+			value as string,
+			`(inline ${attr} on element)`,
+			context,
+			meta
+		) as string;
+	}
+
+	if (name === "meta" && attribs["http-equiv"] !== undefined) {
+		if (attribs["http-equiv"].toLowerCase() === "content-security-policy") {
+			// just delete it. this needs to be emulated eventually but like
+			return new Comment(attribs.content as string);
+		} else if (attribs["http-equiv"].toLowerCase() === "refresh") {
+			const refresh = parseDeclarativeRefresh(attribs.content || "");
+			if (refresh && refresh.url !== null && refresh.url.length > 0) {
+				const rewritten = rewriteUrl(refresh.url.trim(), context, meta);
+				attribs.content =
+					(attribs.content as string).slice(0, refresh.urlStart) +
+					rewritten +
+					(attribs.content as string).slice(refresh.urlEnd);
+			}
+		}
+	}
+
+	return null;
+}
+
+export function traverseParsedHtml(
 	node: any,
 	context: ScramjetContext,
 	meta: URLMeta
 ) {
-	if (node.name === "base" && node.attribs.href !== undefined) {
-		meta.base = new _URL(node.attribs.href, meta.origin);
-	}
-
 	if (node.attribs) {
-		for (const rule of htmlRules) {
-			for (const attr in rule) {
-				const sel = rule[attr.toLowerCase()];
-				if (typeof sel === "function") continue;
-
-				if (sel === "*" || sel.includes(node.name)) {
-					if (node.attribs[attr] !== undefined) {
-						const value = node.attribs[attr];
-						const v = rule.fn(value, context, meta, node.attribs);
-
-						if (v === null) delete node.attribs[attr];
-						else {
-							node.attribs[attr] = v;
-						}
-						node.attribs[`scramjet-attr-${attr}`] = value;
-					}
-				}
-			}
-		}
-		for (const [attr, value] of Object_entries(node.attribs)) {
-			if (eventAttributes.includes(attr)) {
-				node.attribs[`scramjet-attr-${attr}`] = value;
-				node.attribs[attr] = rewriteJs(
-					value as string,
-					`(inline ${attr} on element)`,
-					context,
-					meta
-				);
-			}
-		}
+		const replacement = rewriteElementAttributes(
+			node.name,
+			node.attribs,
+			context,
+			meta
+		);
+		if (replacement) return replacement;
 	}
 
 	if (node.name === "style" && node.children[0] !== undefined)
@@ -440,24 +516,6 @@ function traverseParsedHtml(
 				meta,
 				module
 			);
-		}
-	}
-
-	if (node.name === "meta" && node.attribs["http-equiv"] !== undefined) {
-		if (
-			node.attribs["http-equiv"].toLowerCase() === "content-security-policy"
-		) {
-			// just delete it. this needs to be emulated eventually but like
-			node = new Comment(node.attribs.content);
-		} else if (node.attribs["http-equiv"].toLowerCase() === "refresh") {
-			const refresh = parseDeclarativeRefresh(node.attribs.content || "");
-			if (refresh && refresh.url !== null && refresh.url.length > 0) {
-				const rewritten = rewriteUrl(refresh.url.trim(), context, meta);
-				node.attribs.content =
-					node.attribs.content.slice(0, refresh.urlStart) +
-					rewritten +
-					node.attribs.content.slice(refresh.urlEnd);
-			}
 		}
 	}
 
@@ -632,3 +690,5 @@ export const eventAttributes = [
 	"onscrollsnapchange",
 	"onscrollsnapchanging",
 ];
+
+const eventAttributeSet = new _Set<string>(eventAttributes);

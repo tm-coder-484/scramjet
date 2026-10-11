@@ -209,6 +209,7 @@ export type _Uint8Array = Wrapped<Uint8Array>;
 export const _TextDecoder = makeWrap(globalThis.TextDecoder);
 export type _TextDecoder = Wrapped<TextDecoder>;
 export const _TextEncoder = makeWrap(globalThis.TextEncoder);
+export const _ReadableStream = makeWrap(globalThis.ReadableStream);
 export type _TextEncoder = Wrapped<TextEncoder>;
 
 export function makeWrap<T extends object>(source: T): Wrapped<T> {

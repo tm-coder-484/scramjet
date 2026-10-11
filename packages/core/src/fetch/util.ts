@@ -13,6 +13,9 @@ export function normalizeContentType(
 	if (!isHtmlMimeType(ct)) return;
 
 	headers.set("content-type", "text/html; charset=utf-8");
+	// the body was decoded and rewritten, so the upstream length and coding no longer describe it
+	headers.delete("content-length");
+	headers.delete("content-encoding");
 }
 
 export function isRedirect(response: BareResponse) {
