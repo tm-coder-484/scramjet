@@ -10,6 +10,9 @@ export const AVAILABLE_TRANSPORTS: ReadonlyArray<{
 	{ value: "epoxy", label: "Epoxy" },
 ];
 const DEFAULT_WISP_URL = import.meta.env.VITE_WISP_URL;
+// set by the dev server, which runs a TURN relay for WebRTC (see devturn.ts)
+const TURN_URL: string | undefined = import.meta.env.VITE_TURN_URL;
+export const webrtcRelayAvailable = !!TURN_URL;
 const DEFAULT_TRANSPORT: AvailableTransports = "libcurl";
 const DEFAULT_HOME_URL = "https://google.com";
 const DEFAULT_MAX_REQUESTS = 200;
@@ -20,6 +23,7 @@ export const demoSettingsStore = createStore(
 		wispUrl: DEFAULT_WISP_URL,
 		homeUrl: DEFAULT_HOME_URL,
 		maxRequests: DEFAULT_MAX_REQUESTS,
+		webrtcRelay: true,
 	},
 	{
 		ident: "scramjet-demo-settings",
@@ -89,4 +93,18 @@ export const demoSettingsDefaults = {
 	transport: DEFAULT_TRANSPORT,
 	homeUrl: normalizeHomeUrl(DEFAULT_HOME_URL),
 	maxRequests: DEFAULT_MAX_REQUESTS,
+	webrtcRelay: true,
 };
+
+/** the TURN relay every RTCPeerConnection must use, or null to let WebRTC connect directly */
+export function getWebrtcRelay(): RTCIceServer[] | null {
+	// settings saved before this option existed don't have it: on by default
+	if (!TURN_URL || demoSettingsStore.webrtcRelay === false) return null;
+	return [
+		{
+			urls: TURN_URL,
+			username: import.meta.env.VITE_TURN_USERNAME,
+			credential: import.meta.env.VITE_TURN_CREDENTIAL,
+		},
+	];
+}

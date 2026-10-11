@@ -49,6 +49,13 @@ export interface ScramjetConfig {
 	flags: ScramjetFlags;
 	siteFlags: Record<string, Partial<ScramjetFlags>>;
 	maskedfiles: string[];
+	/**
+	 * TURN servers that every RTCPeerConnection must relay through. WebRTC media
+	 * otherwise goes straight from the browser to the peer, bypassing the proxy (and
+	 * exposing the user's IP). When set, sites only get relay candidates from these
+	 * servers; their own ice servers are dropped.
+	 */
+	webrtcRelay?: RTCIceServer[] | null;
 }
 
 /**

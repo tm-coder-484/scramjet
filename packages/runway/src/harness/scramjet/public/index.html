@@ -75,6 +75,16 @@
 				controller = new Controller({
 					serviceworker: sw,
 					transport,
+					scramjetConfig: {
+						// every RTCPeerConnection relays through the harness's TURN server
+						webrtcRelay: [
+							{
+								urls: "turn:127.0.0.1:4503?transport=tcp",
+								username: "runway",
+								credential: "runway",
+							},
+						],
+					},
 				});
 				window.__runwayController = controller;
 

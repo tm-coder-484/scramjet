@@ -5,7 +5,7 @@ import EpoxyClient from "@mercuryworkshop/epoxy-transport";
 import { defaultConfigDev } from "@mercuryworkshop/scramjet";
 import { Controller } from "@mercuryworkshop/scramjet-controller";
 import { HttpCachePlugin } from "@mercuryworkshop/scramjet-utils";
-import { demoSettingsStore } from "./store";
+import { demoSettingsStore, getWebrtcRelay } from "./store";
 
 let app = document.getElementById("app")!;
 
@@ -96,7 +96,7 @@ async function init() {
 		controller = new Controller({
 			serviceworker: readySw,
 			transport: getTransport(),
-			scramjetConfig: defaultConfigDev,
+			scramjetConfig: { ...defaultConfigDev, webrtcRelay: getWebrtcRelay() },
 		});
 		await controller.wait();
 		console.log(controller);

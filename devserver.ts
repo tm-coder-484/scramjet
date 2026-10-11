@@ -4,6 +4,7 @@ import path from "node:path";
 import { stdout } from "node:process";
 import { execSync } from "node:child_process";
 import http from "node:http";
+import crypto from "node:crypto";
 import chalk from "chalk";
 import { createServer } from "vite";
 //@ts-expect-error no typedefs
@@ -16,6 +17,7 @@ import {
 	printBanner,
 } from "./devlib.ts";
 import rspackConfig from "./rspack.config.ts";
+import { startTurnServer } from "./devturn.ts";
 
 const image = await fs.readFile("./assets/scramjet-mini-noalpha.png");
 
@@ -30,6 +32,7 @@ const version = packagejson.version;
 
 const DEMO_PORT = process.env.DEMO_PORT || 4141;
 const WISP_PORT = process.env.WISP_PORT || 4142;
+const TURN_PORT = process.env.TURN_PORT || 4143;
 
 if (process.env.VITE_WISP_URL) {
 	process.env.VITE_WISP_URL = normalizeWebsocketUrl(process.env.VITE_WISP_URL);
@@ -49,6 +52,28 @@ wispserver.on("upgrade", (req, socket, head) => {
 });
 
 wispserver.listen(Number(WISP_PORT));
+
+// WebRTC media doesn't go through wisp, so the demo makes every RTCPeerConnection relay
+// through this TURN server instead (see devturn.ts). It only listens on loopback, so it's
+// reachable from this machine or through port forwarding, with a fresh password per run.
+const turnCredential = crypto.randomBytes(16).toString("hex");
+try {
+	await startTurnServer({
+		port: Number(TURN_PORT),
+		username: "scramjet",
+		credential: turnCredential,
+		relayAddress: process.env.TURN_RELAY_IP,
+		log: process.env.DEBUG ? (m) => console.log(`[turn] ${m}`) : undefined,
+	});
+	// 127.0.0.1 rather than localhost: VS Code forwards ports on IPv4 loopback
+	process.env.VITE_TURN_URL ??= `turn:127.0.0.1:${TURN_PORT}?transport=tcp`;
+	process.env.VITE_TURN_USERNAME = "scramjet";
+	process.env.VITE_TURN_CREDENTIAL = turnCredential;
+} catch (e) {
+	console.warn(
+		`WebRTC relay not started (${e instanceof Error ? e.message : e}); WebRTC will connect directly`
+	);
+}
 
 const server = await createServer({
 	configFile: "./packages/demo/vite.config.ts",
@@ -81,6 +106,15 @@ const lines = [
 			process.env.VITE_WISP_URL ?? ""
 		)}`
 	),
+	...(process.env.VITE_TURN_URL
+		? [
+				black()(
+					`${accent("webrtc relay")} ${connector} ${urlColor(
+						process.env.VITE_TURN_URL
+					)}`
+				),
+			]
+		: []),
 	black()(chalk.dim(`[${branch}] ${commit} scramjet/${version}`)),
 ];
 
