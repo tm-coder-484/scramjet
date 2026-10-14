@@ -66,6 +66,10 @@ The demo's settings page picks how requests leave the browser:
 
 Relay and wisp share one port (4142 by default; the relay is at `/relay`), so forwarding that port is enough for both.
 
+#### Benchmark
+
+`pnpm --filter runway bench` loads real sites directly in Chromium and through scramjet (the relay transport, in controller worker mode), cold, and prints the median load time of each with the ratio. It includes a game on CrazyGames, timed until the game has drawn its first screen. It serves scramjet itself from the built packages, so run `pnpm build` first; `--sites a,b`, `--reps n` and `--out file.jsonl` narrow and record a run. The relay's caches persist for the run, like a proxy server's, so later reps of a site show what a returning visitor (or anyone after the first) gets.
+
 #### Controller worker mode
 
 `new Controller({ serviceworker, worker: { scripts, transport, setupFrame } })` runs request handling (transport, cookies, rewriting) in a dedicated worker instead of on the page. Proxied frames are same-origin with the page that hosts them, so they share its main thread. Without a worker, every request waits whenever the site runs script or lays out. `transport` and `setupFrame` are function sources (functions are serialized with `toString`) that run in the worker after `scripts` load. Fetch hooks tapped on the page's frames don't run in this mode; install those plugins in `setupFrame` instead. After changing `controller.scramjetConfig` in place, call `controller.pushConfig()`.
