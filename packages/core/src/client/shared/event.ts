@@ -5,8 +5,8 @@ import { getOwnPropertyDescriptorHandler } from "@client/helpers";
 import {
 	Object_defineProperty,
 	Reflect_apply,
+	Object_keys,
 	Reflect_get,
-	Reflect_ownKeys,
 	Symbol_for,
 	_WeakMap,
 } from "@/shared/snapshot";
@@ -224,40 +224,35 @@ export default function (client: ScramjetClient, self: Self) {
 	if (iswindow) targets.push(self.HTMLElement.prototype);
 	if (self.Worker) targets.push(self.Worker.prototype);
 
+	// only the on<type> properties for the types in handlers are trapped, so look those up by name:
+	// listing the window's own keys (over a thousand) cost more than the rest of this module
+	const onKeys = Object_keys(handlers).map((type) => "on" + type);
 	for (const target of targets) {
-		const keys = Reflect_ownKeys(target);
+		for (const key of onKeys) {
+			const descriptor = client.natives.call(
+				"Object.getOwnPropertyDescriptor",
+				null,
+				target,
+				key
+			);
+			if (!descriptor?.get || !descriptor.set || !descriptor.configurable)
+				continue;
 
-		for (const key of keys) {
-			if (
-				typeof key === "string" &&
-				key.startsWith("on") &&
-				handlers[key.slice(2)]
-			) {
-				const descriptor = client.natives.call(
-					"Object.getOwnPropertyDescriptor",
-					null,
-					target,
-					key
-				);
-				if (!descriptor.get || !descriptor.set || !descriptor.configurable)
-					continue;
+			// these are the `onmessage`, `onclick`, etc. properties
+			client.RawTrap(target, key, {
+				get(ctx) {
+					if (this[realOnEvent]) return this[realOnEvent];
 
-				// these are the `onmessage`, `onclick`, etc. properties
-				client.RawTrap(target, key, {
-					get(ctx) {
-						if (this[realOnEvent]) return this[realOnEvent];
+					return ctx.get();
+				},
+				set(ctx, value: any) {
+					this[realOnEvent] = value;
 
-						return ctx.get();
-					},
-					set(ctx, value: any) {
-						this[realOnEvent] = value;
+					if (typeof value !== "function") return ctx.set(value);
 
-						if (typeof value !== "function") return ctx.set(value);
-
-						ctx.set(wraplistener(value));
-					},
-				});
-			}
+					ctx.set(wraplistener(value));
+				},
+			});
 		}
 	}
 }
