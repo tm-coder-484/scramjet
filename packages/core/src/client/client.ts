@@ -227,11 +227,16 @@ function isPlainFunction(value: any): boolean {
 	if (typeof value !== "function") return false;
 	if (Reflect_has(value, "prototype")) return false;
 	// the real test: Reflect.construct throws when newTarget is not a constructor, and reads nothing
-	// from it since value has no prototype property
+	// from it since value has no prototype property. this runs for every hooked function in every
+	// frame, and most of a throw's cost is capturing the stack, which nothing reads here
+	const limit = Error.stackTraceLimit;
+	Error.stackTraceLimit = 0;
 	try {
 		Reflect_construct(emptyFunction, [], value);
 	} catch {
 		return true;
+	} finally {
+		Error.stackTraceLimit = limit;
 	}
 	return false;
 }
