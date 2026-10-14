@@ -41,6 +41,12 @@ import type {
 } from "./types";
 import { assertRuntimeScramjetVersion } from "./version";
 import { sendBody } from "./bodystream";
+import {
+	WARMUP_ORIGIN,
+	WARMUP_SETTLE,
+	WARMUP_TIMEOUT,
+	installWarmupResponder,
+} from "./warmup";
 
 export { VERSION } from "./version";
 export { assertRuntimeScramjetVersion } from "./version";
@@ -240,6 +246,12 @@ type ControllerInit = {
 	config?: Partial<Config>;
 	scramjetConfig?: Partial<ScramjetConfig>;
 	worker?: ControllerWorkerInit;
+	/**
+	 * Before `wait()` resolves, load a made-up site in a hidden frame (served without the
+	 * network, see warmup.ts), so the first real page isn't rewritten and booted by cold code.
+	 * Adds ~1s to startup, once. Default true; skipped without `document.body`.
+	 */
+	warmup?: boolean;
 	/** @internal set by the worker: the facade's id, and how to reach the service worker */
 	headless?: {
 		id: string;
@@ -251,6 +263,8 @@ type FrameOptions = {
 	plugins?: ManagedPlugin[];
 	/** @internal the worker reuses the facade's frame ids */
 	id?: string;
+	/** @internal the hidden frame of the warm-up, whose requests never reach the transport */
+	warmup?: boolean;
 };
 
 export class Controller {
@@ -536,7 +550,7 @@ export class Controller {
 			this.ready = Promise.all([
 				this.startWorker(init.worker),
 				this.loadScramjetWasm(),
-			]).then(() => undefined);
+			]).then(() => this.warmUp());
 			this.rpc = null!;
 			return;
 		}
@@ -547,7 +561,7 @@ export class Controller {
 			}),
 			this.loadScramjetWasm(),
 			this.loadSavedCookies(true),
-		]).then(() => undefined);
+		]).then(() => this.warmUp());
 
 		this.rpc = new RpcHelper<Controllerbound, SWbound>(
 			this.methods,
@@ -671,6 +685,8 @@ export class Controller {
 				},
 				scramjetConfig: this.scramjetConfig,
 				scripts: (workerInit.scripts ?? []).map(abs),
+				// the page's warm-up frame covers the worker's own (see warmUp)
+				frameWarmup: this.willWarmUp(),
 				transport: workerInit.transport.toString(),
 				setupFrame: workerInit.setupFrame?.toString(),
 			},
@@ -826,9 +842,56 @@ export class Controller {
 		element ??= document.createElement("iframe");
 		const frame = new Frame(this, element, options);
 		this.frames.push(frame);
-		this.worker?.postMessage({ $worker$frame: { id: frame.id } });
+		this.worker?.postMessage({
+			$worker$frame: { id: frame.id, warmup: options.warmup },
+		});
+		if (options.warmup && !this.worker) installWarmupResponder(frame);
 		for (const resolve of this.frameWaiters.splice(0)) resolve();
 		return frame;
+	}
+
+	/** @internal forgets a frame (the warm-up's) */
+	removeFrame(frame: Frame) {
+		const i = this.frames.indexOf(frame);
+		if (i !== -1) this.frames.splice(i, 1);
+		this.worker?.postMessage({ $worker$frameGone: { id: frame.id } });
+	}
+
+	private willWarmUp(): boolean {
+		return (
+			!this.init.headless &&
+			this.init.warmup !== false &&
+			typeof document !== "undefined" &&
+			!!document.body
+		);
+	}
+
+	// the made-up site in a hidden frame (see warmup.ts), once, before wait() resolves. a failure
+	// or a timeout only loses the speedup
+	private async warmUp(): Promise<void> {
+		if (!this.willWarmUp()) return;
+		const element = document.createElement("iframe");
+		element.setAttribute("aria-hidden", "true");
+		element.tabIndex = -1;
+		// laid out at a desktop size, out of sight
+		element.style.cssText =
+			"position:fixed;left:-20000px;top:0;width:1280px;height:800px;border:0;visibility:hidden;pointer-events:none";
+		let frame: Frame | undefined;
+		try {
+			frame = this.createFrame(element, { warmup: true });
+			frame.go(WARMUP_ORIGIN + "/");
+			await new Promise<void>((resolve) => {
+				element.addEventListener("load", () => resolve(), { once: true });
+				setTimeout(resolve, WARMUP_TIMEOUT);
+				document.body.appendChild(element);
+			});
+			await new Promise((resolve) => setTimeout(resolve, WARMUP_SETTLE));
+		} catch {
+			// only a missed speedup
+		} finally {
+			element.remove();
+			if (frame) this.removeFrame(frame);
+		}
 	}
 
 	async wait(): Promise<void> {

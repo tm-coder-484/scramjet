@@ -73,3 +73,7 @@ Relay and wisp share one port (4142 by default; the relay is at `/relay`), so fo
 #### Controller worker mode
 
 `new Controller({ serviceworker, worker: { scripts, transport, setupFrame } })` runs request handling (transport, cookies, rewriting) in a dedicated worker instead of on the page. Proxied frames are same-origin with the page that hosts them, so they share its main thread. Without a worker, every request waits whenever the site runs script or lays out. `transport` and `setupFrame` are function sources (functions are serialized with `toString`) that run in the worker after `scripts` load. Fetch hooks tapped on the page's frames don't run in this mode; install those plugins in `setupFrame` instead. After changing `controller.scramjetConfig` in place, call `controller.pushConfig()`.
+
+#### Warm-up
+
+Before `controller.wait()` resolves, the controller loads a made-up site in a hidden frame. It is served by the controller itself and never touches the network (`packages/controller/src/warmup.ts`). That way the first real page isn't rewritten and booted by cold JavaScript. Without the warm-up, the first site loaded after startup took up to ~60% longer than the same site loaded second. The warm-up adds about a second to startup, once. Pass `warmup: false` to the `Controller` to skip it.

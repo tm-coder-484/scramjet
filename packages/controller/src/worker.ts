@@ -2,6 +2,7 @@
 // it handles every proxied request (transport, cookies, rewriting) off that page's main thread
 import "./worker-bootstrap";
 import { Controller, type Frame } from "./index";
+import { installWarmupResponder } from "./warmup";
 import {
 	setJsRewriteOffload,
 	warmUpRewriter,
@@ -23,6 +24,8 @@ type WorkerInitMessage = {
 	scripts: string[];
 	transport: string;
 	setupFrame?: string;
+	/** the page warms everything up with a hidden frame once this worker is ready */
+	frameWarmup?: boolean;
 };
 
 // the page serializes these with toString
@@ -110,7 +113,8 @@ function startRewriterPool(controller: Controller) {
 	};
 }
 // the first document would otherwise be rewritten by cold code (see warmUpRewriter), while the
-// requests for its stylesheets wait behind it. ~20-40ms, once, before the controller says it's ready
+// requests for its stylesheets wait behind it. ~20-40ms, once, before the controller says it's
+// ready. only when the page doesn't load its warm-up frame, which exercises all of this and more
 async function warmUp(controller: Controller) {
 	const prefix = new URL(controller.prefix + "warmup/", location.href);
 	const { encode, decode } = controller.config.codec;
@@ -145,7 +149,13 @@ function handle(data: any) {
 		const frame = controller.createFrame({} as HTMLIFrameElement, {
 			id: data.$worker$frame.id,
 		});
-		setupFrame?.(frame);
+		if (data.$worker$frame.warmup) installWarmupResponder(frame);
+		else setupFrame?.(frame);
+	} else if (data.$worker$frameGone) {
+		const frame = controller.frames.find(
+			(f) => f.id === data.$worker$frameGone.id
+		);
+		if (frame) controller.removeFrame(frame);
 	} else if (data.$worker$sw) {
 		controller.handleServiceWorkerMessage(data.$worker$sw);
 	} else if (data.$worker$config) {
@@ -188,7 +198,7 @@ self.addEventListener("message", (e: MessageEvent) => {
 		controller.wait().then(
 			async () => {
 				pool = startRewriterPool(controller!);
-				await warmUp(controller!);
+				if (!init.frameWarmup) await warmUp(controller!);
 				self.postMessage({ $worker$ready: true });
 			},
 			(err) => self.postMessage({ $worker$error: String(err) })
