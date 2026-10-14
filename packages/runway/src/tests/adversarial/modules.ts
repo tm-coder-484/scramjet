@@ -302,4 +302,49 @@ export default [
 	cacheTest("rewrite-cache-module-and-classic", "/cache"),
 	// /nocache/ is excluded from the rewrite cache by the harness siteFlags
 	cacheTest("rewrite-cache-off-module-and-classic", "/nocache"),
+	// a module from another origin that imports a module statically and then dynamically gets one
+	// instance of it, as in a browser. scramjet tags module urls with the origin they are fetched
+	// for; the static import was tagged with the importing module's origin and the dynamic one
+	// with the document's, so the browser saw two urls and made two instances (CrazyGames'
+	// gameframe: "[GameConfig] is not set"). localhost and 127.0.0.1 are two origins on one server
+	serverTest({
+		name: "modules-cross-origin-static-and-dynamic-import-share-instance",
+		autoPass: true,
+		js: `
+			window.__xo = null;
+			const s = document.createElement("script");
+			s.type = "module";
+			s.src = "http://127.0.0.1:" + location.port + "/xo/entry.mjs";
+			await new Promise((res, rej) => { s.onload = res; s.onerror = () => rej(new Error("entry module failed to load")); document.head.appendChild(s); });
+			for (let i = 0; i < 50 && !window.__xo; i++) await new Promise((r) => setTimeout(r, 50));
+			assert(window.__xo, "the entry module ran");
+			assertEqual(window.__xo.same, true, "import() returned the instance the static import made");
+			assertEqual(window.__xo.value, 42, "state set through the static import is seen through import()");
+		`,
+		start: async (server) => {
+			const files: Record<string, string> = {
+				"/xo/entry.mjs": `
+					import { setValue } from "./state.mjs";
+					setValue(42);
+					const again = await import("./state.mjs");
+					window.__xo = { value: again.getValue(), same: again.setValue === setValue };
+				`,
+				"/xo/state.mjs": `
+					let value = 0;
+					export const setValue = (v) => { value = v; };
+					export const getValue = () => value;
+				`,
+			};
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				const path = (req.url || "/").split("?")[0];
+				if (!files[path]) return;
+				res.writeHead(200, {
+					"Content-Type": "application/javascript",
+					"Access-Control-Allow-Origin": "*",
+				});
+				res.end(files[path]);
+			});
+		},
+	}),
 ];

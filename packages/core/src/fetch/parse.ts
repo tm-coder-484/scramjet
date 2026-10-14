@@ -122,6 +122,7 @@ export function parseRequest(
 	const meta: URLMeta = {
 		origin: url,
 		base: url,
+		initiatorOrigin: params.initiatorOrigin || undefined,
 		topFrameName: params.topFrame,
 		parentFrameName: params.parentFrame,
 		referrerPolicy: params.referrerPolicy,

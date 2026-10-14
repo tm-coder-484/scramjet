@@ -28,6 +28,7 @@ export type RewriteRequest = {
 	prefix: string;
 	origin: string;
 	base: string;
+	initiatorOrigin?: string;
 	isModule: boolean;
 	useCache: boolean;
 };
@@ -48,7 +49,11 @@ async function runJob(job: RewriteRequest) {
 			prefix: new URL(job.prefix),
 			interface: { codecEncode, codecDecode },
 		} as unknown as ScramjetContext;
-		const meta = { origin: new URL(job.origin), base: new URL(job.base) };
+		const meta = {
+			origin: new URL(job.origin),
+			base: new URL(job.base),
+			initiatorOrigin: job.initiatorOrigin,
+		};
 		const res = job.useCache
 			? await rewriteJsWithCache(job.js, job.url, context, meta, job.isModule)
 			: rewriteJsInner(job.js, job.url, context, meta, job.isModule);

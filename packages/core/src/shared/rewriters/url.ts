@@ -35,6 +35,9 @@ export type RewriteUrlOptions = {
 export type URLMeta = {
 	origin: _URL;
 	base: _URL;
+	// the origin a fetched script runs for (its request's $io: the document's), when it isn't
+	// `origin`. module import urls are tagged with it (see rewriteJsWasm)
+	initiatorOrigin?: string;
 	topFrameName?: string;
 	parentFrameName?: string;
 	referrerPolicy?: string;

@@ -62,9 +62,10 @@ fn get_js_config(config: &Object) -> Result<Config> {
 	})
 }
 
-fn get_js_flags(obj: &Object, base: String, is_module: bool) -> Result<Flags> {
+fn get_js_flags(obj: &Object, base: String, origin: String, is_module: bool) -> Result<Flags> {
 	Ok(Flags {
 		base,
+		origin,
 		sourcetag: scramtag(),
 		is_module,
 
@@ -105,9 +106,10 @@ impl Rewriter {
 		base: String,
 		url: String,
 		module: bool,
+		origin: String,
 	) -> Result<JsRewriterOutput> {
 		let config = get_js_config(jsconfig)?;
-		let flags = get_js_flags(jsflags, base, module)?;
+		let flags = get_js_flags(jsflags, base, origin, module)?;
 		let rewriter = get_url_rewriter(encode_url)?;
 
 		let out = match self.js.rewrite(&self.alloc, &js, config, flags, &rewriter) {
@@ -134,11 +136,12 @@ impl Rewriter {
 		base: String,
 		url: String,
 		module: bool,
+		origin: String,
 	) -> Result<JsRewriterOutput> {
 		// SAFETY: we know the js is a valid utf-8 string
 		let js = unsafe { std::string::String::from_utf8_unchecked(js) };
 
-		self.rewrite_js(jsconfig, jsflags, encode_url, js, base, url, module)
+		self.rewrite_js(jsconfig, jsflags, encode_url, js, base, url, module, origin)
 	}
 
 }

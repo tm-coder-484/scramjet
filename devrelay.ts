@@ -495,7 +495,7 @@ parentPort.on("message", async ({ id, header, js }) => {
 			prefix: new URL(prefix, "http://relay.invalid"),
 			interface: { codecEncode: isDefaultCodec(h.codec) ? encodeDefault : refuse, codecDecode: decodeURIComponent },
 		};
-		const meta = { origin: new URL(h.origin), base: new URL(h.base) };
+		const meta = { origin: new URL(h.origin), base: new URL(h.base), initiatorOrigin: h.initiator };
 		const input = new Uint8Array(js);
 		const key = await sj.rewriteKey(header, input);
 		const res = sj.rewriteJsInner(input, h.source, context, meta, !!h.isModule);

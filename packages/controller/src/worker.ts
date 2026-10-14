@@ -94,6 +94,7 @@ function startRewriterPool(controller: Controller) {
 					prefix: context.prefix.href,
 					origin: meta.origin.href,
 					base: meta.base.href,
+					initiatorOrigin: meta.initiatorOrigin,
 					isModule,
 					useCache,
 				},

@@ -39,6 +39,12 @@ function rewriterFlags(context: ScramjetContext, base: URLMeta["base"]) {
 	return flagsobj;
 }
 
+// the origin a script's static imports are fetched for: the document's. a fetched script's own
+// url is its meta.origin, so the request's $io says which document it runs in
+function initiatorOrigin(meta: URLMeta): string {
+	return meta.initiatorOrigin ?? meta.origin.origin;
+}
+
 function rewriteJsWasm(
 	input: string | Uint8Array,
 	source: string | null,
@@ -76,7 +82,8 @@ function rewriteJsWasm(
 				input,
 				base.href,
 				source || "(unknown)",
-				isModule
+				isModule,
+				initiatorOrigin(meta)
 			);
 		} else {
 			out = rewriter.rewrite_js_bytes(
@@ -89,7 +96,8 @@ function rewriteJsWasm(
 				input,
 				base.href,
 				source || "(unknown)",
-				isModule
+				isModule,
+				initiatorOrigin(meta)
 			);
 		}
 		// } catch (err) {
@@ -266,6 +274,8 @@ export async function rewriteJsWithCache(
 		isModule,
 		// the cache is partitioned per requesting site
 		origin: meta.origin.origin,
+		// static import urls are tagged with it
+		initiator: initiatorOrigin(meta),
 		codec: `${context.interface.codecEncode}`,
 	});
 

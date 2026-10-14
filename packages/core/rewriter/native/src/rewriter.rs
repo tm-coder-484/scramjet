@@ -86,6 +86,7 @@ impl NativeRewriter {
 				},
 				Flags {
 					base: cfg.base.clone(),
+					origin: String::new(),
 					sourcetag: cfg.sourcetag.clone(),
 					is_module: cfg.is_module,
 

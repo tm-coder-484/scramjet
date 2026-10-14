@@ -69,7 +69,13 @@ impl UrlRewriter for WasmUrlRewriter {
 
 		if module {
 			// TODO: keep this in sync with QP.isModule or find a way to make this use the real rewriteUrl function
-			let origin = Url::new(&flags.base).map_err(RewriterError::from)?.origin();
+			// $io is the origin the import is fetched for (the document's, see Flags::origin), as
+			// rewriteUrl tags dynamic imports: a different value would make it a different module
+			let origin = if flags.origin.is_empty() {
+				Url::new(&flags.base).map_err(RewriterError::from)?.origin()
+			} else {
+				flags.origin.clone()
+			};
 			let encoded_origin: String = encode_uri_component(&origin).into();
 			rewritten.push_str("?%24module=module&%24io=");
 			rewritten.push_str(&encoded_origin);
