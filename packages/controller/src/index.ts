@@ -40,7 +40,7 @@ import type {
 	BodyType,
 } from "./types";
 import { assertRuntimeScramjetVersion } from "./version";
-import { sendBody, takePort } from "./bodystream";
+import { endAfter, sendBody, takePort } from "./bodystream";
 import {
 	WARMUP_ORIGIN,
 	WARMUP_SETTLE,
@@ -385,6 +385,14 @@ export class Controller {
 					cache: data.cache,
 					clientId: data.clientId,
 				});
+
+				// the response's cookies are still on their way to the page: its bytes go now, its end
+				// once they're there (see cookieSync)
+				if (fetchresponse.cookieSync)
+					fetchresponse.body = endAfter(
+						fetchresponse.body,
+						fetchresponse.cookieSync
+					);
 
 				// a streamed body goes over a port, pushed chunk by chunk, when the service worker
 				// knows how to take it: a transferred stream costs a round trip per chunk
@@ -888,7 +896,9 @@ export class Controller {
 				setTimeout(resolve, WARMUP_TIMEOUT);
 				document.body.appendChild(element);
 			});
-			const settled = new Promise((resolve) => setTimeout(resolve, WARMUP_SETTLE));
+			const settled = new Promise((resolve) =>
+				setTimeout(resolve, WARMUP_SETTLE)
+			);
 			// meanwhile, the thread that rewrites documents runs them some more
 			if (this.worker) this.worker.postMessage({ $worker$warmup: true });
 			else await warmUpRewriters(this);

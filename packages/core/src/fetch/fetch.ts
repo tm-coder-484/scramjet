@@ -69,7 +69,30 @@ export async function doHandleFetch(
 	const response = await doNetworkFetch(handler, request, parsed, newheaders);
 
 	// set-cookie needs to take the raw headers. after this, we can flatten the headers into a ScramjetHeaders object
-	await handleCookies(handler, request, parsed, response.rawHeaders);
+	const cookieSync = handleCookies(
+		handler,
+		request,
+		parsed,
+		response.rawHeaders
+	);
+	// the cookies reach the page's clients while the body is on its way, for a response the page
+	// can only use once all of it is in (see ScramjetFetchResponse.cookieSync). The rest wait here:
+	// a fetch() can read document.cookie as soon as it has the headers. By the browser's own
+	// destination: the one in the url (QP.destination) is the page's to set
+	const deferCookies =
+		cookieSync !== undefined &&
+		WHOLE_BODY_DESTINATIONS.has(request.rawDestination) &&
+		WHOLE_BODY_DESTINATIONS.has(parsed.destination) &&
+		!isRedirect(response);
+	if (cookieSync && !deferCookies) await cookieSync;
+	// whoever gets the response waits for it too, and ends its body either way
+	else
+		cookieSync?.catch((err) =>
+			console.error(
+				"scramjet: couldn't send a response's cookies to the page",
+				err
+			)
+		);
 
 	if (isDocument(parsed)) {
 		// for document.referer
@@ -182,8 +205,32 @@ export async function doHandleFetch(
 
 	await Tap.dispatch(handler.hooks.fetch.response, respcontext, respprops);
 
+	if (deferCookies) {
+		// no body to hold back
+		if (respprops.response.body == null) await cookieSync;
+		else respprops.response.cookieSync = cookieSync;
+	}
 	return respprops.response;
 }
+
+// destinations whose response the page can only use once its last byte is in: a script runs, a
+// stylesheet applies, an image or font loads, a worker starts only then (an image may show, and
+// report its size, while it loads; its load event waits). Not "" (fetch, XHR, beacons), media, or
+// navigations
+const WHOLE_BODY_DESTINATIONS = new Set<string>([
+	"script",
+	"style",
+	"image",
+	"font",
+	"worker",
+	"sharedworker",
+	"manifest",
+	"track",
+	"xslt",
+	"audioworklet",
+	"paintworklet",
+	"json",
+]);
 
 export async function doNetworkFetch(
 	handler: ScramjetFetchHandler,
@@ -306,12 +353,14 @@ export function registrableDomainForRedirect(hostname: string): string {
 	return labels.slice(-2).join(".");
 }
 
-async function handleCookies(
+// stores the response's cookies in the jar, then sends them to the page's clients: resolves once
+// they have them. undefined when the response sets none
+function handleCookies(
 	handler: ScramjetFetchHandler,
 	request: ScramjetFetchRequest,
 	parsed: ScramjetFetchParsed,
 	rawHeaders: RawHeaders
-) {
+): Promise<void> | undefined {
 	const cookies = [];
 
 	for (const [key, value] of rawHeaders) {
@@ -328,7 +377,7 @@ async function handleCookies(
 		return;
 	}
 
-	await handler.sendSetCookie(cookies, {
+	return handler.sendSetCookie(cookies, {
 		destination: parsed.destination,
 	});
 }

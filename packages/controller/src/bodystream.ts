@@ -54,8 +54,7 @@ export function sendBodyTo(
 	return (async () => {
 		try {
 			for (;;) {
-				if (inflight >= WINDOW)
-					await new Promise<void>((r) => (resume = r));
+				if (inflight >= WINDOW) await new Promise<void>((r) => (resume = r));
 				if (cancelled) return;
 				const { done, value } = await reader.read();
 				if (cancelled) return;
@@ -132,7 +131,9 @@ const unread = new WeakMap<ReadableStream<Uint8Array>, MessagePort>();
  * receiveBody, for a body that may only be passing through this thread: until the stream is
  * read, takePort hands out the port itself, to send on to the body's real receiver.
  */
-export function receiveForwardable(port: MessagePort): ReadableStream<Uint8Array> {
+export function receiveForwardable(
+	port: MessagePort
+): ReadableStream<Uint8Array> {
 	let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
 	const stream = new ReadableStream<Uint8Array>(
 		{
@@ -160,9 +161,29 @@ export function receiveForwardable(port: MessagePort): ReadableStream<Uint8Array
 }
 
 /** the port behind a receiveForwardable stream that hasn't been read; the stream is then spent */
-export function takePort(stream: ReadableStream<Uint8Array>): MessagePort | undefined {
+export function takePort(
+	stream: ReadableStream<Uint8Array>
+): MessagePort | undefined {
 	if (stream.locked) return undefined;
 	const port = unread.get(stream);
 	unread.delete(stream);
 	return port;
+}
+
+/** `body` as a stream whose bytes go as they come, but which ends only once `settled` has */
+export function endAfter(
+	body: string | ArrayBuffer | Blob | ReadableStream<Uint8Array>,
+	settled: Promise<unknown>
+): ReadableStream<Uint8Array> {
+	const stream =
+		body instanceof ReadableStream ? body : new Response(body).body!;
+	return stream.pipeThrough(
+		new TransformStream<Uint8Array, Uint8Array>({
+			flush: () =>
+				settled.then(
+					() => {},
+					() => {}
+				),
+		})
+	);
 }

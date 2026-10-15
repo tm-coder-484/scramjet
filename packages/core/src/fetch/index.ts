@@ -72,6 +72,12 @@ export interface ScramjetFetchResponse {
 	headers: ScramjetHeaders;
 	status: number;
 	statusText: string;
+	/**
+	 * set when the response's cookies are still on their way to the page's clients: the body must
+	 * not end before this settles, or the page could use the response before it can see them.
+	 * Only for destinations the page can't use before their body ends (scripts, images...)
+	 */
+	cookieSync?: Promise<void>;
 }
 
 export type CookieSyncEntry = {
