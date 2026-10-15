@@ -27,6 +27,7 @@
 		"ts-checker-rspack-plugin": "^1.1.6",
 		"tsc-alias": "^1.8.16",
 		"@mercuryworkshop/wisp-js": "catalog:",
+		"acorn": "^8.16.0",
 		"chafa-wasm": "^0.3.1",
 		"chalk": "^5.6.2",
 		"eslint": "^10.2.0",

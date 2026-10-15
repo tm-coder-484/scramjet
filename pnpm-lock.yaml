@@ -50,6 +50,9 @@ importers:
       '@rspack/core':
         specifier: ^1.5.8
         version: 1.6.7(@swc/helpers@0.5.17)
+      acorn:
+        specifier: ^8.16.0
+        version: 8.16.0
       ava:
         specifier: ^6.4.1
         version: 6.4.1(rollup@4.52.5)

@@ -25,7 +25,8 @@ import dns from "node:dns";
 import fs from "node:fs";
 import crypto from "node:crypto";
 import os from "node:os";
-import { Worker } from "node:worker_threads";
+import vm from "node:vm";
+import { Worker, isMainThread, parentPort, workerData } from "node:worker_threads";
 import type { Socket } from "node:net";
 import { Agent, buildConnector, fetch as undiciFetch, type Dispatcher } from "undici";
 import { WebSocketServer, WebSocket } from "ws";
@@ -613,6 +614,8 @@ const SPECULATION_KEEP_MS = 60_000;
 type Twin = {
 	url: string;
 	header: string;
+	// its rewrite's key, if the twins thread keeps it (see patchRewrite)
+	key?: string;
 	// its cache partition: the script's origin, and the page's if that's another site's
 	origin: string;
 	initiator: string;
@@ -632,7 +635,7 @@ function edgeHashes(b: Uint8Array): string[] {
 	];
 }
 
-function addTwin(header: string, length: number, edges: string[]) {
+function addTwin(header: string, length: number, edges: string[], key?: string) {
 	let h: any;
 	try {
 		h = JSON.parse(header);
@@ -644,7 +647,7 @@ function addTwin(header: string, length: number, edges: string[]) {
 	const url: string = h.source;
 	const i = twins.findIndex((t) => t.url === url);
 	if (i !== -1) twins.splice(i, 1);
-	twins.push({ url, header, origin: h.origin, initiator: h.initiator || "", length, edges });
+	twins.push({ url, header, key, origin: h.origin, initiator: h.initiator || "", length, edges });
 	if (twins.length > TWINS) twins.shift();
 }
 
@@ -686,16 +689,489 @@ function speculate(url: string, body: Buffer, referer: string) {
 	const h = JSON.parse(twin.header);
 	h.base = h.source = url;
 	const header = JSON.stringify(h);
-	const js = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
 	if (LOG) console.log(`[relay] speculative rewrite of ${url.slice(0, 100)} (twin of ${twin.url.slice(0, 60)})`);
+	const rewrite = () =>
+		new Promise<{ key: string; entry: RewriteEntry } | null>((resolve) =>
+			pool.submit({
+				header,
+				js: body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength),
+				input: body,
+				hint: "speculative " + url,
+				first: true,
+				done: resolve,
+			})
+		);
+	const started = performance.now();
+	const patched = twin.key && twinWorker ? twinWorker.patch(twin.key, header, body) : null;
 	speculated.set(
 		url,
-		new Promise((resolve) =>
-			pool.submit({ header, js, hint: "speculative " + url, first: true, done: resolve })
-		)
+		patched
+			? patched.then((r) => {
+					if (!r) return rewrite();
+					rewriteCachePut(r.key, r.entry);
+					addTwin(header, body.byteLength, edges, r.key);
+					if (LOG)
+						console.log(
+							`[relay] rewrite cache stored ${r.key.slice(0, 12)} (patched from its twin in ${Math.round(performance.now() - started)}ms)`
+						);
+					return r;
+				})
+			: rewrite()
 	);
 	setTimeout(() => speculated.delete(url), SPECULATION_KEEP_MS).unref();
 }
+
+// ---- a twin's rewrite, patched ----
+// YouTube's app bundle differs from one visit to the next only in a few literals: feature-toggle
+// numbers and base64 strings. Its rewrite is then the twin's, with those literals swapped in and
+// every position the output records shifted to match (its scramtag comments, its sourcemap, the
+// prefix's offsets): ~100 ms where a full rewrite takes ~450. That is only right where the
+// rewriter would have made the same changes to the new script, so a literal may differ only where
+// its value can't change them:
+//  - a number: decimal or hex, both before and after
+//  - a string: with the same quotes, on one line, and neither a member key (x["k"]), a property
+//    key ({"k": v}, or anything before a colon), an import specifier, a directive nor an operand of
+//    `in`, which the tokens around it in the twin tell
+//  - neither: touched by any change the rewriter made to the twin
+// anything else, and any surprise in the twin's rewrite, and the script is rewritten in full.
+// The twins' literals are found with acorn, on a thread of their own (the twins thread), which
+// keeps the last few big scripts with their rewrites and does the patching.
+
+type Spans = { starts: Int32Array; ends: Int32Array; kinds: Uint8Array };
+// a literal that changed: [start, end) in the twin, [start, end) in the new script
+type LiteralChange = [number, number, number, number];
+
+const STR = 1,
+	NUM = 2;
+// the tokens a changeable string may follow, and come before (acorn's token labels)
+const STR_PREV = new Set(["=", ",", "(", "?", "+/-", "||", "&&", "??", "==/!=/===/!==", "return"]);
+const STR_NEXT = new Set([",", ")", ";", "]", "}", "+/-", "||", "&&", "??", "==/!=/===/!==", ".", "?"]);
+// decimal (without legacy octal), or hex
+const PLAIN_NUM = /^(?:(?:0|[1-9][0-9]*)(?:\.[0-9]+)?|0[xX][0-9a-fA-F]+)$/;
+const TWIN_CACHE = 4;
+
+// the literals of a script that may change in its twins, by byte range of their whole token
+export function analyzeLiterals(acorn: any, input: Buffer, isModule = false): Spans | null {
+	const src = input.toString("utf8");
+	const starts: number[] = [], ends: number[] = [], kinds: number[] = [];
+	// utf-16 index -> byte offset, advanced along the tokens, which come in order
+	let ci = 0, bi = 0;
+	const toByte = (i: number) => {
+		bi += Buffer.byteLength(src.slice(ci, i));
+		ci = i;
+		return bi;
+	};
+	const push = (start: number, end: number, kind: number) => {
+		starts.push(toByte(start));
+		ends.push(toByte(end));
+		kinds.push(kind);
+	};
+	// the two tokens before this one, and a string waiting for the token after it
+	let prev2 = "", prev = "";
+	let pending: { start: number; end: number } | null = null;
+	const onToken = (tok: { type: { label: string }; start: number; end: number }) => {
+		const label = tok.type.label;
+		if (pending) {
+			if (STR_NEXT.has(label)) push(pending.start, pending.end, STR);
+			pending = null;
+		}
+		if (label === "num") {
+			if (PLAIN_NUM.test(src.slice(tok.start, tok.end))) push(tok.start, tok.end, NUM);
+		} else if (label === "string") {
+			if (STR_PREV.has(prev) && !(prev === "(" && prev2 === "import"))
+				pending = { start: tok.start, end: tok.end };
+		}
+		prev2 = prev;
+		prev = label;
+	};
+	try {
+		acorn.parse(src, {
+			ecmaVersion: "latest",
+			sourceType: isModule ? "module" : "script",
+			allowHashBang: true,
+			allowReturnOutsideFunction: true,
+			onToken,
+		});
+	} catch {
+		return null;
+	}
+	return { starts: Int32Array.from(starts), ends: Int32Array.from(ends), kinds: Uint8Array.from(kinds) };
+}
+
+// the first k with a[i + k] !== b[j + k], or the length of the shorter rest
+function sameRun(a: Buffer, i: number, b: Buffer, j: number) {
+	const n = Math.min(a.length - i, b.length - j);
+	let k = 0;
+	for (const w of [1 << 16, 1 << 12, 1 << 8, 1 << 4])
+		while (k + w <= n && b.compare(a, i + k, i + k + w, j + k, j + k + w) === 0) k += w;
+	while (k < n && a[i + k] === b[j + k]) k++;
+	return k;
+}
+
+// the literal whose token holds byte p (or, a number's, ends at p: it may have grown), or -1
+function literalAt(spans: Spans, p: number) {
+	const { starts, ends, kinds } = spans;
+	let lo = 0, hi = starts.length - 1, found = -1;
+	while (lo <= hi) {
+		const mid = (lo + hi) >> 1;
+		if (starts[mid] <= p) {
+			found = mid;
+			lo = mid + 1;
+		} else hi = mid - 1;
+	}
+	if (found === -1) return -1;
+	return p < ends[found] || (p === ends[found] && kinds[found] === NUM) ? found : -1;
+}
+
+const utf8 = new TextDecoder("utf-8", { fatal: true });
+const isHex = (c: number) => (c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x46) || (c >= 0x61 && c <= 0x66);
+
+// the end of the string literal whose opening quote is at s, or -1 if it isn't one the rewriter
+// would take as it is: one line of valid UTF-8, with only plain escapes (no octal, no \u{})
+function stringEnd(buf: Buffer, s: number) {
+	const q = buf[s];
+	for (let i = s + 1; i < buf.length; i++) {
+		const c = buf[i];
+		if (c === q) {
+			try {
+				utf8.decode(buf.subarray(s, i + 1));
+			} catch {
+				return -1;
+			}
+			return i + 1;
+		}
+		if (c === 0x0a || c === 0x0d) return -1;
+		if (c === 0x5c) {
+			const n = buf[++i];
+			if (n === 0x78) {
+				if (!isHex(buf[i + 1]) || !isHex(buf[i + 2])) return -1;
+				i += 2;
+			} else if (n === 0x75) {
+				for (let k = 1; k <= 4; k++) if (!isHex(buf[i + k])) return -1;
+				i += 4;
+			} else if (n === 0x30) {
+				if (buf[i + 1] >= 0x30 && buf[i + 1] <= 0x39) return -1;
+			} else if (!"\\\"'nrtbfv/".includes(String.fromCharCode(n))) return -1;
+		}
+	}
+	return -1;
+}
+
+// a number token can't be followed by an identifier character, so it ends where they do
+function numberEnd(buf: Buffer, s: number) {
+	let i = s;
+	for (; i < buf.length; i++) {
+		const c = buf[i];
+		if (!((c >= 0x30 && c <= 0x39) || (c >= 0x41 && c <= 0x5a) || (c >= 0x61 && c <= 0x7a) || c === 0x2e || c === 0x5f || c === 0x24))
+			break;
+	}
+	return PLAIN_NUM.test(buf.toString("latin1", s, i)) ? i : -1;
+}
+
+// the literals that changed from `old` to `next`, or null if anything else did
+function diffLiterals(old: Buffer, spans: Spans, next: Buffer): LiteralChange[] | null {
+	const changes: LiteralChange[] = [];
+	let i = 0, j = 0;
+	for (;;) {
+		const k = sameRun(old, i, next, j);
+		if (i + k === old.length && j + k === next.length) return changes;
+		const li = literalAt(spans, i + k);
+		if (li === -1) return null;
+		const s0 = spans.starts[li], e0 = spans.ends[li];
+		if (s0 < i) return null;
+		const s1 = s0 + (j - i);
+		let e1: number;
+		if (spans.kinds[li] === STR) {
+			if (next[s1] !== old[s0]) return null;
+			e1 = stringEnd(next, s1);
+		} else e1 = numberEnd(next, s1);
+		if (e1 === -1 || changes.length >= 10_000) return null;
+		changes.push([s0, e0, s1, e1]);
+		i = e0;
+		j = e1;
+	}
+}
+
+// the twin's literals, moved to where they are in the new script
+export function shiftSpans(spans: Spans, changes: LiteralChange[]): Spans {
+	const starts = new Int32Array(spans.starts.length), ends = new Int32Array(spans.ends.length);
+	let c = 0, delta = 0;
+	for (let i = 0; i < spans.starts.length; i++) {
+		while (c < changes.length && changes[c][1] <= spans.starts[i]) {
+			delta = changes[c][3] - changes[c][1];
+			c++;
+		}
+		const changed = c < changes.length && changes[c][0] === spans.starts[i];
+		starts[i] = spans.starts[i] + delta;
+		ends[i] = changed ? changes[c][3] : spans.ends[i] + delta;
+	}
+	return { starts, ends, kinds: spans.kinds };
+}
+
+const TAG_OPEN = Buffer.from("/*scramtag ");
+
+/**
+ * The rewrite of `next` from its twin's (`old`, its literals `spans` and rewrite `entry`, with
+ * `placeholder` for the prefix), or null when it can't be had that way: see above.
+ */
+export function patchRewrite(
+	old: Buffer,
+	spans: Spans,
+	entry: RewriteEntry,
+	next: Buffer,
+	placeholder: Buffer
+): { entry: RewriteEntry; changes: LiteralChange[] } | null {
+	if (!entry.map || next.indexOf(placeholder) !== -1) return null;
+	const changes = diffLiterals(old, spans, next);
+	if (!changes) return null;
+	const js = Buffer.from(entry.js.buffer, entry.js.byteOffset, entry.js.byteLength);
+	const mapBytes = Buffer.from(entry.map.buffer, entry.map.byteOffset, entry.map.byteLength);
+
+	// the rewriter's changes, from its sourcemap: [position in the output, inserted length, op,
+	// (replace) replaced length, replaced text]. positions are in the output
+	const n = mapBytes.readUInt32LE(0);
+	const at = new Int32Array(n), pos = new Int32Array(n), size = new Int32Array(n);
+	const inStart = new Int32Array(n), inEnd = new Int32Array(n);
+	let cursor = 4, offset = 0;
+	for (let e = 0; e < n; e++) {
+		if (cursor + 9 > mapBytes.length) return null;
+		at[e] = cursor;
+		pos[e] = mapBytes.readUInt32LE(cursor);
+		size[e] = mapBytes.readUInt32LE(cursor + 4);
+		const op = mapBytes[cursor + 8];
+		cursor += 9;
+		inStart[e] = pos[e] - offset;
+		if (op === 0) {
+			inEnd[e] = inStart[e];
+			offset += size[e];
+		} else if (op === 1) {
+			const oldLen = mapBytes.readUInt32LE(cursor);
+			cursor += 4 + oldLen;
+			inEnd[e] = inStart[e] + oldLen;
+			offset += size[e] - oldLen;
+		} else return null;
+	}
+	if (cursor !== mapBytes.length) return null;
+
+	// the literals' places in the output: where the input is copied through, untouched by changes
+	const lits: { o: number; len: number; rep: Buffer }[] = [];
+	let e = 0;
+	offset = 0;
+	for (const [s0, e0, s1, e1] of changes) {
+		while (e < n && inStart[e] < s0) {
+			if (inEnd[e] >= s0 && inEnd[e] !== inStart[e]) return null;
+			offset = pos[e] + size[e] - inEnd[e];
+			e++;
+		}
+		if (e < n && inStart[e] <= e0) return null;
+		const o = s0 + offset;
+		if (js.compare(old, s0, e0, o, o + (e0 - s0)) !== 0) return null;
+		lits.push({ o, len: e0 - s0, rep: next.subarray(s1, e1) });
+	}
+	if (!lits.length) return { entry, changes };
+
+	// the scramtags from the first change on: /*scramtag <its own position in the output> <tag>*/
+	const tagEnd = Buffer.from(" " + entry.tag + "*/");
+	const tags: { x: number; ds: number; de: number; entry: number; digits: string }[] = [];
+	let m = 0;
+	for (let x = js.indexOf(TAG_OPEN, lits[0].o); x !== -1; x = js.indexOf(TAG_OPEN, x + 1)) {
+		const ds = x + TAG_OPEN.length;
+		let de = ds;
+		while (js[de] >= 0x30 && js[de] <= 0x39) de++;
+		// the rewrite's random tag tells its comments from the same text in the script
+		if (de === ds || js.compare(tagEnd, 0, tagEnd.length, de, de + tagEnd.length) !== 0) continue;
+		if (Number(js.toString("latin1", ds, de)) !== x) return null;
+		// its change: the insert of the comment at x
+		const len = de + tagEnd.length - x;
+		while (m < n && pos[m] < x) m++;
+		let f = m;
+		while (f < n && pos[f] === x && !(size[f] === len && inStart[f] === inEnd[f])) f++;
+		if (f === n || pos[f] !== x) return null;
+		tags.push({ x, ds, de, entry: f, digits: "" });
+	}
+
+	// the output's pieces, in order: [from, to) of the twin's output, then the bytes to put there
+	const cuts: { from: number; to: number; rep: Buffer | string; moveAt: number }[] = [];
+	for (let li = 0, ti = 0, delta = 0; li < lits.length || ti < tags.length; ) {
+		if (ti === tags.length || (li < lits.length && lits[li].o < tags[ti].x)) {
+			const { o, len, rep } = lits[li++];
+			cuts.push({ from: o, to: o + len, rep, moveAt: o + len });
+			delta += rep.length - len;
+		} else {
+			const tag = tags[ti++];
+			const { x, ds, de } = tag;
+			const digits = (tag.digits = String(x + delta));
+			// the comment's own position doesn't move with its new length
+			cuts.push({ from: ds, to: de, rep: digits, moveAt: x + 1 });
+			delta += digits.length - (de - ds);
+		}
+	}
+	let total = js.length;
+	for (const c of cuts) total += c.rep.length - (c.to - c.from);
+	const out = Buffer.allocUnsafe(total);
+	let w = 0, r = 0;
+	for (const c of cuts) {
+		w += js.copy(out, w, r, c.from);
+		w += typeof c.rep === "string" ? out.write(c.rep, w, "latin1") : c.rep.copy(out, w);
+		r = c.to;
+	}
+	js.copy(out, w, r);
+
+	// moves a sorted run of positions in the twin's output to the new output
+	const mover = () => {
+		let ci = 0, delta = 0;
+		return (p: number) => {
+			while (ci < cuts.length && cuts[ci].moveAt <= p) {
+				delta += cuts[ci].rep.length - (cuts[ci].to - cuts[ci].from);
+				ci++;
+			}
+			return p + delta;
+		};
+	};
+	const newMap = Buffer.from(mapBytes);
+	const movePos = mover();
+	for (let i = 0; i < n; i++) newMap.writeUInt32LE(movePos(pos[i]), at[i]);
+	for (const t of tags)
+		if (t.digits.length !== t.de - t.ds)
+			newMap.writeUInt32LE(size[t.entry] + t.digits.length - (t.de - t.ds), at[t.entry] + 4);
+	const moveOffset = mover();
+	const offsets = entry.offsets.map(moveOffset);
+	for (const o of offsets)
+		if (out.compare(placeholder, 0, placeholder.length, o, o + placeholder.length) !== 0) return null;
+	return {
+		entry: {
+			js: new Uint8Array(out.buffer, out.byteOffset, out.byteLength),
+			map: new Uint8Array(newMap.buffer, newMap.byteOffset, newMap.byteLength),
+			offsets,
+			tag: entry.tag,
+		},
+		changes,
+	};
+}
+
+// the twins thread, as the relay sees it
+class TwinWorker {
+	private worker: Worker;
+	private waiting = new Map<number, (r: { key: string; entry: RewriteEntry } | null) => void>();
+	private nextId = 1;
+
+	constructor() {
+		this.worker = new Worker(new URL(import.meta.url), {
+			workerData: { role: "twins", dist: CORE_DIST.pathname },
+		});
+		this.worker.unref();
+		this.worker.on("message", (m) => {
+			const done = this.waiting.get(m.id);
+			this.waiting.delete(m.id);
+			if (LOG && m.why) console.log(`[relay] twin's rewrite not patched: ${m.why}`);
+			done?.(m.key ? { key: m.key, entry: m.entry } : null);
+		});
+		this.worker.on("error", (e) => {
+			console.warn("[relay] twins thread failed:", e);
+			for (const done of this.waiting.values()) done(null);
+			this.waiting.clear();
+			twinWorker = null;
+		});
+	}
+
+	// a big script and its rewrite, for its twins to come (`stamp`: the build that rewrote it)
+	add(key: string, header: string, input: Buffer, entry: RewriteEntry, stamp: string) {
+		this.worker.postMessage({ t: "add", key, header, input, entry, stamp });
+	}
+
+	// the rewrite of `input` under `header`, patched from the twin rewritten under `key`
+	patch(key: string, header: string, input: Buffer) {
+		const id = this.nextId++;
+		return new Promise<{ key: string; entry: RewriteEntry } | null>((resolve) => {
+			this.waiting.set(id, resolve);
+			this.worker.postMessage({ t: "patch", id, twin: key, header, input });
+		});
+	}
+
+	clear() {
+		this.worker.postMessage({ t: "clear" });
+	}
+}
+
+let twinWorker: TwinWorker | null = null;
+
+// the twins thread itself: this module, run with workerData.role "twins"
+async function runTwinWorker() {
+	const acorn = await import("acorn");
+	const jsPath = workerData.dist + "scramjet.js", wasmPath = workerData.dist + "scramjet.wasm";
+	// scramjet's build, for the rewrite keys: its stamp is the one the rewriter threads report
+	let stamp = "";
+	const load = () => {
+		const now = fs.statSync(jsPath).mtimeMs + ":" + fs.statSync(wasmPath).mtimeMs;
+		if (now === stamp) return;
+		(globalThis as any).self = globalThis;
+		vm.runInThisContext(fs.readFileSync(jsPath, "utf8"), { filename: jsPath });
+		(globalThis as any).$scramjet.setWasm(fs.readFileSync(wasmPath));
+		stamp = now;
+	};
+	type Kept = {
+		input: Buffer;
+		isModule: boolean;
+		entry: RewriteEntry;
+		spans: Spans | null | undefined;
+		stamp: string;
+	};
+	const kept = new Map<string, Kept>();
+	const keep = (key: string, k: Kept) => {
+		kept.delete(key);
+		kept.set(key, k);
+		if (kept.size > TWIN_CACHE) kept.delete(kept.keys().next().value!);
+		// found after the page that brought it has had its turn at the CPU
+		if (k.spans === undefined)
+			setTimeout(() => {
+				if (k.spans === undefined) k.spans = analyzeLiterals(acorn, k.input, k.isModule);
+			}, 3000);
+	};
+	parentPort!.on("message", async (m) => {
+		if (m.t === "clear") return kept.clear();
+		if (m.t === "add") {
+			const input = Buffer.from(m.input.buffer, m.input.byteOffset, m.input.byteLength);
+			let isModule = false;
+			try {
+				isModule = !!JSON.parse(m.header).isModule;
+			} catch {
+				return;
+			}
+			return keep(m.key, { input, isModule, entry: m.entry, spans: undefined, stamp: m.stamp });
+		}
+		if (m.t !== "patch") return;
+		const fail = (why: string) => parentPort!.postMessage({ id: m.id, why });
+		try {
+			load();
+			const twin = kept.get(m.twin);
+			if (!twin) return fail("twin no longer kept");
+			if (twin.stamp !== stamp) return fail("scramjet was rebuilt");
+			if (twin.spans === undefined) return fail("twin not analyzed yet");
+			if (!twin.spans) return fail("twin doesn't parse");
+			const h = JSON.parse(m.header);
+			const placeholder = Buffer.from("/" + "a".repeat(h.prefixLength - 2) + "/");
+			const input = Buffer.from(m.input.buffer, m.input.byteOffset, m.input.byteLength);
+			const patched = patchRewrite(twin.input, twin.spans, twin.entry, input, placeholder);
+			if (!patched) return fail("not only literals changed, or one that can't");
+			const key: string = await (globalThis as any).$scramjet.rewriteKey(m.header, input);
+			// the relay keeps the patched script as a twin too: this thread keeps its own copy
+			keep(key, {
+				input,
+				isModule: twin.isModule,
+				entry: { ...patched.entry, js: patched.entry.js.slice(), map: patched.entry.map!.slice() },
+				spans: shiftSpans(twin.spans, patched.changes),
+				stamp,
+			});
+			parentPort!.postMessage({ id: m.id, key, entry: patched.entry }, [
+				patched.entry.js.buffer as ArrayBuffer,
+				patched.entry.map!.buffer as ArrayBuffer,
+			]);
+		} catch (e) {
+			fail(String((e as Error)?.message || e));
+		}
+	});
+}
+
 
 // runs in each rewriter thread: scramjet's bundle, reloaded when the build changes
 const REWRITE_WORKER = String.raw`
@@ -751,7 +1227,7 @@ parentPort.on("message", async ({ id, header, js }) => {
 			const hash = (part) => crypto.createHash("sha1").update(part).digest("hex");
 			edges = ["start:" + hash(input.subarray(0, ${TWIN_EDGE})), "end:" + hash(input.subarray(Math.max(0, input.byteLength - ${TWIN_EDGE})))];
 		}
-		parentPort.postMessage({ id, reloaded, key, entry, edges, length: input.byteLength });
+		parentPort.postMessage({ id, reloaded, key, entry, edges, length: input.byteLength, stamp });
 	} catch (e) {
 		parentPort.postMessage({ id, reloaded, error: String((e && e.message) || e) });
 	}
@@ -761,6 +1237,8 @@ parentPort.on("message", async ({ id, header, js }) => {
 type RewriteJob = {
 	header: string;
 	js: ArrayBuffer;
+	// the script, kept on this thread: a big one's twins may be patched from it
+	input?: Buffer;
 	hint: string;
 	// ahead of the queue: a client may wait for it
 	first?: boolean;
@@ -820,10 +1298,15 @@ class RewritePool {
 			rewriteCache.clear();
 			rewriteCacheBytes = 0;
 			twins.length = 0;
+			twinWorker?.clear();
 		}
 		if (m.key && m.entry) {
 			rewriteCachePut(m.key, m.entry);
-			if (job && m.edges) addTwin(job.header, m.length, m.edges);
+			if (job && m.edges) {
+				// the twins thread gets its own copy of the rewrite
+				if (job.input && twinWorker) twinWorker.add(m.key, job.header, job.input, m.entry, m.stamp);
+				addTwin(job.header, m.length, m.edges, job.input && twinWorker ? m.key : undefined);
+			}
 			job?.done?.({ key: m.key, entry: m.entry });
 			if (LOG)
 				console.log(
@@ -849,6 +1332,7 @@ function getRewritePool() {
 			rewritePool = new RewritePool(
 				Math.max(1, Math.min(2, os.availableParallelism() - 1))
 			);
+			twinWorker = new TwinWorker();
 		} else {
 			console.warn(
 				"[relay] no scramjet build in packages/core/dist: the shared rewrite cache is off"
@@ -870,7 +1354,7 @@ function rewritePut(msg: any, body: Buffer) {
 		return;
 	// its own copy, transferred to the thread
 	const js = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
-	getRewritePool()?.submit({ header: msg.header, js, hint: msg.key });
+	getRewritePool()?.submit({ header: msg.header, js, input: body, hint: msg.key });
 }
 
 function handleMuxSocket(ws: WebSocket) {
@@ -1131,3 +1615,6 @@ export function createRelay() {
 		return false;
 	};
 }
+
+// this module is the twins thread too (see TwinWorker)
+if (!isMainThread && workerData?.role === "twins") runTwinWorker();
