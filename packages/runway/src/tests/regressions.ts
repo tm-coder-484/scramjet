@@ -409,4 +409,28 @@ parent.postMessage({ constructibility: checkConstructibility(window, "second doc
 			});
 		},
 	}),
+	// scramjet/core
+	// a 3xx without a Location (and a 304 for the page's own conditional request) was taken for a
+	// redirect and failed the request (new URL(null)). fetch hands those to the page as they are.
+	// Not the 304 here: runway's libcurl transport can't make a 304 Response (it gives it a body)
+	serverTest({
+		name: "regression-3xx-without-location",
+		autoPass: false,
+		js: `
+		const noLocation = await fetch("/redirect-without-location");
+		assertEqual(noLocation.status, 302, "a 302 without a Location is the response");
+		assertEqual(await noLocation.text(), "nowhere to go", "and its body");
+		pass("a 3xx without a Location reaches the page");
+	`,
+		start: async (server) => {
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				const path = (req.url || "").split("?")[0] || "";
+				if (path === "/redirect-without-location") {
+					res.writeHead(302, { "Content-Type": "text/plain" });
+					res.end("nowhere to go");
+				}
+			});
+		},
+	}),
 ];
