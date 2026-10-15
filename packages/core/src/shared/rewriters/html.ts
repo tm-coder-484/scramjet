@@ -467,10 +467,17 @@ export function rewriteElementAttributes(
 	return null;
 }
 
+/** the url inline scripts are rewritten with */
+export const INLINE_SCRIPT_URL = "(inline script element)";
+
 export function traverseParsedHtml(
 	node: any,
 	context: ScramjetContext,
-	meta: URLMeta
+	meta: URLMeta,
+	// takes an inline script's rewrite elsewhere (htmlStream.ts sends big ones to the rewriter
+	// threads): given the script node and the text to rewrite, returns true when it will set the
+	// node's text itself
+	deferScript?: (node: any, js: string, isModule: boolean) => boolean
 ) {
 	if (node.attribs) {
 		const replacement = rewriteElementAttributes(
@@ -527,13 +534,14 @@ export function traverseParsedHtml(
 			);
 			const htmlcomment = /<!--[\s\S]*?-->/g;
 			js = js.replace(htmlcomment, "");
-			node.children[0].data = rewriteJs(
-				js,
-				"(inline script element)",
-				context,
-				meta,
-				module
-			);
+			if (!deferScript?.(node, js, module))
+				node.children[0].data = rewriteJs(
+					js,
+					INLINE_SCRIPT_URL,
+					context,
+					meta,
+					module
+				);
 		}
 	}
 
@@ -542,7 +550,8 @@ export function traverseParsedHtml(
 			node.childNodes[childNode] = traverseParsedHtml(
 				node.childNodes[childNode],
 				context,
-				meta
+				meta,
+				deferScript
 			);
 		}
 	}

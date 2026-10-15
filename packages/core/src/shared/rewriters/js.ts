@@ -329,6 +329,49 @@ export async function rewriteJsWithCache(
 	return res;
 }
 
+/**
+ * rewriteJs for an inline script on the rewriter threads, for the streaming HTML rewriter: the
+ * thread rewriting the document then keeps answering the page's other requests meanwhile (an
+ * inline script of tens of KB takes it several ms, and some pages have a few). Same result as
+ * rewriteJs. Null when there is no offload, or the script is too small to be worth sending.
+ */
+export function rewriteJsOffloaded(
+	js: string,
+	url: string | null,
+	context: ScramjetContext,
+	meta: URLMeta,
+	isModule: boolean
+): Promise<string> | null {
+	// a UTF-16 length at least this long is at least this many UTF-8 bytes
+	if (!jsRewriteOffload || js.length < MIN_OFFLOAD_BYTES) return null;
+	let job: Promise<RewriterResult>;
+	try {
+		job = jsRewriteOffload(
+			TextEncoder_encode(js),
+			url,
+			context,
+			meta,
+			isModule,
+			false
+		);
+	} catch {
+		return null;
+	}
+	const text = (out: string | Uint8Array) =>
+		typeof out === "string" ? out : TextDecoder_decode(out);
+	// a rejection is the rewriter's own failure: handled as rewriteJs handles it
+	return job.then(
+		(res) => {
+			try {
+				return text(finishRewrite(res, context, meta));
+			} catch (err) {
+				return text(failRewrite(err, js, url, context, meta));
+			}
+		},
+		(err) => text(failRewrite(err, js, url, context, meta))
+	);
+}
+
 // rewriteJs for script bodies, with the rewriter output cached (see jscache.ts). the result
 // is the same as rewriteJs's. a hit skips the rewriter, which costs 40-80ms per MB
 export async function rewriteJsCached(

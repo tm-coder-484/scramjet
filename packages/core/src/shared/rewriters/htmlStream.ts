@@ -8,6 +8,7 @@ import { sniffEncoding } from "@/shared/sniffEncoding";
 import {
 	Object_keys,
 	Performance_now,
+	Promise_all,
 	TextEncoder_encode,
 	_Map,
 	_ReadableStream,
@@ -17,11 +18,13 @@ import {
 } from "@/shared/snapshot";
 import {
 	HtmlContext,
+	INLINE_SCRIPT_URL,
 	renderBlockingScript,
 	renderOptions,
 	rewriteElementAttributes,
 	traverseParsedHtml,
 } from "./html";
+import { rewriteJsOffloaded } from "./js";
 
 /*
  * Streaming HTML rewriter. Its output is byte-identical to rewriteHtml (html.ts) on the whole
@@ -311,6 +314,9 @@ type Capture = {
 	parentName: string | undefined;
 };
 
+// output that is still being rewritten elsewhere (a big inline script, see finishCapture)
+type Pending = { promise: Promise<void>; text?: string };
+
 // where the scramjet scripts go, decided the way detectQuirks in html.ts decides it:
 // "quirks" puts them at the start of the document, "head" at the start of the existing <head>,
 // "html" in a new <head> at the start of <html>. "off" when the scripts are not loaded.
@@ -333,6 +339,8 @@ class HtmlStreamRewriter {
 	private pendingAfterHeadOpen: string | undefined;
 	private sawBody = false;
 	private out = "";
+	// output from before the latest pending part, in order: everything in out comes after it
+	private queue: (string | Pending)[] = [];
 
 	// root-level content arrived after a provisional decision, so the output may differ from detectQuirks
 	lateRootContent = false;
@@ -368,11 +376,27 @@ class HtmlStreamRewriter {
 		if (this.injection === "undecided") this.commitQuirks(false);
 	}
 
-	// returns the output produced since the last call
+	// returns the output produced since the last call, up to the first part still being rewritten
 	takeOutput(): string {
-		const out = this.out;
+		let out = "";
+		while (this.queue.length) {
+			const part = this.queue[0];
+			if (typeof part === "string") out += part;
+			else if (part.text !== undefined) out += part.text;
+			else return out;
+			this.queue.shift();
+		}
+		out += this.out;
 		this.out = "";
 		return out;
+	}
+
+	/** settles when the first part still being rewritten is done, if there is one */
+	firstPending(): Promise<void> | undefined {
+		for (const part of this.queue)
+			if (typeof part !== "string" && part.text === undefined)
+				return part.promise;
+		return undefined;
 	}
 
 	private emit(s: string) {
@@ -537,8 +561,34 @@ class HtmlStreamRewriter {
 		const element = dom.root.children[0] as Element;
 		// dom-serializer reads only the parent's name, from elem.parent, to render the element
 		element.parent = { name: parentName } as unknown as Element["parent"];
-		traverseParsedHtml(element, this.context, this.meta);
-		this.emit(render(element, { ...renderOptions, xmlMode: parentMode }));
+		const options = { ...renderOptions, xmlMode: parentMode };
+		// big inline scripts are rewritten on the rewriter threads, and what follows waits for them.
+		// usually one, but in foreign content a script's text is markup, which can hold more
+		const offloaded: Promise<void>[] = [];
+		traverseParsedHtml(element, this.context, this.meta, (node, js, isModule) => {
+			const job = rewriteJsOffloaded(
+				js,
+				INLINE_SCRIPT_URL,
+				this.context,
+				this.meta,
+				isModule
+			);
+			if (!job) return false;
+			offloaded.push(job.then((rewritten) => void (node.children[0].data = rewritten)));
+			return true;
+		});
+		if (!offloaded.length) {
+			this.emit(render(element, options));
+			return;
+		}
+		const part: Pending = {
+			promise: Promise_all(offloaded).then(() => {
+				part.text = render(element, options);
+			}),
+		};
+		// the injection is decided before any <script> is captured, so this output isn't held
+		this.queue.push(this.out, part);
+		this.out = "";
 	}
 
 	private text(data: string) {
@@ -629,6 +679,8 @@ export function rewriteHtmlStream(
 
 	// when this run of work started: reset by a yield, or by a read that had to wait for data
 	let sliceStart = Performance_now();
+	// the input has ended: what's left is the output still queued
+	let finished = false;
 
 	return new _ReadableStream<Uint8Array>({
 		async pull(controller) {
@@ -638,6 +690,24 @@ export function rewriteHtmlStream(
 					if (_MessageChannel && Performance_now() - sliceStart > SLICE_MS) {
 						await yieldToTasks();
 						sliceStart = Performance_now();
+					}
+					if (rewriter) {
+						const out = rewriter.takeOutput();
+						if (out) {
+							controller.enqueue(TextEncoder_encode(out));
+							return;
+						}
+						// an inline script is being rewritten elsewhere: its output comes first
+						const pending = rewriter.firstPending();
+						if (pending) {
+							await pending;
+							sliceStart = Performance_now();
+							continue;
+						}
+						if (finished) {
+							controller.close();
+							return;
+						}
 					}
 					const before = Performance_now();
 					const { done, value } = await reader.read();
@@ -652,7 +722,6 @@ export function rewriteHtmlStream(
 						}
 						rewriter!.write(decoder!.decode());
 						rewriter!.end();
-						const out = rewriter!.takeOutput();
 						if (flagEnabled("rewriterLogs", context, meta.base)) {
 							dbg.time(meta, started, "html rewrite (stream)");
 						}
@@ -661,9 +730,9 @@ export function rewriteHtmlStream(
 								`streamed html rewrite saw root-level content after </html> @ ${meta.origin.href}; the injected scripts may differ from the buffered rewrite`
 							);
 						}
-						if (out) controller.enqueue(TextEncoder_encode(out));
-						controller.close();
-						return;
+						// the rest of the output, once any pending parts are done, then the end
+						finished = true;
+						continue;
 					}
 
 					let text: string;
@@ -679,13 +748,8 @@ export function rewriteHtmlStream(
 						text = decoder!.decode(prefix, { stream: true });
 					}
 
+					// the output (if any yet: it can be held for the injection point) is taken above
 					rewriter!.write(text);
-					const out = rewriter!.takeOutput();
-					if (out) {
-						controller.enqueue(TextEncoder_encode(out));
-						return;
-					}
-					// nothing to write yet (held for the injection point): read on
 				}
 				/* eslint-enable no-await-in-loop */
 			} catch (err) {

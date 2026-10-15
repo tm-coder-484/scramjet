@@ -8,6 +8,7 @@ export * from "./warmup";
 export {
 	getRemoteRewriteCache,
 	materialize,
+	openDb as openRewriteCache,
 	rewriteKey,
 	setRemoteRewriteCache,
 	templateRewrite,

@@ -24,6 +24,11 @@ export class RelayRewriteCache implements RemoteRewriteCache {
 
 	constructor(private url: string) {}
 
+	/** opens the connection now, so the first lookup doesn't wait for it */
+	connect() {
+		this.open();
+	}
+
 	private open(): WebSocket {
 		if (this.ws && this.ws.readyState <= WebSocket.OPEN) return this.ws;
 		const ws = new WebSocket(this.url);
