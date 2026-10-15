@@ -54,9 +54,16 @@ function rewriteLinkHeader(
 	context: ScramjetContext,
 	meta: URLMeta
 ) {
-	return link.replace(/<([^>]+)>/gi, (_match, p1) => {
-		return `<${rewriteUrl(p1, context, meta)}>`;
-	});
+	return (
+		link
+			.replace(/<([^>]+)>/gi, (_match, p1) => {
+				return `<${rewriteUrl(p1, context, meta)}>`;
+			})
+			// a preload's integrity is the hash of the original resource, not of the rewritten one the
+			// proxy serves, so the browser would block it (and the stylesheet or script using the
+			// preload with it). dropped, as the integrity attribute of elements is
+			.replace(/;\s*integrity\s*=\s*(?:"(?:[^"\\]|\\.)*"|[^;,]*)/gi, "")
+	);
 }
 
 export async function rewriteResponseHeaders(
@@ -163,9 +170,50 @@ export function rewriteRequestHeaders(
 		headers.set("Cookie", cookies);
 	}
 
+	// the browser's network stack adds this after the service worker, so the request here has none,
+	// and a transport would send none or its own (undici's fetch sends "*"): sites then pick another
+	// language, or another variant of the page
+	if (!headers.has("accept-language")) {
+		const languages = acceptLanguage();
+		if (languages) headers.set("Accept-Language", languages);
+	}
+
 	applyFetchMetadataHeaders(headers, request, parsed, handler);
 
 	return headers;
+}
+
+let acceptLanguageFor: string | undefined;
+let acceptLanguageValue = "";
+
+// the Accept-Language Chromium sends for navigator.languages: a regional language's base language
+// is added after the last language of its group (en-US becomes "en-US,en") unless the list has it,
+// and the q-values after the first fall by 0.1, down to 0.1
+function acceptLanguage(): string {
+	const languages: readonly string[] = globalThis.navigator?.languages ?? [];
+	const key = languages.join(",");
+	if (key === acceptLanguageFor) return acceptLanguageValue;
+	const expanded: string[] = [];
+	for (let i = 0; i < languages.length; i++) {
+		const language = languages[i];
+		if (!expanded.includes(language)) expanded.push(language);
+		const base = language.split("-")[0];
+		const next = languages[i + 1];
+		if (
+			base !== language &&
+			next?.split("-")[0] !== base &&
+			!languages.includes(base) &&
+			!expanded.includes(base)
+		)
+			expanded.push(base);
+	}
+	acceptLanguageFor = key;
+	acceptLanguageValue = expanded
+		.map((language, i) =>
+			i === 0 ? language : `${language};q=${Math.max(10 - i, 1) / 10}`
+		)
+		.join(",");
+	return acceptLanguageValue;
 }
 
 /**
