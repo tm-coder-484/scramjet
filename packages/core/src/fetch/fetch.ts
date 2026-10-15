@@ -370,11 +370,15 @@ function handleCookies(
 ): Promise<void> | undefined {
 	const cookies = [];
 	let visible = false;
+	// the document that could see the cookies first: the one this response is, or the one that asked
+	// for it. Another site's cookies, or HttpOnly ones, it can't see
+	const observer = isDocument(parsed) ? parsed.url : parsed.clientUrl;
 
 	for (const [key, value] of rawHeaders) {
 		if (key.toLowerCase() !== "set-cookie") continue;
 
-		if (handler.context.cookieJar.setCookies(value, parsed.url)) visible = true;
+		if (handler.context.cookieJar.setCookies(value, parsed.url, observer))
+			visible = true;
 		cookies.push({
 			url: parsed.url,
 			cookie: value,

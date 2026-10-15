@@ -16,6 +16,9 @@ export type Cookie = {
 	sameSite?: string; // "strict"|"lax"|"none" or titlecase variants from parsers
 };
 
+// a document that may read cookies, by its URL's hostname and pathname
+export type CookieObserver = { hostname: string; pathname: string };
+
 export class CookieJar {
 	private cookies: Record<string, Cookie> = {};
 	// Index by domain (without leading dot)
@@ -76,12 +79,36 @@ export class CookieJar {
 		delete this.cookies[id];
 	}
 
+	// whether document.cookie would show this cookie to a document at `observer` (HttpOnly ones it never
+	// shows to anyone)
+	private shownTo(
+		c: Cookie | undefined,
+		observer: CookieObserver | undefined
+	): boolean {
+		if (!c || c.httpOnly) return false;
+		if (!observer) return true;
+		const domain = c.domain!.slice(1);
+		const host = observer.hostname;
+		if (
+			c.hostOnly
+				? host !== domain
+				: host !== domain && !host.endsWith("." + domain)
+		)
+			return false;
+		return this.pathMatches(observer.pathname, c.path!);
+	}
+
 	/**
 	 * Stores the cookies of a Set-Cookie value. Returns whether that changed anything a page can see
-	 * through document.cookie: a new cookie, another value or HttpOnly/Secure flag, an earlier
-	 * expiry, or a removal. Setting a cookie again as it is (with a later expiry) changes nothing
+	 * through document.cookie (at `observer`, if given): a new cookie, another value or
+	 * HttpOnly/Secure flag, an earlier expiry, or a removal. Setting a cookie again as it is (with a
+	 * later expiry) changes nothing, and neither does an HttpOnly cookie
 	 */
-	setCookies(cookieString: string, url: URL): boolean {
+	setCookies(
+		cookieString: string,
+		url: URL,
+		observer?: CookieObserver
+	): boolean {
 		this.invalidate();
 		const parsedCookies = parse(cookieString);
 		let visible = false;
@@ -119,7 +146,7 @@ export class CookieJar {
 				if (!Number.isFinite(cookie.maxAge)) {
 					delete cookie.maxAge;
 				} else if (cookie.maxAge <= 0) {
-					if (this.cookies[id]) visible = true;
+					if (this.shownTo(this.cookies[id], observer)) visible = true;
 					this.removeById(id);
 					continue;
 				} else {
@@ -129,11 +156,12 @@ export class CookieJar {
 
 			const prev = this.cookies[id];
 			if (
-				!prev ||
-				prev.value !== cookie.value ||
-				!!prev.httpOnly !== !!cookie.httpOnly ||
-				!!prev.secure !== !!cookie.secure ||
-				(cookie.expires ?? Infinity) < (prev.expires ?? Infinity)
+				(this.shownTo(prev, observer) || this.shownTo(cookie, observer)) &&
+				(!prev ||
+					prev.value !== cookie.value ||
+					!!prev.httpOnly !== !!cookie.httpOnly ||
+					!!prev.secure !== !!cookie.secure ||
+					(cookie.expires ?? Infinity) < (prev.expires ?? Infinity))
 			)
 				visible = true;
 			if (prev) this.unindexCookie(prev);
