@@ -359,6 +359,9 @@ export default function (client: ScramjetClient, self: typeof window) {
 		formaction: [self.HTMLButtonElement, self.HTMLInputElement],
 		srcdoc: [self.HTMLIFrameElement],
 		poster: [self.HTMLVideoElement],
+		// without these, a srcset set from script went to the browser unrewritten, and it fetched
+		// the images straight from the site
+		srcset: [self.HTMLImageElement, self.HTMLSourceElement],
 		imagesrcset: [self.HTMLLinkElement],
 	};
 
@@ -383,9 +386,13 @@ export default function (client: ScramjetClient, self: typeof window) {
 
 	const attrs = Object_keys(attrObject);
 
-	const urlAttrs = ["src", "data", "href", "action", "formaction"];
+	const urlAttrs = ["src", "data", "href", "action", "formaction", "poster"];
+	// these reflect the attribute as it was written: the page reads back what it set, not the
+	// rewritten urls (which it would rewrite a second time if it set them again)
+	const verbatimAttrs = ["srcset", "imagesrcset"];
 	for (const attr of attrs) {
 		const isUrlAttr = urlAttrs.includes(attr);
+		const isVerbatim = verbatimAttrs.includes(attr);
 		for (const element of attrObject[attr]) {
 			const descriptor = client.natives.call(
 				"Object.getOwnPropertyDescriptor",
@@ -397,6 +404,14 @@ export default function (client: ScramjetClient, self: typeof window) {
 				get() {
 					if (isUrlAttr) {
 						return unrewriteUrl(descriptor.get.call(this), client.context);
+					}
+					if (isVerbatim) {
+						const original = client.natives.call(
+							"Element.prototype.getAttribute",
+							this,
+							`scramjet-attr-${attr}`
+						);
+						if (original !== null) return original;
 					}
 
 					return descriptor.get.call(this);
@@ -889,6 +904,15 @@ export default function (client: ScramjetClient, self: typeof window) {
 		}
 		if (client.box.instanceof(element, "HTMLStyleElement")) {
 			return unrewriteCss(text, client.context);
+		}
+		// with scripting on, a <noscript>'s content is text, and the HTML rewriter rewrote the markup
+		// in it like any other. pages that lazy-load from it (Apple's front page) parse that text and
+		// insert it, which would rewrite its urls a second time: they read the original markup
+		if (
+			element.localName === "noscript" &&
+			text.includes("scramjet-attr-")
+		) {
+			return unrewriteHtml(text, "html");
 		}
 		return text;
 	};
