@@ -473,8 +473,11 @@ export class Controller {
 							this.cookieJar.clear();
 						}
 						this.applyCookieSyncEntries(cookies);
-						await this.persistCookies();
-						await this.propagateCookieSync(cookies, options);
+						// the page doesn't need the jar on disk to see its cookies: both go at once
+						await Promise.all([
+							this.persistCookies(),
+							this.propagateCookieSync(cookies, options),
+						]);
 					},
 					connect: async ({ url, protocols, requestHeaders, port }) => {
 						let resolve: (arg: TransportToController["connect"][1]) => void;
@@ -799,7 +802,34 @@ export class Controller {
 		return this.cookieSyncPromise;
 	}
 
-	async persistCookies(): Promise<void> {
+	// the write in flight, and the one queued behind it: a burst of responses that set cookies
+	// (Cloudflare sets some on ~90) makes one write after the current one, not one each
+	private persisting: Promise<void> | null = null;
+	private persistQueued: Promise<void> | null = null;
+
+	/** writes the jar to IndexedDB, as it is when the write starts, for other tabs and reloads */
+	persistCookies(): Promise<void> {
+		if (!this.persisting) {
+			const done = () => {
+				this.persisting = null;
+			};
+			this.persisting = this.writeCookies();
+			this.persisting.then(done, done);
+			return this.persisting;
+		}
+		return (this.persistQueued ??= this.persisting.then(
+			() => {
+				this.persistQueued = null;
+				return this.persistCookies();
+			},
+			() => {
+				this.persistQueued = null;
+				return this.persistCookies();
+			}
+		));
+	}
+
+	private async writeCookies(): Promise<void> {
 		const updatedAt = await writeCookieState(
 			this.cookieJar.dump(),
 			this.cookieUpdatedAt
@@ -1061,14 +1091,17 @@ export class Frame {
 			context: this.context,
 			transport: controller.transport,
 			async sendSetCookie(cookies, options) {
-				await controller.persistCookies();
-				await controller.propagateCookieSync(
-					cookies.map(({ url, cookie }) => ({
-						url: url.href,
-						cookie,
-					})),
-					options
-				);
+				// the page doesn't need the jar on disk to see its cookies: both go at once
+				await Promise.all([
+					controller.persistCookies(),
+					controller.propagateCookieSync(
+						cookies.map(({ url, cookie }) => ({
+							url: url.href,
+							cookie,
+						})),
+						options
+					),
+				]);
 			},
 			async fetchBlobUrl(url) {
 				return BareResponse.fromNativeResponse(await fetch(url));
