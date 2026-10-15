@@ -12,15 +12,17 @@
 //
 // The relay's caches persist across loads, like a proxy server's would, so the first rep of a
 // site is the cold-cache one; with --reps 3 the medians are of warm-relay, cold-browser loads.
-// CHROMIUM_PATH picks the browser binary, CHROMIUM_ARGS adds launch arguments.
+// The host and the relay run in a child process, as a server of their own: in this one, they
+// would wait on Playwright's protocol traffic. CHROMIUM_PATH picks the browser binary,
+// CHROMIUM_ARGS adds launch arguments.
 import http from "node:http";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { chromium, type Browser, type BrowserContext, type Frame, type Locator, type Page } from "playwright";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "../../..");
-const { createRelay } = await import(path.join(ROOT, "devrelay.ts"));
 
 type Site = {
 	url: string;
@@ -125,7 +127,8 @@ const TYPES: Record<string, string> = {
 	".map": "application/json",
 };
 
-function startHost(): Promise<http.Server> {
+async function startHost(): Promise<http.Server> {
+	const { createRelay } = await import(path.join(ROOT, "devrelay.ts"));
 	const relay = createRelay();
 	const server = http.createServer((req, res) => {
 		const url = new URL(req.url || "/", "http://host");
@@ -222,41 +225,60 @@ const median = (xs: number[]) => {
 	return s.length ? (s.length % 2 ? s[(s.length - 1) / 2] : (s[s.length / 2 - 1] + s[s.length / 2]) / 2) : NaN;
 };
 
-const server = await startHost();
-const browser = await chromium.launch({
-	headless: true,
-	executablePath: process.env.CHROMIUM_PATH || undefined,
-	args: (process.env.CHROMIUM_ARGS || "").split(" ").filter(Boolean),
-});
-const results: Result[] = [];
-for (let rep = 0; rep < reps; rep++) {
-	for (const site of siteNames) {
-		// alternate which goes first, so drift over the run spreads over both
-		const kinds: Result["kind"][] = rep % 2 ? ["scramjet", "direct"] : ["direct", "scramjet"];
-		for (const kind of kinds) {
-			const r = await measure(browser, site, kind, rep);
-			results.push(r);
-			if (out) fs.appendFileSync(out, JSON.stringify(r) + "\n");
-			console.log(`${site.padEnd(11)} ${kind.padEnd(8)} rep${rep} ${r.error ? "ERROR " + r.error : `load=${Math.round(r.load!)}${r.game ? ` game=${r.game}` : ""}`}`);
+// --serve: the child, which serves until its parent goes away
+if (args.includes("--serve")) {
+	await startHost();
+	console.log("serving");
+	process.stdin.resume();
+	process.stdin.on("end", () => process.exit(0));
+} else {
+	await runBenchmark();
+}
+
+async function runBenchmark() {
+	const server = spawn(process.execPath, [...process.execArgv, fileURLToPath(import.meta.url), "--serve", "--port", String(port)], {
+		stdio: ["pipe", "pipe", "inherit"],
+	});
+	await new Promise<void>((resolve, reject) => {
+		server.stdout!.on("data", (d: Buffer) => d.toString().includes("serving") && resolve());
+		server.on("exit", (code) => reject(new Error(`the host exited (${code})`)));
+	});
+	const browser = await chromium.launch({
+		headless: true,
+		executablePath: process.env.CHROMIUM_PATH || undefined,
+		args: (process.env.CHROMIUM_ARGS || "").split(" ").filter(Boolean),
+	});
+	const results: Result[] = [];
+	for (let rep = 0; rep < reps; rep++) {
+		for (const site of siteNames) {
+			// alternate which goes first, so drift over the run spreads over both
+			const kinds: Result["kind"][] = rep % 2 ? ["scramjet", "direct"] : ["direct", "scramjet"];
+			for (const kind of kinds) {
+				const r = await measure(browser, site, kind, rep);
+				results.push(r);
+				if (out) fs.appendFileSync(out, JSON.stringify(r) + "\n");
+				console.log(`${site.padEnd(11)} ${kind.padEnd(8)} rep${rep} ${r.error ? "ERROR " + r.error : `load=${Math.round(r.load!)}${r.game ? ` game=${r.game}` : ""}`}`);
+			}
 		}
 	}
-}
-await browser.close();
-server.close();
+	await browser.close();
+	server.stdin!.end();
+	server.kill();
 
-const med = (site: string, kind: string, key: "load" | "game") =>
-	median(results.filter((r) => r.site === site && r.kind === kind && r[key] !== undefined).map((r) => r[key]!));
-console.log(`\nmedian ms over ${reps} cold loads (ratio = scramjet / direct)`);
-console.log("site          direct  scramjet  ratio");
-const ratios: number[] = [];
-for (const site of siteNames) {
-	for (const key of ["load", "game"] as const) {
-		if (key === "game" && !SITES[site].game) continue;
-		const d = med(site, "direct", key), s = med(site, "scramjet", key), ratio = s / d;
-		if (key === "load" && Number.isFinite(ratio)) ratios.push(ratio);
-		console.log(`${(key === "game" ? site + " game" : site).padEnd(13)} ${String(Math.round(d)).padStart(6)}  ${String(Math.round(s)).padStart(8)}  ${ratio.toFixed(2)}${ratio > 1.1 ? "*" : ""}`);
+	const med = (site: string, kind: string, key: "load" | "game") =>
+		median(results.filter((r) => r.site === site && r.kind === kind && r[key] !== undefined).map((r) => r[key]!));
+	console.log(`\nmedian ms over ${reps} cold loads (ratio = scramjet / direct)`);
+	console.log("site          direct  scramjet  ratio");
+	const ratios: number[] = [];
+	for (const site of siteNames) {
+		for (const key of ["load", "game"] as const) {
+			if (key === "game" && !SITES[site].game) continue;
+			const d = med(site, "direct", key), s = med(site, "scramjet", key), ratio = s / d;
+			if (key === "load" && Number.isFinite(ratio)) ratios.push(ratio);
+			console.log(`${(key === "game" ? site + " game" : site).padEnd(13)} ${String(Math.round(d)).padStart(6)}  ${String(Math.round(s)).padStart(8)}  ${ratio.toFixed(2)}${ratio > 1.1 ? "*" : ""}`);
+		}
 	}
+	const geo = Math.exp(ratios.reduce((a, r) => a + Math.log(r), 0) / ratios.length);
+	console.log(`load: geomean ratio ${geo.toFixed(3)}; sites over 1.10: ${ratios.filter((r) => r > 1.1).length}/${ratios.length}`);
+	process.exit(0);
 }
-const geo = Math.exp(ratios.reduce((a, r) => a + Math.log(r), 0) / ratios.length);
-console.log(`load: geomean ratio ${geo.toFixed(3)}; sites over 1.10: ${ratios.filter((r) => r > 1.1).length}/${ratios.length}`);
-process.exit(0);
