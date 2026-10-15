@@ -213,6 +213,30 @@ function shareable(r: PrefetchedResponse) {
 	return !/\*|cookie/.test(get("vary"));
 }
 
+// undici's fetch sets Sec-Fetch-Mode to its own request's mode, "cors", whatever the browser's
+// request was (it can't make "navigate" or "no-cors" requests), so every page load looked like a
+// fetch() to the site: a bot signal to the bot checks some sites run. the browser's value comes in
+// this header instead, and goes back in place just before the request is sent
+const FETCH_MODE = "x-relay-sec-fetch-mode";
+const keepFetchMode: Dispatcher.DispatcherComposeInterceptor =
+	(dispatch) => (opts, handler) => {
+		const headers = opts.headers;
+		if (headers && typeof headers === "object" && !Array.isArray(headers)) {
+			const record = headers as Record<string, string | string[] | undefined>;
+			const mode = record[FETCH_MODE];
+			if (typeof mode === "string") {
+				const next: Record<string, string | string[] | undefined> = {};
+				for (const [k, v] of Object.entries(record)) {
+					const lower = k.toLowerCase();
+					if (lower !== FETCH_MODE && lower !== "sec-fetch-mode") next[k] = v;
+				}
+				next["sec-fetch-mode"] = mode;
+				opts = { ...opts, headers: next };
+			}
+		}
+		return dispatch(opts, handler);
+	};
+
 const newAgent = (keepAlive?: number): Dispatcher =>
 	new Agent({
 		allowH2: true,
@@ -221,7 +245,7 @@ const newAgent = (keepAlive?: number): Dispatcher =>
 		...(keepAlive
 			? { keepAliveTimeout: keepAlive, keepAliveMaxTimeout: keepAlive }
 			: {}),
-	});
+	}).compose(keepFetchMode);
 
 // the connections to sites are kept open for every browser that uses the relay, the way a proxy
 // server's are: a page then skips the TCP and TLS handshakes for any site it, or anyone, loaded
@@ -327,6 +351,8 @@ class RelaySession {
 				origin: doc.origin,
 				"sec-fetch-dest": dest,
 				"sec-fetch-site": u.origin === doc.origin ? "same-origin" : "cross-site",
+				// fonts load in cors mode; the rest, without a crossorigin attribute, in no-cors
+				[FETCH_MODE]: dest === "font" ? "cors" : "no-cors",
 				accept:
 					dest === "style"
 						? "text/css,*/*;q=0.1"
@@ -399,6 +425,7 @@ class RelaySession {
 				origin: parent.origin,
 				accept: font ? "*/*" : "text/css,*/*;q=0.1",
 				"sec-fetch-dest": font ? "font" : "style",
+				[FETCH_MODE]: font ? "cors" : "no-cors",
 			};
 			for (const name of ["user-agent", "accept-language"])
 				if (parent[name]) headers[name] = parent[name];
@@ -657,6 +684,7 @@ function handleMuxSocket(ws: WebSocket) {
 				if (REQUEST_DROP.has(k.toLowerCase())) continue;
 				try {
 					h.append(k, v);
+					if (k.toLowerCase() === "sec-fetch-mode") h.set(FETCH_MODE, v);
 				} catch {}
 			}
 			const r = await undiciFetch(msg.url, {
