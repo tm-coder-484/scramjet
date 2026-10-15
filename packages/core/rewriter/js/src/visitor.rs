@@ -4,7 +4,7 @@ use coverage_macro::coverage_checked;
 use oxc::{
 	allocator::{Allocator, StringBuilder},
 	ast::ast::{
-		AssignmentExpression, AssignmentTarget, AssignmentTargetMaybeDefault,
+		AssignmentExpression, AssignmentTarget, AssignmentTargetMaybeDefault, BinaryOperator,
 		AssignmentTargetProperty, AssignmentTargetPropertyIdentifier, BindingPattern,
 		BindingPatternKind, BindingProperty, CallExpression, ComputedMemberExpression,
 		DebuggerStatement, ExportAllDeclaration, ExportNamedDeclaration, Expression, ForStatement,
@@ -41,6 +41,22 @@ fn unwrap_parens<'a, 'data>(mut expr: &'a Expression<'data>) -> &'a Expression<'
 		expr = &p.expression;
 	}
 	expr
+}
+
+// a computed key that evaluates to a number, a bigint, a boolean, undefined or a typeof result,
+// whatever its operands: never one of UNSAFE_GLOBALS, so the wrapper would hand it back as is.
+// hot loops index this way (bytes[i++], heap[p >> 2], a VM's code[pc++]), where the wrapper's
+// call is most of the access. `+` can make a string, and is wrapped
+fn never_unsafe_key(expr: &Expression) -> bool {
+	match unwrap_parens(expr) {
+		// x++ --x
+		Expression::UpdateExpression(_) => true,
+		// -x +x !x ~x typeof x void x delete x
+		Expression::UnaryExpression(_) => true,
+		// arithmetic but +, shifts, bitwise, comparisons, in, instanceof
+		Expression::BinaryExpression(b) => b.operator != BinaryOperator::Addition,
+		_ => false,
+	}
 }
 
 pub struct Visitor<'alloc, 'data, E>
@@ -101,6 +117,7 @@ where
 			| Expression::NumericLiteral(_)
 			| Expression::RegExpLiteral(_)
 			| Expression::BooleanLiteral(_) => {}
+			key if never_unsafe_key(key) => {}
 			Expression::StringLiteral(lit) => {
 				if UNSAFE_GLOBALS.contains(&lit.value.as_str()) {
 					self.add_wrap_property(it.expression.span(), receiver);

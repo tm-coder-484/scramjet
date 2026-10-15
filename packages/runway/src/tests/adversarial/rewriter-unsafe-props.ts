@@ -11,6 +11,51 @@ import { basicTest } from "../../testcommon.ts";
 // invisible to the page.
 
 export default [
+	// keys that can only be numbers, booleans or typeof results skip the wrapper (they can't name
+	// an unsafe property): they must still index as written
+	basicTest({
+		name: "unsafeprops-numeric-keys-index",
+		js: `
+			const a = [10, 20, 30, 40];
+			let i = 0;
+			assertEqual(a[i++], 10, "a[i++]");
+			assertEqual(a[i++], 20, "a[i++] again");
+			assertEqual(a[--i], 20, "a[--i]");
+			assertEqual(a[a.length >> 1], 30, "a[n >> 1]");
+			assertEqual(a[a.length - 1], 40, "a[n - 1]");
+			assertEqual(a[~~2.7], 30, "a[~~x]");
+			assertEqual(a[-(-3)], 40, "a[-x]");
+			const heap = new Int32Array(8);
+			const ptr = 12;
+			heap[ptr >> 2] = 7;
+			heap[(ptr + 4) >>> 2]++;
+			assertEqual(heap[3], 7, "heap[p >> 2] write");
+			assertEqual(heap[4], 1, "heap[p >>> 2]++");
+			const named = { number: "n", undefined: "u", true: "t", false: "f", string: "s" };
+			assertEqual(named[typeof 1], "n", "o[typeof x]");
+			assertEqual(named[typeof ""], "s", "o[typeof string]");
+			assertEqual(named[void 0], "u", "o[void 0]");
+			assertEqual(named[1 < 2], "t", "o[a < b]");
+			assertEqual(named["a" in named], "f", "o[k in o]");
+			const big = { 3: "three" };
+			assertEqual(big[1n + 2n === 3n ? 3 : 0], "three", "conditional key");
+		`,
+	}),
+	// the keys that can make a string still go through the wrapper
+	basicTest({
+		name: "unsafeprops-built-keys-still-wrapped",
+		js: `
+			const half = "loc";
+			checkglobal(self[half + "ation"]);
+			checkglobal(window[(0, "top")]);
+			checkglobal(self[1 ? "parent" : 0]);
+			checkglobal(self[\`to\${"p"}\`]);
+			checkglobal(self[["eval"][0]]);
+			const keys = ["top"];
+			let k = 0;
+			checkglobal(self[keys[k++]]);
+		`,
+	}),
 	basicTest({
 		name: "unsafeprops-read-write-plain-object",
 		js: `
