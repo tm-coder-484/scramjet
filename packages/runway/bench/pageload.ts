@@ -16,7 +16,8 @@
 // site is the cold-cache one; with --reps 3 the medians are of warm-relay, cold-browser loads.
 // The host and the relay run in a child process, as a server of their own: in this one, they
 // would wait on Playwright's protocol traffic. CHROMIUM_PATH picks the browser binary,
-// CHROMIUM_ARGS adds launch arguments.
+// CHROMIUM_ARGS adds launch arguments. Both kinds of load connect to sites directly, never through
+// a proxy from the environment, so they take the same route.
 import http from "node:http";
 import { spawn } from "node:child_process";
 import fs from "node:fs";
@@ -258,7 +259,10 @@ async function runBenchmark() {
 	const browser = await chromium.launch({
 		headless: true,
 		executablePath: process.env.CHROMIUM_PATH || undefined,
-		args: (process.env.CHROMIUM_ARGS || "").split(" ").filter(Boolean),
+		// the relay connects to sites directly (it ignores HTTP(S)_PROXY), so direct loads do too:
+		// through a proxy from the environment they'd pay a hop the proxied loads don't (one such
+		// local proxy tripled example.com's direct load time)
+		args: ["--no-proxy-server", ...(process.env.CHROMIUM_ARGS || "").split(" ").filter(Boolean)],
 	});
 	const results: Result[] = [];
 	for (let rep = 0; rep < reps; rep++) {
