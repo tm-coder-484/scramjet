@@ -258,4 +258,50 @@ export default [
 			});
 		},
 	}),
+	serverTest({
+		name: "cookies-repeated-set-cookie-race",
+		autoPass: false,
+		js: `
+		assert(!document.cookie.includes("runway_repeat_cookie=1"), "document.cookie should be empty");
+		// both responses set the same cookie; whichever the proxy handles second sets nothing new
+		const fetched = fetch("/set-same-cookie");
+		const seen = new Promise((resolve, reject) => {
+			window.__repeatSeen = resolve;
+			const s = document.createElement("script");
+			s.src = "/set-same-cookie.js";
+			s.onerror = () => reject(new Error("script failed to load"));
+			document.head.appendChild(s);
+		});
+		const until = performance.now() + 300;
+		while (performance.now() < until) {}
+		const cookie = await seen;
+		assert(
+			cookie.includes("runway_repeat_cookie=1"),
+			"a script should see the cookie its response set, even when another response set it first: " + cookie
+		);
+		await fetched;
+		for (let i = 0; i < 3; i++) await fetch("/set-same-cookie");
+		assert(document.cookie.includes("runway_repeat_cookie=1"), "still set after it was set again");
+		pass("repeated Set-Cookie seen by the script");
+	`,
+		start: async (server) => {
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				const path = (req.url || "").split("?")[0] || "";
+				if (path === "/set-same-cookie") {
+					res.writeHead(200, {
+						"Content-Type": "text/plain",
+						"Set-Cookie": "runway_repeat_cookie=1; Path=/",
+					});
+					res.end("ok");
+				} else if (path === "/set-same-cookie.js") {
+					res.writeHead(200, {
+						"Content-Type": "text/javascript",
+						"Set-Cookie": "runway_repeat_cookie=1; Path=/",
+					});
+					res.end("window.__repeatSeen(document.cookie);");
+				}
+			});
+		},
+	}),
 ];

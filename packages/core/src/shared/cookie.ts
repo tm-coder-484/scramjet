@@ -76,9 +76,15 @@ export class CookieJar {
 		delete this.cookies[id];
 	}
 
-	setCookies(cookieString: string, url: URL) {
+	/**
+	 * Stores the cookies of a Set-Cookie value. Returns whether that changed anything a page can see
+	 * through document.cookie: a new cookie, another value or HttpOnly/Secure flag, an earlier
+	 * expiry, or a removal. Setting a cookie again as it is (with a later expiry) changes nothing
+	 */
+	setCookies(cookieString: string, url: URL): boolean {
 		this.invalidate();
 		const parsedCookies = parse(cookieString);
+		let visible = false;
 
 		for (const parsedCookie of parsedCookies) {
 			const lowerName = parsedCookie.name.toLowerCase();
@@ -113,6 +119,7 @@ export class CookieJar {
 				if (!Number.isFinite(cookie.maxAge)) {
 					delete cookie.maxAge;
 				} else if (cookie.maxAge <= 0) {
+					if (this.cookies[id]) visible = true;
 					this.removeById(id);
 					continue;
 				} else {
@@ -121,10 +128,19 @@ export class CookieJar {
 			}
 
 			const prev = this.cookies[id];
+			if (
+				!prev ||
+				prev.value !== cookie.value ||
+				!!prev.httpOnly !== !!cookie.httpOnly ||
+				!!prev.secure !== !!cookie.secure ||
+				(cookie.expires ?? Infinity) < (prev.expires ?? Infinity)
+			)
+				visible = true;
 			if (prev) this.unindexCookie(prev);
 			this.cookies[id] = cookie;
 			this.indexCookie(cookie);
 		}
+		return visible;
 	}
 
 	// SameSite enforcement context passed to getCookies.

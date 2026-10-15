@@ -353,8 +353,15 @@ export function registrableDomainForRedirect(hostname: string): string {
 	return labels.slice(-2).join(".");
 }
 
-// stores the response's cookies in the jar, then sends them to the page's clients: resolves once
-// they have them. undefined when the response sets none
+// the last cookie sync that changed what a page can see, until the page's clients have it
+let visibleSync: Promise<void> | undefined;
+
+// stores the response's cookies in the jar, then sends them to the page's clients. Returns what the
+// response must wait for before the page may see it: the sync, if it changed what a page can see
+// through document.cookie. Many sites set the same cookie again on every response (Cloudflare's
+// on ~90 of its front page's), and each sync waits for a page's main thread. A response that only
+// sets cookies again waits for nothing, or for the sync that set those values if the page doesn't
+// have it yet. undefined when there's nothing to wait for
 function handleCookies(
 	handler: ScramjetFetchHandler,
 	request: ScramjetFetchRequest,
@@ -362,11 +369,12 @@ function handleCookies(
 	rawHeaders: RawHeaders
 ): Promise<void> | undefined {
 	const cookies = [];
+	let visible = false;
 
 	for (const [key, value] of rawHeaders) {
 		if (key.toLowerCase() !== "set-cookie") continue;
 
-		handler.context.cookieJar.setCookies(value, parsed.url);
+		if (handler.context.cookieJar.setCookies(value, parsed.url)) visible = true;
 		cookies.push({
 			url: parsed.url,
 			cookie: value,
@@ -377,7 +385,23 @@ function handleCookies(
 		return;
 	}
 
-	return handler.sendSetCookie(cookies, {
+	const sync = handler.sendSetCookie(cookies, {
 		destination: parsed.destination,
 	});
+	if (!visible) {
+		// still sent, for the new expiry, but nothing waits on it
+		sync.catch((err) =>
+			console.error(
+				"scramjet: couldn't send a response's cookies to the page",
+				err
+			)
+		);
+		return visibleSync;
+	}
+	visibleSync = sync;
+	const done = () => {
+		if (visibleSync === sync) visibleSync = undefined;
+	};
+	sync.then(done, done);
+	return sync;
 }
