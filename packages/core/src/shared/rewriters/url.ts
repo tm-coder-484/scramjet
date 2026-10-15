@@ -75,6 +75,73 @@ function tryCanParseURL(url: string, origin?: string | URL): _URL | null {
 	}
 }
 
+// the strings rewriteUrl reads off the same few URL objects (meta.origin, meta.base and
+// context.prefix) for every url of a document. in a browser each getter crosses into its URL
+// implementation, so the last few objects' strings are kept. keyed by identity: those objects are
+// replaced (a <base> makes a new meta.base), never changed in place
+type UrlStrings = {
+	href: string;
+	origin: string;
+	// an http(s) url's href up to its path (its origin, with any credentials), which a
+	// path-absolute url ("/a/b") resolves against
+	httpOrigin: string | null;
+};
+const stringsOf: { url: _URL | null; strings: UrlStrings | null }[] = [
+	{ url: null, strings: null },
+	{ url: null, strings: null },
+	{ url: null, strings: null },
+	{ url: null, strings: null },
+];
+let nextStrings = 0;
+function urlStrings(url: _URL): UrlStrings {
+	for (const entry of stringsOf) if (entry.url === url) return entry.strings!;
+	const href = url.href;
+	const origin = url.origin;
+	const strings = {
+		href,
+		origin,
+		// "/" can't occur in the credentials (they percent-encode it) or the host
+		httpOrigin:
+			String_startsWith(href, "https://") || String_startsWith(href, "http://")
+				? href.slice(0, href.indexOf("/", href.indexOf("//") + 2))
+				: null,
+	};
+	const entry = stringsOf[nextStrings];
+	nextStrings = (nextStrings + 1) % stringsOf.length;
+	entry.url = url;
+	entry.strings = strings;
+	return strings;
+}
+
+const TAB_OR_NEWLINE = /[\t\n\r]/;
+
+// new _URL(url, base), or null where that throws. an absolute http(s) url, or a path-absolute one
+// ("/a/b", not "//host" or "/\\host") against an http(s) base, gives the same url parsed on its
+// own, without parsing the base again: most of a page's links are one or the other. tabs and
+// newlines are dropped anywhere in a url, so "/\t/host" is scheme-relative, and keeps the base
+function resolveUrl(
+	url: string,
+	base: string,
+	baseHttpOrigin: string | null
+): _URL | null {
+	try {
+		if (String_startsWith(url, "https://") || String_startsWith(url, "http://"))
+			return new _URL(url);
+		if (
+			baseHttpOrigin !== null &&
+			url.charCodeAt(0) === 47 &&
+			url.charCodeAt(1) !== 47 &&
+			url.charCodeAt(1) !== 92 &&
+			!TAB_OR_NEWLINE.test(url)
+		)
+			return new _URL(baseHttpOrigin + url);
+
+		return new _URL(url, base);
+	} catch {
+		return null;
+	}
+}
+
 export function rewriteBlob(
 	url: string,
 	context: ScramjetContext,
@@ -185,22 +252,26 @@ export function rewriteUrl(
 	) {
 		return url;
 	} else {
-		let base = meta.base.href;
+		const baseStrings = urlStrings(meta.base);
+		let base = baseStrings.href;
+		let baseHttpOrigin = baseStrings.httpOrigin;
 
-		if (String_startsWith(base, "about:"))
+		if (String_startsWith(base, "about:")) {
 			base = unrewriteUrl(self.location.href, context); // jank!!!!! weird jank!!!
-		const realUrl = tryCanParseURL(url, base);
+			baseHttpOrigin = null;
+		}
+		const realUrl = resolveUrl(url, base, baseHttpOrigin);
 		if (!realUrl) return url;
 
-		if (realUrl.protocol != "http:" && realUrl.protocol != "https:") {
+		// the fragment is cut from href: the first "#" in a serialized url starts it, since the
+		// path and query percent-encode theirs. cheaper than the hash setter, which reparses
+		let href = realUrl.href;
+		if (!String_startsWith(href, "http:") && !String_startsWith(href, "https:")) {
 			// custom protocol. best thing to do is pass it through so it can open an app etc
 			// there's also extension:// pages we might need to worry about later
 			return url;
 		}
 
-		// the fragment is cut from href: the first "#" in a serialized url starts it, since the
-		// path and query percent-encode theirs. cheaper than the hash setter, which reparses
-		let href = realUrl.href;
 		let fragment = "";
 		const hashIndex = href.indexOf("#");
 		if (hashIndex !== -1) {
@@ -211,7 +282,7 @@ export function rewriteUrl(
 		const realHash = encodedHash ? "#" + encodedHash : "";
 
 		return (
-			context.prefix.href +
+			urlStrings(context.prefix).href +
 			context.interface.codecEncode(href) +
 			rewriteQuery(context, meta, options) +
 			realHash
@@ -248,8 +319,9 @@ function rewriteQuery(
 		!options?.isModule && (options?.referrerPolicy ?? meta.referrerPolicy);
 	// specific tracking for sec-fetch-site
 	// don't send for the top level controller calling it in go()
-	const origin = meta.origin.origin;
-	const initiatorOrigin = origin !== context.prefix.origin ? origin : "";
+	const origin = urlStrings(meta.origin).origin;
+	const initiatorOrigin =
+		origin !== urlStrings(context.prefix).origin ? origin : "";
 
 	const plain = !options;
 	const key = plain ? (referrerPolicy || "") + "\n" + initiatorOrigin : undefined;

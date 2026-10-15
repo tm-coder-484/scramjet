@@ -634,14 +634,24 @@ function concatBytes(chunks: Uint8Array[], length: number): Uint8Array {
 const SLICE_MS = 4;
 const _MessageChannel = globalThis.MessageChannel;
 
+// one channel for every yield on this thread: a new channel per yield cost ~0.5ms in a worker
+let yieldPorts: MessageChannel | undefined;
+const yieldWaiters: (() => void)[] = [];
+
 function yieldToTasks(): Promise<void> {
-	return new Promise((resolve) => {
-		const { port1, port2 } = new _MessageChannel();
-		port1.onmessage = () => {
-			port1.close();
-			resolve();
+	if (!yieldPorts) {
+		yieldPorts = new _MessageChannel();
+		// each message ends one yield, in order
+		yieldPorts.port1.onmessage = () => {
+			yieldWaiters.shift()?.();
+			// in node, a port with a listener keeps the process alive: only while a yield waits
+			if (!yieldWaiters.length) (yieldPorts!.port1 as any).unref?.();
 		};
-		port2.postMessage(null);
+	}
+	if (!yieldWaiters.length) (yieldPorts.port1 as any).ref?.();
+	return new Promise((resolve) => {
+		yieldWaiters.push(resolve);
+		yieldPorts!.port2.postMessage(null);
 	});
 }
 
@@ -652,6 +662,60 @@ function yieldToTasks(): Promise<void> {
 export function canStreamHtml(context: ScramjetContext): boolean {
 	const hooks = context.hooks?.rewriter.html;
 	return !hooks || (!Tap.hasTaps(hooks.pre) && !Tap.hasTaps(hooks.post));
+}
+
+/**
+ * Rewrites a document somewhere else (one of the controller's rewriter threads), so the thread
+ * handling requests keeps answering the ones for the document's stylesheets and scripts while it
+ * streams. Takes what rewriteHtmlStream takes, and the srcs of the scripts to inject, which this
+ * thread makes (they carry its cookie jar). Returns null, without touching the body, to have the
+ * document rewritten here instead.
+ */
+export type HtmlRewriteOffload = (
+	body: ReadableStream<Uint8Array>,
+	contentType: string | null,
+	context: ScramjetContext,
+	meta: URLMeta,
+	htmlcontext: HtmlContext,
+	injectScripts: string[]
+) => ReadableStream<Uint8Array> | null;
+
+let htmlRewriteOffload: HtmlRewriteOffload | null = null;
+
+/** routes streamed document rewrites (rewriteHtmlStreamOffloaded) through `offload` */
+export function setHtmlRewriteOffload(offload: HtmlRewriteOffload | null) {
+	htmlRewriteOffload = offload;
+}
+
+/** rewriteHtmlStream, on the offload when there is one that takes the document */
+export function rewriteHtmlStreamOffloaded(
+	body: ReadableStream<Uint8Array>,
+	contentType: string | null,
+	context: ScramjetContext,
+	meta: URLMeta,
+	htmlcontext: HtmlContext
+): ReadableStream<Uint8Array> {
+	if (htmlRewriteOffload) {
+		const injectScripts = htmlcontext.loadScripts
+			? (context.interface.getInjectScripts(
+					meta,
+					null,
+					htmlcontext,
+					(src) => src as any
+				) as unknown as string[])
+			: [];
+		const out = htmlRewriteOffload(
+			body,
+			contentType,
+			context,
+			meta,
+			htmlcontext,
+			injectScripts
+		);
+		if (out) return out;
+	}
+
+	return rewriteHtmlStream(body, contentType, context, meta, htmlcontext);
 }
 
 /**

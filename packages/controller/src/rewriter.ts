@@ -1,14 +1,18 @@
-// controller.rewriter.js: one of the controller worker's rewriter threads. Big scripts are
-// rewritten here (see rewriterPool in worker.ts), so the controller worker keeps answering other
-// requests meanwhile, and several bundles can be rewritten at once
+// controller.rewriter.js: one of the controller worker's rewriter threads. Big scripts and
+// documents are rewritten here (see startRewriterPool in worker.ts), so the controller worker
+// keeps answering other requests meanwhile, and several can be rewritten at once
 import "./worker-bootstrap";
 import { RelayRewriteCache } from "./remotecache";
+import { receiveBody, sendBodyTo } from "./bodystream";
+import { REWRITER_WARMUP_MS } from "./warmup";
 import {
 	openRewriteCache,
+	rewriteHtmlStream,
 	rewriteJsInner,
 	rewriteJsWithCache,
 	setRemoteRewriteCache,
 	setWasm,
+	warmUpRewriter,
 	type ScramjetConfig,
 	type ScramjetContext,
 } from "@mercuryworkshop/scramjet";
@@ -34,6 +38,25 @@ export type RewriteRequest = {
 	useCache: boolean;
 };
 
+/** a streamed document: rewriteHtmlStream's arguments, and where its output goes */
+export type HtmlRewriteRequest = {
+	// the body comes in on one port (from sendBody) and the rewritten document goes out on the other
+	body: MessagePort;
+	out: MessagePort;
+	contentType: string | null;
+	prefix: string;
+	origin: string;
+	base: string;
+	topFrameName?: string;
+	parentFrameName?: string;
+	referrerPolicy?: string;
+	loadScripts: boolean;
+	inline: boolean;
+	source: string;
+	// made by the controller, which has the cookie jar
+	injectScripts: string[];
+};
+
 // eslint-disable-next-line @typescript-eslint/no-implied-eval
 const revive = (source: string) => new Function(`return (${source})`)();
 
@@ -45,11 +68,7 @@ let codecDecode: (url: string) => string;
 // just rewrites it, for the scripts too small to cache): all of it here, off the controller's thread
 async function runJob(job: RewriteRequest) {
 	try {
-		const context = {
-			config: config!,
-			prefix: new URL(job.prefix),
-			interface: { codecEncode, codecDecode },
-		} as unknown as ScramjetContext;
+		const context = contextFor(job.prefix, []);
 		const meta = {
 			origin: new URL(job.origin),
 			base: new URL(job.base),
@@ -62,6 +81,65 @@ async function runJob(job: RewriteRequest) {
 		self.postMessage({ id: job.id, res });
 	} catch (err: any) {
 		self.postMessage({ id: job.id, error: String(err?.message ?? err) });
+	}
+}
+
+function contextFor(prefix: string, injectScripts: string[]): ScramjetContext {
+	return {
+		config: config!,
+		prefix: new URL(prefix),
+		interface: {
+			codecEncode,
+			codecDecode,
+			getInjectScripts: (_meta, _handler, _htmlcontext, script) =>
+				injectScripts.map(script),
+		},
+	} as unknown as ScramjetContext;
+}
+
+function runHtmlJob(job: HtmlRewriteRequest) {
+	const meta = {
+		origin: new URL(job.origin),
+		base: new URL(job.base),
+		topFrameName: job.topFrameName,
+		parentFrameName: job.parentFrameName,
+		referrerPolicy: job.referrerPolicy,
+	};
+	const body = receiveBody(job.body);
+	let out: ReadableStream<Uint8Array>;
+	try {
+		out = rewriteHtmlStream(
+			body,
+			job.contentType,
+			contextFor(job.prefix, job.injectScripts),
+			meta,
+			{ loadScripts: job.loadScripts, inline: job.inline, source: job.source }
+		);
+	} catch (err) {
+		body.cancel(err).catch(() => {});
+		out = new ReadableStream({ start: (c) => c.error(err) });
+	}
+	// a document the page cancels cancels its rewrite, and its body, through the ports
+	void sendBodyTo(out, job.out).finally(() =>
+		self.postMessage({ docDone: true })
+	);
+}
+
+// the warm-up frame's document reaches one of these threads at most. while the page waits for
+// the optimized code to land, each runs the rewriters over that page (`html`) twice, as the
+// controller's thread does (see warmUpRewriters)
+async function warmUp(html: string) {
+	const context = contextFor(
+		new URL("/scramjet/warmup/", location.href).href,
+		["/scramjet.js", "/inject.js"]
+	);
+	const end = performance.now() + REWRITER_WARMUP_MS;
+	try {
+		for (let i = 0; i < 2 && performance.now() < end; i++)
+			// eslint-disable-next-line no-await-in-loop
+			await warmUpRewriter(context, 1, html);
+	} catch {
+		// only a missed speedup
 	}
 }
 
@@ -85,5 +163,9 @@ self.addEventListener("message", (e: MessageEvent) => {
 		config = data.$rewriter$config;
 	} else if (data.$rewriter$job) {
 		void runJob(data.$rewriter$job);
+	} else if (data.$rewriter$html) {
+		runHtmlJob(data.$rewriter$html);
+	} else if (data.$rewriter$warmup) {
+		void warmUp(data.$rewriter$warmup.html);
 	}
 });

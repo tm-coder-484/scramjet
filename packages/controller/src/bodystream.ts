@@ -18,6 +18,18 @@ type BodyMessage =
 /** Pumps `stream` into a new port and returns the other end, to transfer to the receiver. */
 export function sendBody(stream: ReadableStream<Uint8Array>): MessagePort {
 	const { port1, port2 } = new MessageChannel();
+	void sendBodyTo(stream, port1);
+	return port2;
+}
+
+/**
+ * Pumps `stream` into `port1`, whose other end goes to receiveBody. Resolves once the body has
+ * been sent, cancelled by the receiver, or failed.
+ */
+export function sendBodyTo(
+	stream: ReadableStream<Uint8Array>,
+	port1: MessagePort
+): Promise<void> {
 	const reader = stream.getReader();
 	let inflight = 0;
 	let resume: (() => void) | null = null;
@@ -39,7 +51,7 @@ export function sendBody(stream: ReadableStream<Uint8Array>): MessagePort {
 		}
 	};
 
-	(async () => {
+	return (async () => {
 		try {
 			for (;;) {
 				if (inflight >= WINDOW)
@@ -65,8 +77,6 @@ export function sendBody(stream: ReadableStream<Uint8Array>): MessagePort {
 				port1.postMessage({ error: String(err) } satisfies BodyMessage);
 		}
 	})();
-
-	return port2;
 }
 
 /** The body arriving on `port` (from sendBody), as a stream. */
@@ -113,4 +123,46 @@ export function receiveBody(port: MessagePort): ReadableStream<Uint8Array> {
 		},
 		{ highWaterMark: WINDOW, size: (chunk) => chunk.byteLength }
 	);
+}
+
+// the ports of receiveForwardable's streams that nobody has read yet
+const unread = new WeakMap<ReadableStream<Uint8Array>, MessagePort>();
+
+/**
+ * receiveBody, for a body that may only be passing through this thread: until the stream is
+ * read, takePort hands out the port itself, to send on to the body's real receiver.
+ */
+export function receiveForwardable(port: MessagePort): ReadableStream<Uint8Array> {
+	let reader: ReadableStreamDefaultReader<Uint8Array> | null = null;
+	const stream = new ReadableStream<Uint8Array>(
+		{
+			async pull(controller) {
+				if (!reader) {
+					unread.delete(stream);
+					reader = receiveBody(port).getReader();
+				}
+				const { done, value } = await reader.read();
+				if (done) controller.close();
+				else controller.enqueue(value);
+			},
+			cancel(reason) {
+				unread.delete(stream);
+				if (reader) return reader.cancel(reason);
+				port.postMessage({ cancel: true } satisfies BodyMessage);
+				port.close();
+			},
+		},
+		// nothing is read from the port before someone reads the stream
+		{ highWaterMark: 0 }
+	);
+	unread.set(stream, port);
+	return stream;
+}
+
+/** the port behind a receiveForwardable stream that hasn't been read; the stream is then spent */
+export function takePort(stream: ReadableStream<Uint8Array>): MessagePort | undefined {
+	if (stream.locked) return undefined;
+	const port = unread.get(stream);
+	unread.delete(stream);
+	return port;
 }

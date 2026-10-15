@@ -6,6 +6,11 @@ export * from "./worker";
 export * from "./wasm";
 export * from "./warmup";
 export {
+	rewriteHtmlStream,
+	setHtmlRewriteOffload,
+	type HtmlRewriteOffload,
+} from "./htmlStream";
+export {
 	getRemoteRewriteCache,
 	materialize,
 	openDb as openRewriteCache,

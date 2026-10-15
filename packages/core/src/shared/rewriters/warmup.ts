@@ -87,19 +87,20 @@ async function drain(stream: ReadableStream<Uint8Array>) {
 }
 
 /**
- * Runs the document rewriters on a made-up page, `rounds` times, so the code they run is compiled
- * before the first real document. Returns the time it took, in ms.
+ * Runs the document rewriters on a made-up page (or `html`), `rounds` times, so the code they run
+ * is compiled before the first real document. Returns the time it took, in ms.
  */
 export async function warmUpRewriter(
 	context: ScramjetContext,
-	rounds = 3
+	rounds = 3,
+	html?: string
 ): Promise<number> {
 	const started = Performance_now();
 	const meta: URLMeta = {
 		origin: new URL("https://warmup.example.test/dir/page.html"),
 		base: new URL("https://warmup.example.test/dir/page.html"),
 	};
-	const bytes = TextEncoder_encode(warmupDocument());
+	const bytes = TextEncoder_encode(html ?? warmupDocument());
 	for (let round = 0; round < rounds; round++) {
 		const body = new ReadableStream<Uint8Array>({
 			start(controller) {

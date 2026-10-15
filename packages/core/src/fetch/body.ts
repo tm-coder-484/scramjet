@@ -18,7 +18,7 @@ import { sniffEncoding } from "@/shared/sniffEncoding";
 import { _TextDecoder } from "@/shared/snapshot";
 import {
 	canStreamHtml,
-	rewriteHtmlStream,
+	rewriteHtmlStreamOffloaded,
 } from "@/shared/rewriters/htmlStream";
 
 export async function rewriteBody(
@@ -33,7 +33,7 @@ export async function rewriteBody(
 			if (isHtmlMimeType(response.headers.get("content-type") ?? "")) {
 				// stream the document unless a plugin needs the whole tree (see canStreamHtml)
 				if (response.body && canStreamHtml(handler.context)) {
-					return rewriteHtmlStream(
+					return rewriteHtmlStreamOffloaded(
 						response.body,
 						response.headers.get("content-type"),
 						handler.context,

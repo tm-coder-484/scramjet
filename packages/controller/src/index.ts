@@ -40,11 +40,12 @@ import type {
 	BodyType,
 } from "./types";
 import { assertRuntimeScramjetVersion } from "./version";
-import { sendBody } from "./bodystream";
+import { sendBody, takePort } from "./bodystream";
 import {
 	WARMUP_ORIGIN,
 	WARMUP_SETTLE,
 	WARMUP_TIMEOUT,
+	warmUpRewriters,
 	installWarmupResponder,
 } from "./warmup";
 
@@ -391,7 +392,9 @@ export class Controller {
 					data.acceptsBodyPort &&
 					fetchresponse.body instanceof ReadableStream
 				) {
-					const bodyPort = sendBody(fetchresponse.body);
+					// a document rewritten on a rewriter thread comes from there directly
+					const bodyPort =
+						takePort(fetchresponse.body) ?? sendBody(fetchresponse.body);
 					return [
 						{
 							body: null as unknown as BodyType,
@@ -885,7 +888,11 @@ export class Controller {
 				setTimeout(resolve, WARMUP_TIMEOUT);
 				document.body.appendChild(element);
 			});
-			await new Promise((resolve) => setTimeout(resolve, WARMUP_SETTLE));
+			const settled = new Promise((resolve) => setTimeout(resolve, WARMUP_SETTLE));
+			// meanwhile, the thread that rewrites documents runs them some more
+			if (this.worker) this.worker.postMessage({ $worker$warmup: true });
+			else await warmUpRewriters(this);
+			await settled;
 		} catch {
 			// only a missed speedup
 		} finally {

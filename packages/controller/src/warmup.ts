@@ -4,8 +4,12 @@
 // loaded after any other site. So before a controller says it's ready, it loads a made-up site in
 // a hidden frame, through the whole pipeline (service worker, controller, rewriters, client), with
 // every response made up here: the warm-up never touches the network.
-import { Plugin } from "@mercuryworkshop/scramjet";
-import type { Frame } from "./index";
+import {
+	Plugin,
+	warmUpRewriter,
+	type ScramjetContext,
+} from "@mercuryworkshop/scramjet";
+import type { Controller, Frame } from "./index";
 
 /** The made-up site's origin. ".invalid" never resolves, so nothing real can live here. */
 export const WARMUP_ORIGIN = "https://warmup.scramjet.invalid";
@@ -16,6 +20,11 @@ export const WARMUP_TIMEOUT = 4000;
 // warm-up then waits this long: a page loaded right after the frame's load event got little of
 // the speedup (Wikipedia 1.42x direct, against 1.16x after 300ms and 1.08x after 700ms)
 export const WARMUP_SETTLE = 500;
+// the frame leaves the document rewriters only part-way optimized: a first Wikipedia article after
+// it still streamed out ~240ms after its last byte came in, against ~25ms by the third. so while
+// the page waits out the settle time, every thread that rewrites documents runs them some more
+// (see warmUpRewriters), for at most this long
+export const REWRITER_WARMUP_MS = 300;
 
 const words =
 	"lorem ipsum dolor sit amet consectetur adipiscing elit sed do eiusmod tempor incididunt ut labore et dolore magna aliqua".split(
@@ -29,7 +38,7 @@ const text = (i: number, n: number) => {
 
 // ~200 KB of the markup real pages are made of: every attribute the rewriter handles, entities,
 // inline handlers and styles, scripts and styles of each kind, an iframe, svg and forms
-function html(): string {
+export function html(): string {
 	let main = "";
 	for (let i = 0; i < 260; i++) {
 		main += `<article class="card c${i % 7}" id="a${i}" data-index="${i}" style="--w:${i % 9}px">
@@ -177,4 +186,41 @@ export function installWarmupResponder(frame: Frame) {
 				: new Response(null, { status: 404 })
 		) as any;
 	});
+}
+
+/**
+ * Runs the document rewriters (HTML, CSS, small scripts) on this thread, so they're optimized
+ * before the first real document: over the warm-up frame's page twice (it has a real page's
+ * variety of markup: two rounds of it did better than twelve of core's small page), or, with
+ * `small`, over core's small page, for at most `budget` ms either way.
+ */
+export async function warmUpRewriters(
+	controller: Controller,
+	{ budget = REWRITER_WARMUP_MS, small = false } = {}
+) {
+	const prefix = new URL(controller.prefix + "warmup/", location.href);
+	const { encode, decode } = controller.config.codec;
+	const context = {
+		config: controller.scramjetConfig,
+		prefix,
+		cookieJar: controller.cookieJar,
+		interface: {
+			getInjectScripts: (_meta, _handler, _htmlcontext, script) => [
+				script(controller.config.scramjetPath),
+				script(controller.config.injectPath),
+			],
+			getWorkerInjectScripts: () => "",
+			codecEncode: encode,
+			codecDecode: decode,
+		},
+	} as ScramjetContext;
+	const page = small ? undefined : html();
+	const end = performance.now() + budget;
+	try {
+		for (let i = 0; i < (small ? 12 : 2) && performance.now() < end; i++)
+			// eslint-disable-next-line no-await-in-loop
+			await warmUpRewriter(context, 1, page);
+	} catch {
+		// only a missed speedup
+	}
 }
