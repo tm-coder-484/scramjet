@@ -91,7 +91,8 @@ function startRewriterPool(controller: Controller) {
 			if (!job) return;
 			pending.delete(e.data.id);
 			job.slot.busy--;
-			if (e.data.error !== undefined) job.reject(new Error(e.data.error));
+			if (e.data.error !== undefined)
+				job.reject(Object.assign(new Error(e.data.error), { input: e.data.input }));
 			else job.resolve(e.data.res);
 		});
 		slots.push(slot);
@@ -106,6 +107,13 @@ function startRewriterPool(controller: Controller) {
 		const slot = leastBusy();
 		slot.busy++;
 		const id = nextId++;
+		// the script moves to the thread: the rejection of a failed rewrite brings it back
+		const transfer =
+			js.byteOffset === 0 &&
+			js.byteLength === js.buffer.byteLength &&
+			js.buffer instanceof ArrayBuffer
+				? [js.buffer]
+				: [];
 		return new Promise<RewriterResult>((resolve, reject) => {
 			pending.set(id, { resolve, reject, slot });
 			slot.worker.postMessage({
@@ -120,7 +128,7 @@ function startRewriterPool(controller: Controller) {
 					isModule,
 					useCache,
 				},
-			});
+			}, transfer);
 		});
 	});
 

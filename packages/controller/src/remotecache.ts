@@ -1,7 +1,7 @@
 // The relay's shared rewrite cache (devrelay.ts), as the core's RemoteRewriteCache: a rewriter
 // pool thread asks it for an entry before rewriting a script, and hands it the scripts it had to
 // rewrite, which the relay rewrites itself and keeps for the next browser.
-//   -> {t:"rwget", id, key}                     <- {t:"rwhit", id, tag, offsets, jsLength} + binary [u32 id][js][map]
+//   -> {t:"rwget", id, key, url?}               <- {t:"rwhit", id, tag, offsets, jsLength} + binary [u32 id][js][map]
 //                                               <- {t:"rwmiss", id}
 //   -> {t:"rwput", id, key, header, body:true} + binary [u32 id][script]
 import type { CachedRewrite, RemoteRewriteCache } from "@mercuryworkshop/scramjet";
@@ -80,7 +80,7 @@ export class RelayRewriteCache implements RemoteRewriteCache {
 		else this.queue.push(m);
 	}
 
-	get(key: string): Promise<CachedRewrite | undefined> {
+	get(key: string, url?: string): Promise<CachedRewrite | undefined> {
 		const id = this.nextId++;
 		return new Promise((resolve) => {
 			const timer = setTimeout(() => {
@@ -93,7 +93,7 @@ export class RelayRewriteCache implements RemoteRewriteCache {
 					resolve(entry);
 				},
 			});
-			this.send(JSON.stringify({ t: "rwget", id, key }));
+			this.send(JSON.stringify({ t: "rwget", id, key, url }));
 		});
 	}
 

@@ -14,13 +14,14 @@
 //                     binary [u32 id][chunk]...
 //                     text   {t:"end", id}
 //   the shared rewrite cache (RelayTransport's rewriteCache, used by the controller's rewriter threads):
-//   client -> server  text   {t:"rwget", id, key}
+//   client -> server  text   {t:"rwget", id, key, url?}   (url for big scripts: see speculate)
 //                     text   {t:"rwput", id, key, header, body:true} + binary [u32 id][script]
 //   server -> client  text   {t:"rwhit", id, tag, offsets, jsLength} + binary [u32 id][js][map] | {t:"rwmiss", id}
 // Websockets get their own socket: ws://<host>/relay/ws?url=&protocols=&headers=
 import http from "node:http";
 import dns from "node:dns";
 import fs from "node:fs";
+import crypto from "node:crypto";
 import os from "node:os";
 import { Worker } from "node:worker_threads";
 import { Agent, fetch as undiciFetch, type Dispatcher } from "undici";
@@ -284,6 +285,8 @@ class RelaySession {
 			const body = Buffer.from(await r.arrayBuffer());
 			if (/text\/css/.test(r.headers.get("content-type") || ""))
 				this.prefetchFromCss(url, body.toString("utf8"), headers);
+			if (r.status === 200 && isScript(headers["sec-fetch-dest"] || "", r.headers.get("content-type") || ""))
+				speculate(url, body, headers.referer || "");
 			const res = { status: r.status, statusText: r.statusText, headers: raw, body };
 			if (this.useCache) cacheStore(url, "GET", rawRequest, res);
 			return res;
@@ -481,11 +484,116 @@ function rewriteCachePut(key: string, entry: RewriteEntry) {
 	}
 }
 
+// ---- speculative rewrites ----
+// YouTube serves its 10 MB app bundle in a slightly different build on every visit (a few feature
+// toggles and experiment names differ, and so does its url), so the rewrite cache never hits, and
+// every visit waits ~1s for the rewrite. But the relay has the bundle first: it usually prefetches
+// it from the page's HTML, well before the browser asks for it. So when a big script comes through
+// that starts or ends like one the relay rewrote for a client recently (its twin), it rewrites it
+// right away, the way that client would have it rewritten: the twin's header (build, settings,
+// cache partition), with the new url. A client that asks for the script (rwget with its url)
+// waits for that rewrite, and gets it if its key is the client's: same header, same bytes. Only
+// within a partition: the twin is from the script's origin and, if it ran for another site's page
+// (its initiator), the script came for a page of that site.
+const SPECULATE_MIN_BYTES = 1024 * 1024;
+// how much of a script's start and end identifies its twins
+const TWIN_EDGE = 64 * 1024;
+const TWINS = 8;
+const SPECULATION_KEEP_MS = 60_000;
+
+type Twin = {
+	url: string;
+	header: string;
+	// its cache partition: the script's origin, and the page's if that's another site's
+	origin: string;
+	initiator: string;
+	length: number;
+	edges: string[];
+};
+// the last few big scripts rewritten, newest last
+const twins: Twin[] = [];
+// rewrites started ahead of any client, by script url: their key and entry, or null if they failed
+const speculated = new Map<string, Promise<{ key: string; entry: RewriteEntry } | null>>();
+
+function edgeHashes(b: Uint8Array): string[] {
+	const h = (part: Uint8Array) => crypto.createHash("sha1").update(part).digest("hex");
+	return [
+		"start:" + h(b.subarray(0, TWIN_EDGE)),
+		"end:" + h(b.subarray(Math.max(0, b.byteLength - TWIN_EDGE))),
+	];
+}
+
+function addTwin(header: string, length: number, edges: string[]) {
+	let h: any;
+	try {
+		h = JSON.parse(header);
+	} catch {
+		return;
+	}
+	// a twin's header is reused with another url only where the script's url is all it holds
+	if (typeof h.source !== "string" || h.base !== h.source || typeof h.origin !== "string") return;
+	const url: string = h.source;
+	const i = twins.findIndex((t) => t.url === url);
+	if (i !== -1) twins.splice(i, 1);
+	twins.push({ url, header, origin: h.origin, initiator: h.initiator || "", length, edges });
+	if (twins.length > TWINS) twins.shift();
+}
+
+const isScript = (dest: string, contentType: string) =>
+	dest === "script" || /javascript|ecmascript/i.test(contentType);
+
+// starts the rewrite of a big script the relay is serving, if it has a twin (see above).
+// `referer`: the page the script was fetched for
+function speculate(url: string, body: Buffer, referer: string) {
+	if (
+		body.byteLength < SPECULATE_MIN_BYTES ||
+		body.byteLength > MAX_REWRITE_INPUT ||
+		speculated.has(url) ||
+		!twins.length
+	)
+		return;
+	const edges = edgeHashes(body);
+	let origin = "", page = "";
+	try {
+		origin = new URL(url).origin;
+		page = referer ? new URL(referer).origin : "";
+	} catch {
+		return;
+	}
+	let twin: Twin | undefined;
+	for (let i = twins.length - 1; i >= 0 && !twin; i--) {
+		const t = twins[i];
+		if (
+			t.url !== url &&
+			t.origin === origin &&
+			(!t.initiator || t.initiator === page) &&
+			Math.abs(t.length - body.byteLength) <= body.byteLength / 50 &&
+			t.edges.some((e) => edges.includes(e))
+		)
+			twin = t;
+	}
+	const pool = getRewritePool();
+	if (!twin || !pool) return;
+	const h = JSON.parse(twin.header);
+	h.base = h.source = url;
+	const header = JSON.stringify(h);
+	const js = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
+	if (LOG) console.log(`[relay] speculative rewrite of ${url.slice(0, 100)} (twin of ${twin.url.slice(0, 60)})`);
+	speculated.set(
+		url,
+		new Promise((resolve) =>
+			pool.submit({ header, js, hint: "speculative " + url, first: true, done: resolve })
+		)
+	);
+	setTimeout(() => speculated.delete(url), SPECULATION_KEEP_MS).unref();
+}
+
 // runs in each rewriter thread: scramjet's bundle, reloaded when the build changes
 const REWRITE_WORKER = String.raw`
 const { parentPort, workerData } = require("node:worker_threads");
 const fs = require("node:fs");
 const vm = require("node:vm");
+const crypto = require("node:crypto");
 const jsPath = workerData.dist + "scramjet.js";
 const wasmPath = workerData.dist + "scramjet.wasm";
 let stamp = "";
@@ -528,14 +636,27 @@ parentPort.on("message", async ({ id, header, js }) => {
 		const res = sj.rewriteJsInner(input, h.source, context, meta, !!h.isModule);
 		if (res.errors.length) return parentPort.postMessage({ id, reloaded });
 		const entry = sj.templateRewrite({ js: res.js, map: res.map, tag: res.tag }, input, new TextEncoder().encode(prefix));
-		parentPort.postMessage({ id, reloaded, key, entry });
+		// a big script's start and end, to know its twins by (see speculate)
+		let edges;
+		if (entry && input.byteLength >= ${SPECULATE_MIN_BYTES}) {
+			const hash = (part) => crypto.createHash("sha1").update(part).digest("hex");
+			edges = ["start:" + hash(input.subarray(0, ${TWIN_EDGE})), "end:" + hash(input.subarray(Math.max(0, input.byteLength - ${TWIN_EDGE})))];
+		}
+		parentPort.postMessage({ id, reloaded, key, entry, edges, length: input.byteLength });
 	} catch (e) {
 		parentPort.postMessage({ id, reloaded, error: String((e && e.message) || e) });
 	}
 });
 `;
 
-type RewriteJob = { header: string; js: ArrayBuffer; hint: string };
+type RewriteJob = {
+	header: string;
+	js: ArrayBuffer;
+	hint: string;
+	// ahead of the queue: a client may wait for it
+	first?: boolean;
+	done?: (result: { key: string; entry: RewriteEntry } | null) => void;
+};
 
 class RewritePool {
 	private idle: Worker[] = [];
@@ -556,6 +677,7 @@ class RewritePool {
 				console.warn("[relay] rewrite worker failed:", e);
 				const job = this.running.get(worker);
 				if (job) this.hints.delete(job.hint);
+				job?.done?.(null);
 				this.running.delete(worker);
 			});
 			this.idle.push(worker);
@@ -563,9 +685,11 @@ class RewritePool {
 	}
 
 	submit(job: RewriteJob) {
-		if (this.hints.has(job.hint) || this.queue.length >= 32) return;
+		if (this.hints.has(job.hint) || (!job.first && this.queue.length >= 32))
+			return job.done?.(null);
 		this.hints.add(job.hint);
-		this.queue.push(job);
+		if (job.first) this.queue.unshift(job);
+		else this.queue.push(job);
 		this.pump();
 	}
 
@@ -586,15 +710,21 @@ class RewritePool {
 		if (m.reloaded) {
 			rewriteCache.clear();
 			rewriteCacheBytes = 0;
+			twins.length = 0;
 		}
 		if (m.key && m.entry) {
 			rewriteCachePut(m.key, m.entry);
+			if (job && m.edges) addTwin(job.header, m.length, m.edges);
+			job?.done?.({ key: m.key, entry: m.entry });
 			if (LOG)
 				console.log(
-					`[relay] rewrite cache stored ${m.key.slice(0, 12)} (${Math.round(m.entry.js.byteLength / 1024)}KB${m.key === job?.hint ? "" : ", client key differs"})`
+					`[relay] rewrite cache stored ${m.key.slice(0, 12)} (${Math.round(m.entry.js.byteLength / 1024)}KB${job?.first ? ", speculative" : m.key === job?.hint ? "" : ", client key differs"})`
 				);
-		} else if (LOG)
-			console.log(`[relay] rewrite not kept: ${m.error ?? "parse errors or prefix in the script"}`);
+		} else {
+			job?.done?.(null);
+			if (LOG)
+				console.log(`[relay] rewrite not kept: ${m.error ?? "parse errors or prefix in the script"}`);
+		}
 		this.idle.push(worker);
 		this.pump();
 	}
@@ -649,12 +779,22 @@ function handleMuxSocket(ws: WebSocket) {
 		if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 	};
 
+	const sendRewrite = (id: number, entry: RewriteEntry) => {
+		sendJson({ t: "rwhit", id, tag: entry.tag, offsets: entry.offsets, jsLength: entry.js.byteLength });
+		const frame = Buffer.allocUnsafe(4 + entry.js.byteLength + (entry.map?.byteLength ?? 0));
+		frame.writeUInt32LE(id, 0);
+		frame.set(entry.js, 4);
+		if (entry.map) frame.set(entry.map, 4 + entry.js.byteLength);
+		if (ws.readyState === WebSocket.OPEN) ws.send(frame);
+	};
+
 	async function run(msg: any, body?: Buffer) {
 		const started = performance.now();
 		const ac = new AbortController();
 		live.set(msg.id, ac);
 		try {
 			const headers: RawHeaders = msg.headers;
+			const dest = header(headers, "sec-fetch-dest").toLowerCase();
 			if (msg.cache) {
 				session.useCache = true;
 				const hit = cacheLookup(msg.url, msg.method, headers);
@@ -663,6 +803,8 @@ function handleMuxSocket(ws: WebSocket) {
 					sendJson({ t: "head", id: msg.id, status: r.status, statusText: r.statusText, headers: r.headers });
 					if (r.body.byteLength) sendChunk(msg.id, r.body);
 					sendJson({ t: "end", id: msg.id });
+					if (r.status === 200 && isScript(dest, header(r.headers, "content-type")))
+						speculate(msg.url, r.body, header(headers, "referer"));
 					return;
 				}
 			}
@@ -700,7 +842,6 @@ function handleMuxSocket(ws: WebSocket) {
 			sendJson({ t: "head", id: msg.id, status: r.status, statusText: r.statusText, headers: raw });
 			const headAt = performance.now();
 
-			const dest = header(headers, "sec-fetch-dest").toLowerCase();
 			const scanner =
 				msg.prefetch &&
 				(dest === "document" || dest === "iframe") &&
@@ -713,14 +854,22 @@ function handleMuxSocket(ws: WebSocket) {
 				msg.cache &&
 				freshnessLifetime(r.status, raw, Date.now()) > 0 &&
 				msg.method === "GET";
+			// a big script's body is kept too, to rewrite ahead of the client (see speculate)
+			const script =
+				r.status === 200 &&
+				twins.length > 0 &&
+				isScript(dest, r.headers.get("content-type") || "") &&
+				(r.headers.has("content-encoding") ||
+					Number(r.headers.get("content-length") ?? SPECULATE_MIN_BYTES) >= SPECULATE_MIN_BYTES);
 			const chunks: Uint8Array[] = [];
 			if (r.body) {
 				for await (const chunk of r.body) {
 					sendChunk(msg.id, chunk);
-					if (keep) chunks.push(chunk);
+					if (keep || script) chunks.push(chunk);
 					if (scanner) scanner.write(decoder!.decode(chunk, { stream: true }));
 				}
 			}
+			const whole = keep || script ? Buffer.concat(chunks) : null;
 			scanner?.end();
 			if (LOG)
 				console.log(
@@ -731,9 +880,10 @@ function handleMuxSocket(ws: WebSocket) {
 					status: r.status,
 					statusText: r.statusText,
 					headers: raw,
-					body: Buffer.concat(chunks),
+					body: whole!,
 				});
 			sendJson({ t: "end", id: msg.id });
+			if (script) speculate(msg.url, whole!, header(headers, "referer"));
 		} catch (e: any) {
 			sendJson({ t: "err", id: msg.id, error: String(e?.cause ?? e) });
 		} finally {
@@ -760,24 +910,25 @@ function handleMuxSocket(ws: WebSocket) {
 			if (msg.body) waitingForBody.set(msg.id, msg);
 			else run(msg);
 		} else if (msg.t === "rwget") {
-			const entry = typeof msg.key === "string" ? rewriteCacheGet(msg.key) : undefined;
+			if (typeof msg.key !== "string") return sendJson({ t: "rwmiss", id: msg.id });
+			const entry = rewriteCacheGet(msg.key);
+			const pending = !entry && typeof msg.url === "string" ? speculated.get(msg.url) : undefined;
 			if (LOG)
 				console.log(
-					`[relay] rewrite cache ${entry ? `hit (${Math.round(entry.js.byteLength / 1024)}KB)` : "miss"} ${String(msg.key).slice(0, 12)}`
+					`[relay] rewrite cache ${entry ? `hit (${Math.round(entry.js.byteLength / 1024)}KB)` : pending ? "miss, waiting for its speculative rewrite" : "miss"} ${msg.key.slice(0, 12)}`
 				);
-			if (!entry) return sendJson({ t: "rwmiss", id: msg.id });
-			sendJson({
-				t: "rwhit",
-				id: msg.id,
-				tag: entry.tag,
-				offsets: entry.offsets,
-				jsLength: entry.js.byteLength,
+			if (entry) return sendRewrite(msg.id, entry);
+			if (!pending) return sendJson({ t: "rwmiss", id: msg.id });
+			const started = performance.now();
+			pending.then((done) => {
+				const hit = done?.key === msg.key;
+				if (LOG)
+					console.log(
+						`[relay] speculative rewrite ${hit ? "used" : done ? "had another key" : "failed"} after ${Math.round(performance.now() - started)}ms ${msg.key.slice(0, 12)}`
+					);
+				if (hit) sendRewrite(msg.id, done!.entry);
+				else sendJson({ t: "rwmiss", id: msg.id });
 			});
-			const frame = Buffer.allocUnsafe(4 + entry.js.byteLength + (entry.map?.byteLength ?? 0));
-			frame.writeUInt32LE(msg.id, 0);
-			frame.set(entry.js, 4);
-			if (entry.map) frame.set(entry.map, 4 + entry.js.byteLength);
-			ws.send(frame);
 		} else if (msg.t === "rwput") {
 			waitingForBody.set(msg.id, msg);
 		} else if (msg.t === "abort") {

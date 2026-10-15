@@ -77,11 +77,31 @@ async function runJob(job: RewriteRequest) {
 		const res = job.useCache
 			? await rewriteJsWithCache(job.js, job.url, context, meta, job.isModule)
 			: rewriteJsInner(job.js, job.url, context, meta, job.isModule);
-		// copied, not transferred: the cache may hold on to these bytes
-		self.postMessage({ id: job.id, res });
+		// transferred: the output is always its own copy (the cache keeps its own), and copying a
+		// big bundle's took several ms
+		self.postMessage({ id: job.id, res }, ownBuffers(res.js, res.map));
 	} catch (err: any) {
-		self.postMessage({ id: job.id, error: String(err?.message ?? err) });
+		// the script back, for the controller's fallback (it was transferred here)
+		self.postMessage(
+			{ id: job.id, error: String(err?.message ?? err), input: job.js },
+			ownBuffers(job.js)
+		);
 	}
+}
+
+// the buffers of these arrays that hold nothing else, to transfer
+function ownBuffers(...arrays: unknown[]): ArrayBuffer[] {
+	const buffers: ArrayBuffer[] = [];
+	for (const a of arrays)
+		if (
+			a instanceof Uint8Array &&
+			a.byteOffset === 0 &&
+			a.byteLength === a.buffer.byteLength &&
+			a.buffer instanceof ArrayBuffer &&
+			!buffers.includes(a.buffer)
+		)
+			buffers.push(a.buffer);
+	return buffers;
 }
 
 function contextFor(prefix: string, injectScripts: string[]): ScramjetContext {

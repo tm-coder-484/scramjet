@@ -373,8 +373,11 @@ export function storeEntry(key: string, entry: CachedRewrite) {
  * never taken from clients, or one client could hand its rewrites to another.
  */
 export type RemoteRewriteCache = {
-	/** the entry for a key (see rewriteKey), or undefined */
-	get(key: string): Promise<CachedRewrite | undefined>;
+	/**
+	 * the entry for a key (see rewriteKey), or undefined. `url`, the script's, is sent for big
+	 * scripts: the owner may be rewriting that one already (devrelay.ts's speculative rewrites)
+	 */
+	get(key: string, url?: string): Promise<CachedRewrite | undefined>;
 	/**
 	 * asks the cache to compute and keep the rewrite of `input` under `header` (the same header
 	 * rewriteKey takes). `key` is this client's key for it, a hint the owner may use to skip work

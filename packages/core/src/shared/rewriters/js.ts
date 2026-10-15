@@ -18,6 +18,7 @@ import {
 	TextDecoder_decode,
 	TextEncoder_encode,
 	_RegExp,
+	_TextDecoder,
 	_Uint8Array,
 	Object_keys,
 	Performance_now,
@@ -138,6 +139,40 @@ export function rewriteJsInner(
 	return rewriteJsWasm(js, url, context, meta, isModule);
 }
 
+// "use strict" has to stay the script's first statement
+const STRICT_MODE = /^\s*(['"])use strict\1;?/;
+// the head of a script as text, with any byte order mark kept as U+FEFF (whitespace to the regex
+// above), so the text's UTF-8 length is the head's length in bytes
+const headDecoder = new _TextDecoder("utf-8", { ignoreBOM: true });
+const HEAD_BYTES = 256;
+
+// `line` in front of a script, after its "use strict" if it has one. A script in bytes stays in
+// bytes: decoding YouTube's 12 MB rewritten bundle to put a line in front, and encoding it again
+// for the response, held up the controller ~60 ms
+function prependToScript(js: string | Uint8Array, line: string): string | Uint8Array {
+	if (typeof js !== "string") {
+		const head = headDecoder.decode(js.subarray(0, HEAD_BYTES));
+		const lead = new _RegExp(/^\s*/).exec(head)![0].length;
+		// the head holds the whole directive ('use strict'; is 13 characters), or shows there's none
+		if (lead + 16 <= head.length) {
+			const match = new _RegExp(STRICT_MODE).exec(head);
+			const at = match ? TextEncoder_encode(match[0]).length : 0;
+			const insert = TextEncoder_encode(match ? `\n${line}` : `${line}\n`);
+			const out = new _Uint8Array(js.length + insert.length);
+			out.set(js.subarray(0, at));
+			out.set(insert, at);
+			out.set(js.subarray(at), at + insert.length);
+			return out;
+		}
+		js = TextDecoder_decode(js);
+	}
+
+	const strictMode = new _RegExp(STRICT_MODE);
+	return strictMode.test(js)
+		? js.replace(strictMode, `$&\n${line}`)
+		: `${line}\n${js}`;
+}
+
 // the sourcemap call and the logs for a rewriter result. throws if that fails
 function finishRewrite(
 	res: RewriterResult,
@@ -151,20 +186,9 @@ function finishRewrite(
 		if (pushmap) {
 			pushmap(res.map, res.tag);
 		} else {
-			// TODO: how do we check instanceof here?
-			let text: string =
-				typeof newjs === "string" ? newjs : TextDecoder_decode(newjs);
 			// base64 is a string literal, which parses far faster than a decimal array of the same bytes
 			const sourcemapfn = `${context.config.globals.pushsourcemapfn}("${bytesToBase64(res.map)}", "${res.tag}");`;
-
-			// don't put the sourcemap call before "use strict"
-			const strictMode = new _RegExp(/^\s*(['"])use strict\1;?/);
-			if (strictMode.test(text)) {
-				text = text.replace(strictMode, `$&\n${sourcemapfn}`);
-			} else {
-				text = `${sourcemapfn}\n${text}`;
-			}
-			newjs = text;
+			newjs = prependToScript(newjs, sourcemapfn);
 		}
 	}
 
@@ -222,7 +246,9 @@ export function rewriteJs(
 /**
  * Rewrites a script somewhere else (the controller's rewriter pool), so the thread handling
  * requests isn't blocked while a bundle is hashed, looked up in the cache, rewritten and stored.
- * Same inputs and result as rewriteJsWithCache (or rewriteJsInner, without the cache).
+ * Same inputs and result as rewriteJsWithCache (or rewriteJsInner, without the cache). It may
+ * transfer `js` away (copying YouTube's 10 MB bundle to a thread took ~50 ms); a rejection then
+ * hands it back as the error's `input`, for the fallback.
  */
 export type JsRewriteOffload = (
 	js: Uint8Array,
@@ -247,6 +273,9 @@ const MIN_CACHED_BYTES = 64 * 1024;
 // scripts under this size are rewritten where they are, even with an offload: a pool thread can be
 // busy with a big bundle for 100ms
 const MIN_OFFLOAD_BYTES = 16 * 1024;
+// from this size on, a remote cache is told which script it's asked for: it may be rewriting it
+// already (see RemoteRewriteCache.get)
+const MIN_SPECULATED_BYTES = 1024 * 1024;
 
 /**
  * The rewriter output for a script body, from the cache (see jscache.ts) when it has it, and
@@ -299,7 +328,9 @@ export async function rewriteJsWithCache(
 
 	const remote = getRemoteRewriteCache();
 	if (remote) {
-		const entry = await remote.get(key).catch(() => undefined);
+		const entry = await remote
+			.get(key, url && js.byteLength >= MIN_SPECULATED_BYTES ? url : undefined)
+			.catch(() => undefined);
 		if (entry) {
 			storeEntry(key, entry);
 			if (flagEnabled("rewriterLogs", context, base))
@@ -397,8 +428,11 @@ export async function rewriteJsCached(
 		res = offload
 			? await offload(js, url, context, meta, isModule, useCache)
 			: await rewriteJsWithCache(js, url, context, meta, isModule);
-	} catch (err) {
-		return failRewrite(err, js, url, context, meta);
+	} catch (err: any) {
+		// a script the offload took is in the rejection, unless the thread died with it
+		const input: Uint8Array = err?.input ?? js;
+		if (!input.byteLength && js.byteLength) throw err;
+		return failRewrite(err, input, url, context, meta);
 	}
 
 	try {
