@@ -6,7 +6,12 @@ import type {
 
 import { RpcHelper } from "@mercuryworkshop/rpc";
 import type { Config } from ".";
-import { CONTROLLERFRAME, WASM_DIGEST, WASM_MODULE } from "./symbols";
+import {
+	CONTROLLERFRAME,
+	PLAIN_NATIVES,
+	WASM_DIGEST,
+	WASM_MODULE,
+} from "./symbols";
 import type {
 	SerializedCookieSyncEntry,
 	ControllerToTransport,
@@ -18,6 +23,7 @@ import {
 	SCRAMJETCLIENT,
 	ScramjetClient,
 	setWasm,
+	sharePlainNatives,
 	Tap,
 	WORKERTRANSPORT,
 	type CookieSyncOptions,
@@ -239,7 +245,7 @@ type WorkerInit = {
  * Controller.loadScramjetWasm). Walk the real window chain to find it: parent, top, opener,
  * and each of their chains. Runs before any hooks exist; a cross-origin read throws, so each is guarded.
  */
-function findHostWasm(): [WebAssembly.Module, string] | undefined {
+function findHostWasm(): [WebAssembly.Module, string, any] | undefined {
 	const seen: any[] = [globalThis];
 	for (let i = 0; i < seen.length && i < 32; i++) {
 		const win = seen[i];
@@ -251,7 +257,7 @@ function findHostWasm(): [WebAssembly.Module, string] | undefined {
 				typeof digest === "string" &&
 				Object.prototype.toString.call(module) === "[object WebAssembly.Module]"
 			)
-				return [module, digest];
+				return [module, digest, win[PLAIN_NATIVES]];
 		} catch {}
 		for (const next of [() => win.parent, () => win.top, () => win.opener]) {
 			try {
@@ -286,6 +292,7 @@ function loadWasm(fallbackUrl: string | undefined) {
 	const host = findHostWasm();
 	if (host) {
 		setWasm(host[0], host[1]);
+		if (host[2] && typeof host[2] === "object") sharePlainNatives(host[2]);
 		return;
 	}
 

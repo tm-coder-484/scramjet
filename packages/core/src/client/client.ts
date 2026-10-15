@@ -241,6 +241,31 @@ function isPlainFunction(value: any): boolean {
 	return false;
 }
 
+// isPlainFunction's answer per hook name ("Element.prototype.append"). It is the same for every
+// realm's built-in at that name, and the throw it takes is slow in a fresh realm: booting the client
+// took ~25ms more per document, and per about:blank frame a page reaches into (YouTube's front page
+// boots four). A function with a prototype property is still never plain
+let plainByName: Record<string, boolean | undefined> = {
+	__proto__: null,
+} as unknown as Record<string, boolean | undefined>;
+
+/**
+ * Has this realm share isPlainFunction's answers with the page's other documents. `store` is a
+ * null-prototype object every document of the page gets (the controller's host page publishes it)
+ */
+export function sharePlainNatives(store: Record<string, boolean | undefined>) {
+	plainByName = store;
+}
+
+function isPlainNative(name: string | undefined, value: any): boolean {
+	if (typeof value !== "function" || Reflect_has(value, "prototype"))
+		return false;
+	if (name === undefined) return isPlainFunction(value);
+	let plain = plainByName[name];
+	if (plain === undefined) plainByName[name] = plain = isPlainFunction(value);
+	return plain;
+}
+
 // a method-shorthand function has no [[Construct]] and no prototype, like the native it wraps.
 // name and length are copied from the native
 function createMethodWrapper(
@@ -952,7 +977,11 @@ return { apply, construct };
 		};
 
 		let proxy: any;
-		if (handler.apply && !handler.construct && isPlainFunction(value)) {
+		if (
+			handler.apply &&
+			!handler.construct &&
+			isPlainNative(debugname, value)
+		) {
 			// a non-constructible function without a prototype (method, global or static): a real
 			// function is much cheaper than a Proxy apply trap
 			proxy = createMethodWrapper(prop, value, applyHook);

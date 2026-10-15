@@ -1,6 +1,41 @@
 import { basicTest, serverTest } from "../testcommon.ts";
 // historical regressions
 
+// what a hooked function must still be in a realm `w`: methods aren't constructible and have no
+// prototype, constructors construct. returns what's wrong (a string per failure)
+const CONSTRUCTIBILITY_CHECK = `function checkConstructibility(w, where) {
+	const bad = [];
+	const methods = {
+		fetch: w.fetch,
+		setAttribute: w.Element.prototype.setAttribute,
+		addEventListener: w.EventTarget.prototype.addEventListener,
+		pushState: w.History.prototype.pushState,
+		querySelector: w.Document.prototype.querySelector,
+		createObjectURL: w.URL.createObjectURL,
+		appendChild: w.Node.prototype.appendChild,
+	};
+	for (const [name, f] of Object.entries(methods)) {
+		if (typeof f !== "function") { bad.push(where + ": " + name + " is " + typeof f); continue; }
+		if ("prototype" in f) bad.push(where + ": " + name + " has a prototype");
+		let threw = null;
+		try { new f(); } catch (e) { threw = e; }
+		if (!threw || threw.name !== "TypeError") bad.push(where + ": new " + name + " should throw a TypeError, got " + threw);
+	}
+	const ctors = [
+		["Image", () => new w.Image().tagName === "IMG"],
+		["URL", () => new w.URL("https://example.com/a").pathname === "/a"],
+		["Function", () => new w.Function("return 7")() === 7],
+		["MutationObserver", () => typeof new w.MutationObserver(() => {}).observe === "function"],
+		["Blob", () => new w.Blob(["ab"]).size === 2],
+		["Request", () => new w.Request("https://example.com/").method === "GET"],
+	];
+	for (const [name, make] of ctors) {
+		try { if (!make()) bad.push(where + ": new " + name + " made the wrong thing"); }
+		catch (e) { bad.push(where + ": new " + name + " threw " + e); }
+	}
+	return bad;
+}`;
+
 export default [
 	// scramjet/core
 	// non-JS <script> data islands (Spotify, GitHub) read undefined from textContent/innerText
@@ -331,5 +366,47 @@ export default [
             assertEqual(document["location"].href, location.href, "document[location] stays proxied");
             assertEqual(self["location"].href, location.href, "self[location] stays proxied");
         `,
+	}),
+	// scramjet/core
+	// hooked functions keep their constructibility in every realm: a method stays a method and a
+	// constructor stays one, in the page, an about:blank frame it reaches into, and another document.
+	// The client decides plain wrapper or Proxy once per hook name and shares that between documents
+	serverTest({
+		name: "regression-hooked-functions-constructibility",
+		autoPass: false,
+		js: `
+		${CONSTRUCTIBILITY_CHECK}
+		const bad = checkConstructibility(window, "page");
+		const blank = document.createElement("iframe");
+		document.body.appendChild(blank);
+		bad.push(...checkConstructibility(blank.contentWindow, "about:blank frame"));
+		const fromDoc = await new Promise((resolve, reject) => {
+			const timer = setTimeout(() => reject(new Error("second document never answered")), 10000);
+			window.addEventListener("message", (e) => {
+				if (!e.data || !Array.isArray(e.data.constructibility)) return;
+				clearTimeout(timer);
+				resolve(e.data.constructibility);
+			});
+			const doc = document.createElement("iframe");
+			doc.src = "/constructibility-frame.html";
+			document.body.appendChild(doc);
+		});
+		bad.push(...fromDoc);
+		assert(bad.length === 0, bad.join("; "));
+		pass("hooked functions keep their constructibility in every realm");
+	`,
+		start: async (server) => {
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				const path = (req.url || "").split("?")[0] || "";
+				if (path !== "/constructibility-frame.html") return;
+				res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+				res.end(
+					`<!doctype html><script>${CONSTRUCTIBILITY_CHECK}
+parent.postMessage({ constructibility: checkConstructibility(window, "second document") }, "*");
+</script>`
+				);
+			});
+		},
 	}),
 ];

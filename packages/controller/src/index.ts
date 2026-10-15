@@ -27,6 +27,7 @@ import {
 	DEFAULT_PREFIX,
 	WASM_DIGEST,
 	WASM_MODULE,
+	PLAIN_NATIVES,
 } from "./symbols";
 import type {
 	FrameInitHooks,
@@ -333,6 +334,13 @@ export class Controller {
 			enumerable: false,
 			configurable: true,
 		});
+		// made here, so it keeps no document's realm alive (see core's sharePlainNatives)
+		if (!(PLAIN_NATIVES in globalThis))
+			Object.defineProperty(globalThis, PLAIN_NATIVES, {
+				value: Object.create(null),
+				enumerable: false,
+				configurable: true,
+			});
 		this.wasmAlreadyFetched = true;
 	}
 

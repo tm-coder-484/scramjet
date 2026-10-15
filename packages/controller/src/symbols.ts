@@ -8,3 +8,5 @@ export const DEFAULT_PREFIX = "/~/sj/";
 // can adopt it without the payload. see Controller.loadScramjetWasm and inject.ts findHostWasm
 export const WASM_MODULE = Symbol.for("scramjet wasm module");
 export const WASM_DIGEST = Symbol.for("scramjet wasm digest");
+// and a table every document's client fills and reads (core's sharePlainNatives)
+export const PLAIN_NATIVES = Symbol.for("scramjet plain natives");
