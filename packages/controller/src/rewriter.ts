@@ -10,6 +10,7 @@ import {
 	rewriteHtmlStream,
 	rewriteJsInner,
 	rewriteJsWithCache,
+	finishRewrite,
 	setRemoteRewriteCache,
 	setWasm,
 	warmUpRewriter,
@@ -74,12 +75,20 @@ async function runJob(job: RewriteRequest) {
 			base: new URL(job.base),
 			initiatorOrigin: job.initiatorOrigin,
 		};
-		const res = job.useCache
+		const rewritten = job.useCache
 			? await rewriteJsWithCache(job.js, job.url, context, meta, job.isModule)
 			: rewriteJsInner(job.js, job.url, context, meta, job.isModule);
+		// the sourcemap call goes in here too, so the controller only passes the script on
+		const res = {
+			js: finishRewrite(rewritten, context, meta),
+			map: null,
+			tag: rewritten.tag,
+			errors: rewritten.errors,
+			finished: true,
+		};
 		// transferred: the output is always its own copy (the cache keeps its own), and copying a
 		// big bundle's took several ms
-		self.postMessage({ id: job.id, res }, ownBuffers(res.js, res.map));
+		self.postMessage({ id: job.id, res }, ownBuffers(res.js));
 	} catch (err: any) {
 		// the script back, for the controller's fallback (it was transferred here)
 		self.postMessage(

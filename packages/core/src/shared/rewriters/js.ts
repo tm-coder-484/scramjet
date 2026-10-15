@@ -30,6 +30,8 @@ export type RewriterResult = {
 	map: Uint8Array | null;
 	tag: string;
 	errors: string[];
+	// finishRewrite already ran where the script was rewritten (a rewriter thread): js is final
+	finished?: boolean;
 };
 
 function rewriterFlags(context: ScramjetContext, base: URLMeta["base"]) {
@@ -174,7 +176,7 @@ function prependToScript(js: string | Uint8Array, line: string): string | Uint8A
 }
 
 // the sourcemap call and the logs for a rewriter result. throws if that fails
-function finishRewrite(
+export function finishRewrite(
 	res: RewriterResult,
 	context: ScramjetContext,
 	meta: URLMeta
@@ -270,9 +272,11 @@ export function setJsRewriteOffload(offload: JsRewriteOffload | null) {
 // scripts under this size are rewritten every time. a small rewrite takes about 1ms, less than a
 // lookup in the disk store, which also waits for the database to open in a fresh page
 const MIN_CACHED_BYTES = 64 * 1024;
-// scripts under this size are rewritten where they are, even with an offload: a pool thread can be
-// busy with a big bundle for 100ms
-const MIN_OFFLOAD_BYTES = 16 * 1024;
+// scripts under this size are rewritten where they are, even with an offload: the round trip to a
+// pool thread costs about what rewriting a few KB does. GitHub's front page loads ~150 modules,
+// most of them under 16 KB: rewritten on the controller, they kept it busy for ~150 ms, while
+// the requests behind them waited
+const MIN_OFFLOAD_BYTES = 4 * 1024;
 // from this size on, a remote cache is told which script it's asked for: it may be rewriting it
 // already (see RemoteRewriteCache.get)
 const MIN_SPECULATED_BYTES = 1024 * 1024;
@@ -394,7 +398,7 @@ export function rewriteJsOffloaded(
 	return job.then(
 		(res) => {
 			try {
-				return text(finishRewrite(res, context, meta));
+				return text(res.finished ? res.js : finishRewrite(res, context, meta));
 			} catch (err) {
 				return text(failRewrite(err, js, url, context, meta));
 			}
@@ -436,7 +440,7 @@ export async function rewriteJsCached(
 	}
 
 	try {
-		return finishRewrite(res, context, meta);
+		return res.finished ? res.js : finishRewrite(res, context, meta);
 	} catch (err) {
 		return failRewrite(err, js, url, context, meta);
 	}

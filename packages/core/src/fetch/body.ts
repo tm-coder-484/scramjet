@@ -93,6 +93,15 @@ export async function rewriteBody(
 					rewritten += `\n//# sourceURL=${parsed.url.href}`;
 				}
 
+				// the rewriter's output is always its own copy: as an ArrayBuffer, the controller
+				// transfers it to the service worker instead of copying it
+				if (
+					typeof rewritten !== "string" &&
+					rewritten.byteOffset === 0 &&
+					rewritten.byteLength === rewritten.buffer.byteLength
+				)
+					return rewritten.buffer as ArrayBuffer;
+
 				return rewritten as unknown as ArrayBuffer;
 			}
 			return response.body;
