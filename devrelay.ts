@@ -46,27 +46,47 @@ const LOG = !!process.env.RELAY_LOG;
 // the high bit of a binary frame's id: the frame is a whole response (see the protocol above)
 const WHOLE = 0x80000000;
 
-// DNS answers are kept for a minute, like Chromium's host cache
-const dnsCache = new Map<string, { expires: number; result: any[] }>();
+// DNS answers are kept for a minute, like Chromium's host cache, and a lookup in flight is shared
+const dnsCache = new Map<string, { expires: number; addresses: dns.LookupAddress[] }>();
+const dnsPending = new Map<string, Promise<dns.LookupAddress[]>>();
+
+function resolveHost(hostname: string): Promise<dns.LookupAddress[]> {
+	const hit = dnsCache.get(hostname);
+	if (hit && hit.expires > Date.now()) return Promise.resolve(hit.addresses);
+	let pending = dnsPending.get(hostname);
+	if (!pending) {
+		pending = dns.promises
+			.lookup(hostname, { all: true })
+			.then((addresses) => {
+				dnsCache.set(hostname, { expires: Date.now() + 60_000, addresses });
+				return addresses;
+			})
+			.finally(() => dnsPending.delete(hostname));
+		dnsPending.set(hostname, pending);
+	}
+	return pending;
+}
+
 function cachedLookup(hostname: string, options: any, cb: any) {
 	if (typeof options === "function") {
 		cb = options;
 		options = {};
 	}
-	const key = `${hostname}|${options.family || 0}|${!!options.all}`;
-	const hit = dnsCache.get(key);
-	if (hit && hit.expires > Date.now()) {
-		process.nextTick(() => cb(null, ...hit.result));
-		return;
-	}
-	dns.lookup(hostname, options, (err: any, address: any, family: any) => {
-		if (!err)
-			dnsCache.set(key, {
-				expires: Date.now() + 60_000,
-				result: options.all ? [address] : [address, family],
-			});
-		cb(err, address, family);
-	});
+	const family = options.family === 4 || options.family === 6 ? options.family : 0;
+	resolveHost(hostname).then(
+		(addresses) => {
+			const list = family ? addresses.filter((a) => a.family === family) : addresses;
+			if (!list.length) {
+				const err: any = new Error(`getaddrinfo ENOTFOUND ${hostname}`);
+				err.code = "ENOTFOUND";
+				err.hostname = hostname;
+				return cb(err);
+			}
+			if (options.all) cb(null, list);
+			else cb(null, list[0].address, list[0].family);
+		},
+		(err) => cb(err)
+	);
 }
 
 // ---- shared HTTP cache (opt-in per request: the transport's `cache` option) ----
@@ -384,6 +404,16 @@ class RelaySession {
 						} catch {}
 					} else if (name === "link" && a.href) {
 						const rel = (a.rel || "").toLowerCase().split(/\s+/);
+						// the browser resolves these hosts ahead of the requests script will make to them
+						// (Wikipedia's banners, from meta. and auth.wikimedia.org: ~150-230 ms each for a
+						// cold lookup), but it only sees the proxy's host in them
+						if (rel.includes("dns-prefetch") || rel.includes("preconnect")) {
+							try {
+								const u = new URL(a.href.trim(), base);
+								if (u.protocol === "https:" || u.protocol === "http:")
+									resolveHost(u.hostname).catch(() => {});
+							} catch {}
+						}
 						if (rel.includes("stylesheet") && a.disabled === undefined)
 							add(a.href, "style");
 						else if (rel.includes("modulepreload")) add(a.href, "script");
