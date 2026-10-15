@@ -702,21 +702,42 @@ function speculate(url: string, body: Buffer, referer: string) {
 			})
 		);
 	const started = performance.now();
-	const patched = twin.key && twinWorker ? twinWorker.patch(twin.key, header, body) : null;
+	const patched =
+		twin.key && twinWorker?.ready(twin.key) ? twinWorker.patch(twin.key, header, body) : null;
+	if (!patched) {
+		speculated.set(url, rewrite());
+		setTimeout(() => speculated.delete(url), SPECULATION_KEEP_MS).unref();
+		return;
+	}
+	// the patch, or the full rewrite if the patch fails or is slow (the twins thread may be busy
+	// with another twin's literals): whichever is first
 	speculated.set(
 		url,
-		patched
-			? patched.then((r) => {
-					if (!r) return rewrite();
-					rewriteCachePut(r.key, r.entry);
-					addTwin(header, body.byteLength, edges, r.key);
-					if (LOG)
-						console.log(
-							`[relay] rewrite cache stored ${r.key.slice(0, 12)} (patched from its twin in ${Math.round(performance.now() - started)}ms)`
-						);
-					return r;
-				})
-			: rewrite()
+		new Promise((resolve) => {
+			let fallback: Promise<{ key: string; entry: RewriteEntry } | null> | null = null;
+			let settled = false;
+			const settle = (r: { key: string; entry: RewriteEntry } | null) => {
+				if (settled) return;
+				settled = true;
+				clearTimeout(timer);
+				resolve(r);
+			};
+			const rewriteInstead = () => {
+				fallback ??= rewrite();
+				fallback.then(settle);
+			};
+			const timer = setTimeout(rewriteInstead, PATCH_WAIT_MS);
+			patched.then((r) => {
+				if (!r) return rewriteInstead();
+				rewriteCachePut(r.key, r.entry);
+				addTwin(header, body.byteLength, edges, r.key);
+				if (LOG)
+					console.log(
+						`[relay] rewrite cache stored ${r.key.slice(0, 12)} (patched from its twin in ${Math.round(performance.now() - started)}ms)`
+					);
+				settle(r);
+			});
+		})
 	);
 	setTimeout(() => speculated.delete(url), SPECULATION_KEEP_MS).unref();
 }
@@ -749,6 +770,8 @@ const STR_NEXT = new Set([",", ")", ";", "]", "}", "+/-", "||", "&&", "??", "==/
 // decimal (without legacy octal), or hex
 const PLAIN_NUM = /^(?:(?:0|[1-9][0-9]*)(?:\.[0-9]+)?|0[xX][0-9a-fA-F]+)$/;
 const TWIN_CACHE = 4;
+// how long a speculative rewrite waits for a patch before it does the full rewrite as well
+const PATCH_WAIT_MS = 150;
 
 // the literals of a script that may change in its twins, by byte range of their whole token
 export function analyzeLiterals(acorn: any, input: Buffer, isModule = false): Spans | null {
@@ -1054,6 +1077,8 @@ class TwinWorker {
 	private worker: Worker;
 	private waiting = new Map<number, (r: { key: string; entry: RewriteEntry } | null) => void>();
 	private nextId = 1;
+	// the twins whose literals the thread has found, so a patch from them can be had at once
+	private analyzed = new Set<string>();
 
 	constructor() {
 		this.worker = new Worker(new URL(import.meta.url), {
@@ -1061,6 +1086,11 @@ class TwinWorker {
 		});
 		this.worker.unref();
 		this.worker.on("message", (m) => {
+			if (m.analyzed) {
+				this.analyzed.add(m.analyzed);
+				if (this.analyzed.size > TWIN_CACHE * 4) this.analyzed.delete(this.analyzed.values().next().value!);
+				return;
+			}
 			const done = this.waiting.get(m.id);
 			this.waiting.delete(m.id);
 			if (LOG && m.why) console.log(`[relay] twin's rewrite not patched: ${m.why}`);
@@ -1074,9 +1104,14 @@ class TwinWorker {
 		});
 	}
 
-	// a big script and its rewrite, for its twins to come (`stamp`: the build that rewrote it)
+	// a big script and its rewrite, for its twins to come (`stamp`: the build that rewrote it).
+	// its literals are found a few seconds later (~1.5 s of CPU for a 10 MB script)
 	add(key: string, header: string, input: Buffer, entry: RewriteEntry, stamp: string) {
 		this.worker.postMessage({ t: "add", key, header, input, entry, stamp });
+	}
+
+	ready(key: string) {
+		return this.analyzed.has(key);
 	}
 
 	// the rewrite of `input` under `header`, patched from the twin rewritten under `key`
@@ -1089,6 +1124,7 @@ class TwinWorker {
 	}
 
 	clear() {
+		this.analyzed.clear();
 		this.worker.postMessage({ t: "clear" });
 	}
 }
@@ -1121,10 +1157,13 @@ async function runTwinWorker() {
 		kept.delete(key);
 		kept.set(key, k);
 		if (kept.size > TWIN_CACHE) kept.delete(kept.keys().next().value!);
+		if (k.spans) parentPort!.postMessage({ analyzed: key });
 		// found after the page that brought it has had its turn at the CPU
-		if (k.spans === undefined)
+		else if (k.spans === undefined)
 			setTimeout(() => {
-				if (k.spans === undefined) k.spans = analyzeLiterals(acorn, k.input, k.isModule);
+				if (k.spans !== undefined || kept.get(key) !== k) return;
+				k.spans = analyzeLiterals(acorn, k.input, k.isModule);
+				if (k.spans) parentPort!.postMessage({ analyzed: key });
 			}, 3000);
 	};
 	parentPort!.on("message", async (m) => {
@@ -1237,7 +1276,7 @@ parentPort.on("message", async ({ id, header, js }) => {
 type RewriteJob = {
 	header: string;
 	js: ArrayBuffer;
-	// the script, kept on this thread: a big one's twins may be patched from it
+	// a speculative rewrite's script, kept on this thread: its twins to come may be patched from it
 	input?: Buffer;
 	hint: string;
 	// ahead of the queue: a client may wait for it
@@ -1303,9 +1342,12 @@ class RewritePool {
 		if (m.key && m.entry) {
 			rewriteCachePut(m.key, m.entry);
 			if (job && m.edges) {
-				// the twins thread gets its own copy of the rewrite
-				if (job.input && twinWorker) twinWorker.add(m.key, job.header, job.input, m.entry, m.stamp);
-				addTwin(job.header, m.length, m.edges, job.input && twinWorker ? m.key : undefined);
+				// a speculative rewrite's script is another version of a twin: the next one may be
+				// patched from it, so the twins thread gets its own copy (a script seen in one version
+				// only is never patched from)
+				const variant = !!job.input && !!twinWorker && job.hint.startsWith("speculative ");
+				if (variant) twinWorker!.add(m.key, job.header, job.input!, m.entry, m.stamp);
+				addTwin(job.header, m.length, m.edges, variant ? m.key : undefined);
 			}
 			job?.done?.({ key: m.key, entry: m.entry });
 			if (LOG)
@@ -1354,7 +1396,7 @@ function rewritePut(msg: any, body: Buffer) {
 		return;
 	// its own copy, transferred to the thread
 	const js = body.buffer.slice(body.byteOffset, body.byteOffset + body.byteLength);
-	getRewritePool()?.submit({ header: msg.header, js, input: body, hint: msg.key });
+	getRewritePool()?.submit({ header: msg.header, js, hint: msg.key });
 }
 
 function handleMuxSocket(ws: WebSocket) {
