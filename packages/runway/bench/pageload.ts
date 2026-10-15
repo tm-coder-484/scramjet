@@ -7,8 +7,10 @@
 //   pnpm --filter runway bench [--sites wikipedia,crazygames] [--reps 3] [--out results.jsonl]
 //
 // load: the site document's navigation timing loadEventEnd, read inside the document in both
-// cases. Sites with a game (crazygames) also report "game": the time from starting the
-// navigation until the game has drawn a screen, which is what a player waits for.
+// cases. A load whose document came back with an error status (a site's rate-limit page, say) is
+// reported but left out of the medians, since an error page is no measure of the site. Sites
+// with a game (crazygames) also report "game": the time from starting the navigation until the
+// game has drawn a screen, which is what a player waits for.
 //
 // The relay's caches persist across loads, like a proxy server's would, so the first rep of a
 // site is the cold-cache one; with --reps 3 the medians are of warm-relay, cold-browser loads.
@@ -161,11 +163,20 @@ async function startHost(): Promise<http.Server> {
 
 // ---- measuring ----
 
-type Result = { site: string; kind: "direct" | "scramjet"; rep: number; load?: number; game?: number; error?: string };
+type Result = {
+	site: string;
+	kind: "direct" | "scramjet";
+	rep: number;
+	load?: number;
+	// the document's HTTP status
+	status?: number;
+	game?: number;
+	error?: string;
+};
 
 const navTiming = () => {
 	const n = performance.getEntriesByType("navigation")[0] as PerformanceNavigationTiming | undefined;
-	return n && n.loadEventEnd > 0 ? n.loadEventEnd : null;
+	return n && n.loadEventEnd > 0 ? { load: n.loadEventEnd, status: n.responseStatus } : null;
 };
 
 async function waitFor<T>(fn: () => Promise<T | null>, what: string): Promise<T> {
@@ -193,8 +204,7 @@ async function measure(browser: Browser, site: string, kind: Result["kind"], rep
 		if (kind === "direct") {
 			const t0 = Date.now();
 			await page.goto(url, { waitUntil: "commit", timeout: TIMEOUT });
-			const load = await waitFor(() => page.evaluate(navTiming), "the load event");
-			const result: Result = { site, kind, rep, load };
+			const result: Result = { site, kind, rep, ...(await waitFor(() => page.evaluate(navTiming), "the load event")) };
 			if (game) {
 				await gameDrawn(game(page));
 				result.game = Date.now() - t0;
@@ -206,8 +216,7 @@ async function measure(browser: Browser, site: string, kind: Result["kind"], rep
 		const t0 = Date.now();
 		await page.evaluate((u) => (window as any).bench.go(u), url);
 		const frame = await waitFor(async () => page.frames().find((f) => f.parentFrame() === page.mainFrame() && f.url() !== "about:blank") ?? null, "the site's frame");
-		const load = await waitFor(() => frame.evaluate(navTiming), "the load event");
-		const result: Result = { site, kind, rep, load };
+		const result: Result = { site, kind, rep, ...(await waitFor(() => frame.evaluate(navTiming), "the load event")) };
 		if (game) {
 			await gameDrawn(game(page.frameLocator("#f")));
 			result.game = Date.now() - t0;
@@ -219,6 +228,9 @@ async function measure(browser: Browser, site: string, kind: Result["kind"], rep
 		await ctx.close();
 	}
 }
+
+// an error page in place of the site (0 is a response the browser didn't get a status for)
+const failed = (r: Result) => (r.status ?? 0) >= 400;
 
 const median = (xs: number[]) => {
 	const s = [...xs].sort((a, b) => a - b);
@@ -257,7 +269,7 @@ async function runBenchmark() {
 				const r = await measure(browser, site, kind, rep);
 				results.push(r);
 				if (out) fs.appendFileSync(out, JSON.stringify(r) + "\n");
-				console.log(`${site.padEnd(11)} ${kind.padEnd(8)} rep${rep} ${r.error ? "ERROR " + r.error : `load=${Math.round(r.load!)}${r.game ? ` game=${r.game}` : ""}`}`);
+				console.log(`${site.padEnd(11)} ${kind.padEnd(8)} rep${rep} ${r.error ? "ERROR " + r.error : `load=${Math.round(r.load!)}${r.game ? ` game=${r.game}` : ""}${failed(r) ? ` status=${r.status} (left out)` : ""}`}`);
 			}
 		}
 	}
@@ -266,7 +278,7 @@ async function runBenchmark() {
 	server.kill();
 
 	const med = (site: string, kind: string, key: "load" | "game") =>
-		median(results.filter((r) => r.site === site && r.kind === kind && r[key] !== undefined).map((r) => r[key]!));
+		median(results.filter((r) => r.site === site && r.kind === kind && r[key] !== undefined && !failed(r)).map((r) => r[key]!));
 	console.log(`\nmedian ms over ${reps} cold loads (ratio = scramjet / direct)`);
 	console.log("site          direct  scramjet  ratio");
 	const ratios: number[] = [];
