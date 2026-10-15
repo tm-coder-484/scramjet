@@ -29,6 +29,11 @@ export type RelayTransportOptions = {
 	rewriteCache?: boolean;
 };
 
+// the high bit of a binary frame's id: the frame holds a whole response, head and body (see
+// devrelay.ts)
+const WHOLE = 0x80000000;
+const headDecoder = new TextDecoder();
+
 type Pending = {
 	resolve: (r: TransferrableResponse) => void;
 	reject: (e: unknown) => void;
@@ -70,8 +75,10 @@ export class RelayTransport implements ProxyTransport {
 		};
 		ws.onmessage = (e) => {
 			if (typeof e.data !== "string") {
-				const id = new DataView(e.data).getUint32(0, true);
-				this.streams.get(id)?.controller?.enqueue(new Uint8Array(e.data, 4));
+				const view = new DataView(e.data);
+				const word = view.getUint32(0, true);
+				if (word & WHOLE) return this.whole(word & ~WHOLE, view);
+				this.streams.get(word)?.controller?.enqueue(new Uint8Array(e.data, 4));
 				return;
 			}
 			const msg = JSON.parse(e.data);
@@ -117,6 +124,29 @@ export class RelayTransport implements ProxyTransport {
 		return ws;
 	}
 
+	// a response the relay had whole (from its cache or a prefetch), in one frame
+	private whole(id: number, view: DataView) {
+		const s = this.streams.get(id);
+		if (!s) return;
+		this.streams.delete(id);
+		const headLength = view.getUint32(4, true);
+		const head = JSON.parse(
+			headDecoder.decode(new Uint8Array(view.buffer, 8, headLength))
+		);
+		const bytes = new Uint8Array(view.buffer, 8 + headLength);
+		s.resolve({
+			body: new ReadableStream<Uint8Array>({
+				start: (c) => {
+					if (bytes.byteLength) c.enqueue(bytes);
+					c.close();
+				},
+			}),
+			headers: head.headers,
+			status: head.status,
+			statusText: head.statusText,
+		});
+	}
+
 	private send(m: string | Uint8Array) {
 		const ws = this.open();
 		if (ws.readyState === WebSocket.OPEN) ws.send(m);
@@ -147,6 +177,7 @@ export class RelayTransport implements ProxyTransport {
 				body: bytes !== null,
 				prefetch: !!this.options.prefetch,
 				cache: !!this.options.cache,
+				whole: true,
 			})
 		);
 		if (bytes) {

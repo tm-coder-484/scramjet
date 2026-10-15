@@ -7,12 +7,14 @@
 // encrypted bytes. That's fine for your own machine or Codespace, not for a public deployment.
 //
 // Protocol, on ws://<host>/relay (one socket per RelayTransport):
-//   client -> server  text   {t:"req", id, url, method, headers, body:bool, prefetch?:bool, cache?:bool}
+//   client -> server  text   {t:"req", id, url, method, headers, body:bool, prefetch?:bool, cache?:bool, whole?:bool}
 //                     binary [u32 id][request body]   (follows a req with body:true)
 //                     text   {t:"abort", id}
 //   server -> client  text   {t:"head", id, status, statusText, headers} | {t:"err", id, error}
 //                     binary [u32 id][chunk]...
 //                     text   {t:"end", id}
+//                     or, for a response the relay has whole (cache, prefetch) and a req with whole:true,
+//                     binary [u32 id | WHOLE][u32 n][n bytes: {status, statusText, headers}][body]
 //   the shared rewrite cache (RelayTransport's rewriteCache, used by the controller's rewriter threads):
 //   client -> server  text   {t:"rwget", id, key, url?}   (url for big scripts: see speculate)
 //                     text   {t:"rwput", id, key, header, body:true} + binary [u32 id][script]
@@ -41,6 +43,8 @@ const DROP = new Set([
 const REQUEST_DROP = new Set(["host", "connection", "content-length"]);
 // RELAY_LOG=1 prints each upstream request's timing
 const LOG = !!process.env.RELAY_LOG;
+// the high bit of a binary frame's id: the frame is a whole response (see the protocol above)
+const WHOLE = 0x80000000;
 
 // DNS answers are kept for a minute, like Chromium's host cache
 const dnsCache = new Map<string, { expires: number; result: any[] }>();
@@ -778,6 +782,22 @@ function handleMuxSocket(ws: WebSocket) {
 	const sendJson = (msg: object) => {
 		if (ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify(msg));
 	};
+	// a response the relay already has whole: one message where head, body and end took three
+	const sendResponse = (msg: any, r: PrefetchedResponse) => {
+		if (!msg.whole) {
+			sendJson({ t: "head", id: msg.id, status: r.status, statusText: r.statusText, headers: r.headers });
+			if (r.body.byteLength) sendChunk(msg.id, r.body);
+			sendJson({ t: "end", id: msg.id });
+			return;
+		}
+		const head = Buffer.from(JSON.stringify({ status: r.status, statusText: r.statusText, headers: r.headers }));
+		const frame = Buffer.allocUnsafe(8 + head.byteLength + r.body.byteLength);
+		frame.writeUInt32LE((msg.id | WHOLE) >>> 0, 0);
+		frame.writeUInt32LE(head.byteLength, 4);
+		frame.set(head, 8);
+		frame.set(r.body, 8 + head.byteLength);
+		if (ws.readyState === WebSocket.OPEN) ws.send(frame);
+	};
 
 	const sendRewrite = (id: number, entry: RewriteEntry) => {
 		sendJson({ t: "rwhit", id, tag: entry.tag, offsets: entry.offsets, jsLength: entry.js.byteLength });
@@ -800,9 +820,7 @@ function handleMuxSocket(ws: WebSocket) {
 				const hit = cacheLookup(msg.url, msg.method, headers);
 				if (hit) {
 					const r = fromCache(hit);
-					sendJson({ t: "head", id: msg.id, status: r.status, statusText: r.statusText, headers: r.headers });
-					if (r.body.byteLength) sendChunk(msg.id, r.body);
-					sendJson({ t: "end", id: msg.id });
+					sendResponse(msg, r);
 					if (r.status === 200 && isScript(dest, header(r.headers, "content-type")))
 						speculate(msg.url, r.body, header(headers, "referer"));
 					return;
@@ -814,9 +832,7 @@ function handleMuxSocket(ws: WebSocket) {
 			if (pre) {
 				const r = await pre.entry.promise.catch(() => null);
 				if (r && (pre.sameCookies || shareable(r))) {
-					sendJson({ t: "head", id: msg.id, status: r.status, statusText: r.statusText, headers: r.headers });
-					if (r.body.byteLength) sendChunk(msg.id, r.body);
-					sendJson({ t: "end", id: msg.id });
+					sendResponse(msg, r);
 					return;
 				}
 			}
