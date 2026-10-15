@@ -26,7 +26,8 @@ import fs from "node:fs";
 import crypto from "node:crypto";
 import os from "node:os";
 import { Worker } from "node:worker_threads";
-import { Agent, fetch as undiciFetch, type Dispatcher } from "undici";
+import type { Socket } from "node:net";
+import { Agent, buildConnector, fetch as undiciFetch, type Dispatcher } from "undici";
 import { WebSocketServer, WebSocket } from "ws";
 import { Parser } from "htmlparser2";
 
@@ -87,6 +88,81 @@ function cachedLookup(hostname: string, options: any, cb: any) {
 		},
 		(err) => cb(err)
 	);
+}
+
+// ---- connections ahead of requests ----
+// a page loaded directly has the browser connect to the hosts its <link rel=preconnect> names
+// while the document still streams in, but proxied, those hints name the proxy's host. the relay
+// opens such connections itself: for the hints, and for every host a site's pages used the last
+// time (sites close idle connections within a minute or two, and a page's chain of banner, login
+// and image requests then pays a TCP and TLS handshake at each step: ~300 ms on Wikipedia).
+// one connector makes every connection, and hands out a warm one for its host if there is one
+const connectSocket = buildConnector({ allowH2: true, lookup: cachedLookup as any });
+// a warm connection is given to the first request for its host that comes within this long
+const WARM_TTL = 10_000;
+const warmSockets = new Map<string, Promise<Socket | null>>();
+
+const connector: buildConnector.connector = (opts, cb) => {
+	const key = `${opts.hostname}:${opts.port || 443}`;
+	const warm = opts.protocol === "https:" && !opts.httpSocket ? warmSockets.get(key) : undefined;
+	if (!warm) return connectSocket(opts, cb);
+	warmSockets.delete(key);
+	warm.then((socket) => {
+		if (socket && !socket.destroyed && socket.readyState === "open") cb(null, socket);
+		else connectSocket(opts, cb);
+	});
+};
+
+// opens a connection to an https origin, unless `pool` already has one or one is warm
+function preconnect(origin: string, pool: Agent) {
+	let u: URL;
+	try {
+		u = new URL(origin);
+	} catch {
+		return;
+	}
+	if (u.protocol !== "https:") return;
+	// as undici's client names it: an IPv6 address without its brackets
+	const hostname = u.hostname.replace(/^\[(.*)\]$/, "$1");
+	const key = `${hostname}:${u.port || 443}`;
+	if (warmSockets.has(key) || Number(pool.stats[u.origin]?.connected ?? 0) > 0) return;
+	const ready = new Promise<Socket | null>((resolve) =>
+		connectSocket(
+			{ hostname, host: u.host, protocol: "https:", port: u.port, localAddress: null },
+			(err, socket) => resolve(err ? null : (socket as Socket))
+		)
+	);
+	warmSockets.set(key, ready);
+	if (LOG) console.log(`[relay] preconnect ${u.origin}`);
+	setTimeout(() => {
+		if (warmSockets.get(key) !== ready) return;
+		warmSockets.delete(key);
+		ready.then((socket) => socket?.destroy());
+	}, WARM_TTL).unref();
+}
+
+// the other origins each site's pages requested (by the Referer's origin), most recent last
+const LEARNED_ORIGINS = 16;
+const learnedOrigins = new Map<string, string[]>();
+
+function learnOrigin(referer: string, url: string) {
+	let from: string, to: string;
+	try {
+		from = new URL(referer).origin;
+		to = new URL(url).origin;
+	} catch {
+		return;
+	}
+	if (from === to || from === "null") return;
+	let list = learnedOrigins.get(from);
+	if (!list) {
+		if (learnedOrigins.size >= 1000) learnedOrigins.delete(learnedOrigins.keys().next().value!);
+		learnedOrigins.set(from, (list = []));
+	} else if (list[list.length - 1] === to) return;
+	const i = list.indexOf(to);
+	if (i !== -1) list.splice(i, 1);
+	list.push(to);
+	if (list.length > LEARNED_ORIGINS) list.shift();
 }
 
 // ---- shared HTTP cache (opt-in per request: the transport's `cache` option) ----
@@ -262,35 +338,34 @@ const keepFetchMode: Dispatcher.DispatcherComposeInterceptor =
 		return dispatch(opts, handler);
 	};
 
-const newAgent = (keepAlive?: number): Dispatcher =>
+const newAgent = (keepAlive?: number): Agent =>
 	new Agent({
 		allowH2: true,
-		connect: { lookup: cachedLookup as any },
+		connect: connector,
 		// undici closes idle connections after 4s by default; Chromium keeps them for minutes
 		...(keepAlive
 			? { keepAliveTimeout: keepAlive, keepAliveMaxTimeout: keepAlive }
 			: {}),
-	}).compose(keepFetchMode);
+	});
 
 // the connections to sites are kept open for every browser that uses the relay, the way a proxy
 // server's are: a page then skips the TCP and TLS handshakes for any site it, or anyone, loaded
 // recently. RELAY_POOL=session gives each transport its own pool instead (closed with it), which
 // is what a browser without the relay would have
 const SHARED_POOL = process.env.RELAY_POOL !== "session";
-let sharedAgent: Dispatcher | null = null;
+let sharedAgent: Agent | null = null;
 
 // one per websocket, i.e. per transport instance: the prefetches started for documents it loaded,
 // and its connection pool if the pool isn't shared
 class RelaySession {
-	agent: Dispatcher = SHARED_POOL
-		? (sharedAgent ??= newAgent(5 * 60_000))
-		: newAgent();
+	pool: Agent = SHARED_POOL ? (sharedAgent ??= newAgent(5 * 60_000)) : newAgent();
+	agent: Dispatcher = this.pool.compose(keepFetchMode);
 	prefetched = new Map<string, PrefetchEntry>();
 	/** whether this transport asked for the shared cache */
 	useCache = false;
 
 	close() {
-		if (!SHARED_POOL) this.agent.close().catch(() => {});
+		if (!SHARED_POOL) this.pool.close().catch(() => {});
 		this.prefetched.clear();
 	}
 
@@ -347,6 +422,7 @@ class RelaySession {
 	// will request eagerly: stylesheets, scripts, preloads and the first few non-lazy images
 	htmlScanner(docUrl: string, docHeaders: RawHeaders, setCookies: string[]) {
 		const doc = new URL(docUrl);
+		const pool = this.pool;
 		let base = doc;
 		let count = 0;
 		let images = 0;
@@ -404,14 +480,13 @@ class RelaySession {
 						} catch {}
 					} else if (name === "link" && a.href) {
 						const rel = (a.rel || "").toLowerCase().split(/\s+/);
-						// the browser resolves these hosts ahead of the requests script will make to them
-						// (Wikipedia's banners, from meta. and auth.wikimedia.org: ~150-230 ms each for a
-						// cold lookup), but it only sees the proxy's host in them
+						// the browser connects to these hosts (or resolves them) ahead of the requests script
+						// will make to them, but it only sees the proxy's host in them (see preconnect)
 						if (rel.includes("dns-prefetch") || rel.includes("preconnect")) {
 							try {
 								const u = new URL(a.href.trim(), base);
-								if (u.protocol === "https:" || u.protocol === "http:")
-									resolveHost(u.hostname).catch(() => {});
+								if (u.protocol === "https:") preconnect(u.origin, pool);
+								else if (u.protocol === "http:") resolveHost(u.hostname).catch(() => {});
 							} catch {}
 						}
 						if (rel.includes("stylesheet") && a.disabled === undefined)
@@ -845,6 +920,15 @@ function handleMuxSocket(ws: WebSocket) {
 		try {
 			const headers: RawHeaders = msg.headers;
 			const dest = header(headers, "sec-fetch-dest").toLowerCase();
+			if (dest === "document" || dest === "iframe") {
+				try {
+					for (const origin of learnedOrigins.get(new URL(msg.url).origin) ?? [])
+						preconnect(origin, session.pool);
+				} catch {}
+			} else {
+				const referer = header(headers, "referer");
+				if (referer) learnOrigin(referer, msg.url);
+			}
 			if (msg.cache) {
 				session.useCache = true;
 				const hit = cacheLookup(msg.url, msg.method, headers);
