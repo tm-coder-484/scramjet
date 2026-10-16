@@ -175,6 +175,15 @@ function prependToScript(js: string | Uint8Array, line: string): string | Uint8A
 		: `${line}\n${js}`;
 }
 
+// whether a rewriter sourcemap records no changes: its first u32 is the number of changes
+function unchanged(map: Uint8Array | null | undefined): boolean {
+	return (
+		!!map &&
+		map.byteLength >= 4 &&
+		(map[0] | (map[1] << 8) | (map[2] << 16) | (map[3] << 24)) === 0
+	);
+}
+
 // the sourcemap call and the logs for a rewriter result. throws if that fails
 export function finishRewrite(
 	res: RewriterResult,
@@ -183,7 +192,9 @@ export function finishRewrite(
 ): string | Uint8Array {
 	let newjs = res.js;
 
-	if (flagEnabled("sourcemaps", context, meta.base)) {
+	// a script the rewriter left unchanged (no functions, nothing hooked: Apollo state, JSON-ish
+	// config) has nothing to map back, and its output is its source
+	if (flagEnabled("sourcemaps", context, meta.base) && !unchanged(res.map)) {
 		const pushmap = globalThis[context.config.globals.pushsourcemapfn];
 		if (pushmap) {
 			pushmap(res.map, res.tag);

@@ -475,9 +475,14 @@ export function traverseParsedHtml(
 	context: ScramjetContext,
 	meta: URLMeta,
 	// takes an inline script's rewrite elsewhere (htmlStream.ts sends big ones to the rewriter
-	// threads): given the script node and the text to rewrite, returns true when it will set the
-	// node's text itself
-	deferScript?: (node: any, js: string, isModule: boolean) => boolean
+	// threads): given the script node and the text to rewrite, returns true when it will hand the
+	// rewrite to `finish` itself
+	deferScript?: (
+		node: any,
+		js: string,
+		isModule: boolean,
+		finish: (rewritten: string) => void
+	) => boolean
 ) {
 	if (node.attribs) {
 		const replacement = rewriteElementAttributes(
@@ -527,20 +532,23 @@ export function traverseParsedHtml(
 			"language" in node.attribs
 		);
 		if (isScriptType(scriptBlockType)) {
-			let js = node.children[0].data;
+			const source: string = node.children[0].data;
 			const module = isModuleScriptType(scriptBlockType);
-			node.attribs["scramjet-attr-script-source-src"] = bytesToBase64(
-				TextEncoder_encode(js)
-			);
 			const htmlcomment = /<!--[\s\S]*?-->/g;
-			js = js.replace(htmlcomment, "");
-			if (!deferScript?.(node, js, module))
-				node.children[0].data = rewriteJs(
-					js,
-					INLINE_SCRIPT_URL,
-					context,
-					meta,
-					module
+			const js = source.replace(htmlcomment, "");
+			// the script's text becomes the rewrite, and the page reads its source back from the
+			// attribute: not needed when the rewrite is the source (Aljazeera's 241 KB Apollo state
+			// doubled in size with it, and the frame's parser took the time to read it)
+			const finish = (rewritten: string) => {
+				node.children[0].data = rewritten;
+				if (rewritten !== source)
+					node.attribs["scramjet-attr-script-source-src"] = bytesToBase64(
+						TextEncoder_encode(source)
+					);
+			};
+			if (!deferScript?.(node, js, module, finish))
+				finish(
+					rewriteJs(js, INLINE_SCRIPT_URL, context, meta, module) as string
 				);
 		}
 	}

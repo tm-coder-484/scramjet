@@ -565,7 +565,7 @@ class HtmlStreamRewriter {
 		// big inline scripts are rewritten on the rewriter threads, and what follows waits for them.
 		// usually one, but in foreign content a script's text is markup, which can hold more
 		const offloaded: Promise<void>[] = [];
-		traverseParsedHtml(element, this.context, this.meta, (node, js, isModule) => {
+		traverseParsedHtml(element, this.context, this.meta, (_node, js, isModule, finish) => {
 			const job = rewriteJsOffloaded(
 				js,
 				INLINE_SCRIPT_URL,
@@ -574,7 +574,7 @@ class HtmlStreamRewriter {
 				isModule
 			);
 			if (!job) return false;
-			offloaded.push(job.then((rewritten) => void (node.children[0].data = rewritten)));
+			offloaded.push(job.then(finish));
 			return true;
 		});
 		if (!offloaded.length) {
