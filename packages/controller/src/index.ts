@@ -402,6 +402,24 @@ export class Controller {
 						fetchresponse.cookieSync
 					);
 
+				// a body the transport's server can serve itself goes straight from there to the
+				// service worker, past this thread
+				const bodyUrl =
+					data.acceptsBodyUrl && !fetchresponse.cookieSync
+						? fetchresponse.nativeBody?.()
+						: null;
+				if (bodyUrl)
+					return [
+						{
+							body: null as unknown as BodyType,
+							bodyUrl,
+							status: fetchresponse.status,
+							statusText: fetchresponse.statusText,
+							headers: fetchresponse.headers.toRawHeaders(),
+						},
+						[],
+					];
+
 				// a streamed body goes over a port, pushed chunk by chunk, when the service worker
 				// knows how to take it: a transferred stream costs a round trip per chunk
 				if (

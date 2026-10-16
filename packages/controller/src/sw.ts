@@ -307,6 +307,7 @@ export async function route(event: FetchEvent): Promise<Response> {
 				rawClientUrl: client ? client.url : undefined,
 				clientId: event.clientId || event.resultingClientId,
 				acceptsBodyPort: true,
+				acceptsBodyUrl: true,
 			},
 			event.request.body instanceof ReadableStream ||
 				// @ts-expect-error the types for fetchevent are messed up
@@ -317,8 +318,19 @@ export async function route(event: FetchEvent): Promise<Response> {
 
 		if (response.networkError) return Response.error();
 
+		let body = response.bodyPort ? receiveBody(response.bodyPort) : response.body;
+		if (response.bodyUrl) {
+			// the browser streams it from there to the page, with none of it through script
+			const r = await fetch(response.bodyUrl, {
+				cache: "no-store",
+				credentials: "include",
+			}).catch(() => null);
+			if (!r?.ok || !r.body) return Response.error();
+			body = r.body;
+		}
+
 		return new Response(
-			response.bodyPort ? receiveBody(response.bodyPort) : response.body,
+			body,
 			{
 				status: response.status,
 				statusText: response.statusText,

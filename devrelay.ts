@@ -17,7 +17,9 @@
 //                     binary [u32 id | WHOLE][u32 n][n bytes: {status, statusText, headers}][body]
 //                     or, when that body is big and the req had bulk:true,
 //                     text   {t:"bulk", id, status, statusText, headers, token}: the client GETs the
-//                            body from http(s)://<host>/relay/body/<token>, once (see putBulk)
+//                            body from http(s)://<host>/relay/body/<token>, once (see putBulk). A
+//                            big response from the network comes that way too, as it arrives
+//                            (see liveBulk), with no end message on the socket
 //   client -> server  text   {t:"bulkpull", id, token}: that GET failed, send the body here instead
 //                            (as chunks and an end)
 //   a script req's `rewrite` is its rewrite-cache header (see rewriteKey): the relay may answer it
@@ -63,24 +65,140 @@ const WHOLE = 0x80000000;
 const BULK_MIN = 32 * 1024;
 // a body the client hasn't fetched by then is dropped (the request was aborted, say)
 const BULK_TTL = 60_000;
-const bulkBodies = new Map<string, { parts: Uint8Array[]; timer: NodeJS.Timeout }>();
+// where a body still arriving goes once the client asks for it: its HTTP response, or the socket
+type BulkSink = {
+	write(chunk: Uint8Array): void | Promise<void>;
+	end(): void;
+	fail(): void;
+	// the client went away: stop the upstream request
+	onGone(f: () => void): void;
+};
+type BulkEntry = {
+	parts: Uint8Array[];
+	timer: NodeJS.Timeout;
+	// a body still arriving from the network (see liveBulk)
+	live?: {
+		ended: boolean;
+		failed: boolean;
+		sink: BulkSink | null;
+		drop: () => void;
+		// the upstream request, waiting for the client to come (see LIVE_BUFFER)
+		wake: (() => void) | null;
+	};
+};
+const bulkBodies = new Map<string, BulkEntry>();
 
-// keeps a body for the client to fetch once from /relay/body/<token>, and returns the token
-function putBulk(parts: Uint8Array[]): string {
+function newBulk(entry: Omit<BulkEntry, "timer">): string {
 	const token = crypto.randomBytes(18).toString("base64url");
-	const timer = setTimeout(() => bulkBodies.delete(token), BULK_TTL);
+	const timer = setTimeout(() => {
+		bulkBodies.delete(token);
+		entry.live?.drop();
+	}, BULK_TTL);
 	timer.unref();
-	bulkBodies.set(token, { parts, timer });
+	bulkBodies.set(token, { ...entry, timer });
 	return token;
 }
 
-function takeBulk(token: unknown): Uint8Array[] | null {
+// keeps a body for the client to fetch once from /relay/body/<token>, and returns the token
+function putBulk(parts: Uint8Array[]): string {
+	return newBulk({ parts });
+}
+
+// how much of a live body is kept for a client that hasn't asked for it yet, before its upstream
+// request waits (a video's request can be left unread for a while)
+const LIVE_BUFFER = 8 * 1024 * 1024;
+
+/**
+ * A body still arriving from the network, for the client to fetch from /relay/body/<token> as it
+ * comes: write its chunks (waiting when the client is behind), then end or fail it. Until the
+ * client asks, the chunks are kept. `drop` stops the upstream request when nobody fetches it.
+ */
+function liveBulk(drop: () => void) {
+	const wake = () => {
+		const resume = live.wake;
+		live.wake = null;
+		resume?.();
+	};
+	const live: NonNullable<BulkEntry["live"]> = {
+		ended: false,
+		failed: false,
+		sink: null,
+		drop: () => {
+			wake();
+			drop();
+		},
+		wake: null,
+	};
+	const parts: Uint8Array[] = [];
+	let kept = 0;
+	const token = newBulk({ parts, live });
+	return {
+		token,
+		write(chunk: Uint8Array): void | Promise<void> {
+			if (live.sink) return live.sink.write(chunk);
+			parts.push(chunk);
+			kept += chunk.byteLength;
+			if (kept >= LIVE_BUFFER) return new Promise<void>((resolve) => (live.wake = resolve));
+		},
+		end() {
+			live.ended = true;
+			live.sink?.end();
+		},
+		fail() {
+			live.failed = true;
+			parts.length = 0;
+			live.sink?.fail();
+		},
+	};
+}
+
+function takeBulk(token: unknown): BulkEntry | null {
 	if (typeof token !== "string") return null;
 	const entry = bulkBodies.get(token);
 	if (!entry) return null;
 	bulkBodies.delete(token);
 	clearTimeout(entry.timer);
-	return entry.parts;
+	return entry;
+}
+
+// hands a taken entry's body to `sink`: what came so far, and the rest as it comes
+function drainBulk(entry: BulkEntry, sink: BulkSink) {
+	for (const part of entry.parts) sink.write(part);
+	entry.parts.length = 0;
+	const live = entry.live;
+	if (!live || live.ended) return sink.end();
+	if (live.failed) return sink.fail();
+	live.sink = sink;
+	sink.onGone(live.drop);
+	live.wake?.();
+}
+
+// an HTTP response as a BulkSink, which waits for the client when it falls behind
+function httpSink(res: http.ServerResponse): BulkSink {
+	// one wait for the next drain, however many writes it holds up
+	let waiting: Promise<void> | null = null;
+	return {
+		write(chunk) {
+			if (res.destroyed || res.write(chunk)) return;
+			return (waiting ??= new Promise<void>((resolve) => {
+				const done = () => {
+					res.off("drain", done);
+					res.off("close", done);
+					waiting = null;
+					resolve();
+				};
+				res.on("drain", done);
+				res.on("close", done);
+			}));
+		},
+		end: () => res.end(),
+		fail: () => res.destroy(),
+		onGone(f) {
+			res.on("close", () => {
+				if (!res.writableFinished) f();
+			});
+		},
+	};
 }
 
 // GET /relay/body/<token>. The token is the only key (it's unguessable, and good for one fetch),
@@ -89,12 +207,12 @@ function takeBulk(token: unknown): Uint8Array[] | null {
 function serveBulk(req: http.IncomingMessage, res: http.ServerResponse): boolean {
 	const url = new URL(req.url || "/", "http://relay");
 	if (!url.pathname.startsWith("/relay/body/")) return false;
-	const parts = req.method === "GET" ? takeBulk(url.pathname.slice("/relay/body/".length)) : null;
+	const entry = req.method === "GET" ? takeBulk(url.pathname.slice("/relay/body/".length)) : null;
 	const origin = req.headers.origin;
 	const cors: Record<string, string> = origin
 		? { "access-control-allow-origin": origin, "access-control-allow-credentials": "true", vary: "origin" }
 		: { "access-control-allow-origin": "*" };
-	if (!parts) {
+	if (!entry) {
 		res.writeHead(404, cors);
 		res.end();
 		return true;
@@ -102,11 +220,11 @@ function serveBulk(req: http.IncomingMessage, res: http.ServerResponse): boolean
 	res.writeHead(200, {
 		...cors,
 		"content-type": "application/octet-stream",
-		"content-length": String(parts.reduce((n, p) => n + p.byteLength, 0)),
+		// a body still arriving goes chunked
+		...(entry.live ? {} : { "content-length": String(entry.parts.reduce((n, p) => n + p.byteLength, 0)) }),
 		"cache-control": "no-store",
 	});
-	for (const part of parts) res.write(part);
-	res.end();
+	drainBulk(entry, httpSink(res));
 	return true;
 }
 
@@ -1657,6 +1775,7 @@ function handleMuxSocket(ws: WebSocket) {
 		const started = performance.now();
 		const ac = new AbortController();
 		live.set(msg.id, ac);
+		let bulk: ReturnType<typeof liveBulk> | null = null;
 		try {
 			const headers: RawHeaders = msg.headers;
 			const dest = header(headers, "sec-fetch-dest").toLowerCase();
@@ -1716,7 +1835,15 @@ function handleMuxSocket(ws: WebSocket) {
 			for (const [k, v] of r.headers) if (!DROP.has(k)) raw.push([k, v]);
 			// a script that may go rewritten waits for its whole body, and its rewrite
 			const buffered = !!rewrite && r.status === 200;
-			if (!buffered)
+			// a big body goes over HTTP as it arrives (see liveBulk): its length, or with an encoding
+			// the encoded length, says it's big
+			bulk =
+				!buffered && msg.bulk && r.body && Number(r.headers.get("content-length") ?? 0) >= BULK_MIN
+					? liveBulk(() => ac.abort())
+					: null;
+			if (bulk)
+				sendJson({ t: "bulk", id: msg.id, status: r.status, statusText: r.statusText, headers: raw, token: bulk.token });
+			else if (!buffered)
 				sendJson({ t: "head", id: msg.id, status: r.status, statusText: r.statusText, headers: raw });
 			const headAt = performance.now();
 
@@ -1742,7 +1869,8 @@ function handleMuxSocket(ws: WebSocket) {
 			const chunks: Uint8Array[] = [];
 			if (r.body) {
 				for await (const chunk of r.body) {
-					if (!buffered) sendChunk(msg.id, chunk);
+					if (bulk) await bulk.write(chunk);
+					else if (!buffered) sendChunk(msg.id, chunk);
 					if (keep || script || buffered) chunks.push(chunk);
 					if (scanner) scanner.write(decoder!.decode(chunk, { stream: true }));
 				}
@@ -1763,8 +1891,10 @@ function handleMuxSocket(ws: WebSocket) {
 			if (script) speculate(msg.url, whole!, header(headers, "referer"));
 			if (buffered)
 				await sendScript(msg, { status: r.status, statusText: r.statusText, headers: raw, body: whole as Buffer }, rewrite!);
+			else if (bulk) bulk.end();
 			else sendJson({ t: "end", id: msg.id });
 		} catch (e: any) {
+			bulk?.fail();
 			sendJson({ t: "err", id: msg.id, error: String(e?.cause ?? e) });
 		} finally {
 			live.delete(msg.id);
@@ -1814,10 +1944,14 @@ function handleMuxSocket(ws: WebSocket) {
 		} else if (msg.t === "abort") {
 			live.get(msg.id)?.abort();
 		} else if (msg.t === "bulkpull") {
-			const parts = takeBulk(msg.token);
-			if (!parts) return sendJson({ t: "err", id: msg.id, error: "the body is gone" });
-			for (const part of parts) sendChunk(msg.id, part);
-			sendJson({ t: "end", id: msg.id });
+			const entry = takeBulk(msg.token);
+			if (!entry) return sendJson({ t: "err", id: msg.id, error: "the body is gone" });
+			drainBulk(entry, {
+				write: (chunk) => sendChunk(msg.id, chunk),
+				end: () => sendJson({ t: "end", id: msg.id }),
+				fail: () => sendJson({ t: "err", id: msg.id, error: "the body failed" }),
+				onGone: (f) => ws.on("close", f),
+			});
 		}
 	});
 	ws.on("close", () => {

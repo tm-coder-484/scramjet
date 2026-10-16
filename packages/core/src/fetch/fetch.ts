@@ -13,7 +13,7 @@ import {
 import { rewriteUrl, unrewriteBlob, unrewriteUrl } from "@rewriters/url";
 import { QP, parseRequest } from "./parse";
 import { ScramjetHeaders, flagEnabled } from "@/shared";
-import { REWRITE_HEADER, rewriteCacheHeader } from "@rewriters/js";
+import { NATIVE_BODY, REWRITE_HEADER, rewriteCacheHeader } from "@rewriters/js";
 import { isDocument, isRedirect, normalizeContentType } from "./util";
 import { rewriteBody } from "./body";
 import { corsPreflight } from "./cors";
@@ -208,6 +208,15 @@ export async function doHandleFetch(
 	};
 
 	await Tap.dispatch(handler.hooks.fetch.response, respcontext, respprops);
+
+	// the body passes through as the transport gave it
+	const native = (response.rawHeaders as any)?.[NATIVE_BODY];
+	if (
+		typeof native === "function" &&
+		respprops.response.body != null &&
+		respprops.response.body === response.body
+	)
+		respprops.response.nativeBody = native;
 
 	if (deferCookies) {
 		// no body to hold back

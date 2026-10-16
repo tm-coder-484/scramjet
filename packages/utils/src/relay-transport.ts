@@ -43,6 +43,11 @@ const headDecoder = new TextDecoder();
 // may answer with the script rewritten under it, and the details of that rewrite on the response
 const REWRITE_HEADER = Symbol.for("scramjet rewrite header");
 const REWRITTEN = Symbol.for("scramjet rewritten");
+// scramjet's NATIVE_BODY: on a response whose body is at the relay's HTTP endpoint, a function that
+// gives its url to fetch it from, once, instead of reading the body here. The service worker then
+// fetches it itself, and the browser streams it to the page without any of it passing through
+// this thread (Discord's videos: ~900 messages and ~270 ms of this thread in a load)
+const NATIVE_BODY = Symbol.for("scramjet native body");
 
 // the response's headers, marked with the relay's rewrite if it sent one (a field of its own
 // message, never a header, so a site can't fake it)
@@ -59,6 +64,16 @@ type Pending = {
 	// a body being fetched over HTTP (see pullBulk)
 	bulk?: AbortController;
 };
+
+// can the service worker fetch `url` itself (see NATIVE_BODY)? only from its own origin, where
+// no CORS stands in the way
+function sameOrigin(url: string) {
+	try {
+		return new URL(url).origin === self.location.origin;
+	} catch {
+		return false;
+	}
+}
 
 /**
  * A transport for a relay server (devrelay.ts), which makes requests itself with native TLS and
@@ -131,22 +146,42 @@ export class RelayTransport implements ProxyTransport {
 					statusText: msg.statusText,
 				});
 			} else if (msg.t === "bulk") {
-				const body = new ReadableStream<Uint8Array>({
-					start: (c) => {
-						s.controller = c;
+				const bulkUrl = this.bulkUrl;
+				let pulling = false;
+				// fetched once someone reads it, unless it was handed on first (see NATIVE_BODY)
+				const body = new ReadableStream<Uint8Array>(
+					{
+						start: (c) => {
+							s.controller = c;
+						},
+						pull: () => {
+							if (pulling) return;
+							pulling = true;
+							this.pullBulk(msg.id, msg.token, s);
+						},
+						cancel: () => {
+							this.streams.delete(msg.id);
+							s.bulk?.abort();
+							// the relay may still be fetching it
+							if (!pulling) this.send(JSON.stringify({ t: "abort", id: msg.id }));
+						},
 					},
-					cancel: () => {
+					{ highWaterMark: 0 }
+				);
+				const headers = markRewrite(msg.headers, msg.rewritten);
+				if (bulkUrl && sameOrigin(bulkUrl) && headers && typeof headers === "object")
+					headers[NATIVE_BODY] = () => {
+						if (pulling || this.streams.get(msg.id) !== s) return null;
+						pulling = true;
 						this.streams.delete(msg.id);
-						s.bulk?.abort();
-					},
-				});
+						return bulkUrl + msg.token;
+					};
 				s.resolve({
 					body,
-					headers: markRewrite(msg.headers, msg.rewritten),
+					headers,
 					status: msg.status,
 					statusText: msg.statusText,
 				});
-				this.pullBulk(msg.id, msg.token, s);
 			} else if (msg.t === "end") {
 				this.streams.delete(msg.id);
 				s.controller?.close();

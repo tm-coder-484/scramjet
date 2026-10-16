@@ -80,6 +80,12 @@ export interface ScramjetFetchResponse {
 	 * Only for destinations the page can't use before their body ends (scripts, images...)
 	 */
 	cookieSync?: Promise<void>;
+	/**
+	 * set when `body` is the transport's own, untouched, and its server can serve it over plain
+	 * HTTP: gives the url to fetch it from instead, once (null if it's too late). Whoever answers
+	 * the page can fetch it there, so the browser streams it without this thread
+	 */
+	nativeBody?: () => string | null;
 }
 
 export type CookieSyncEntry = {
