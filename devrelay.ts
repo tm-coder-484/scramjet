@@ -7,7 +7,7 @@
 // encrypted bytes. That's fine for your own machine or Codespace, not for a public deployment.
 //
 // Protocol, on ws://<host>/relay (one socket per RelayTransport):
-//   client -> server  text   {t:"req", id, url, method, headers, body:bool, prefetch?:bool, cache?:bool, whole?:bool}
+//   client -> server  text   {t:"req", id, url, method, headers, body:bool, prefetch?:bool, cache?:bool, whole?:bool, rewrite?}
 //                     binary [u32 id][request body]   (follows a req with body:true)
 //                     text   {t:"abort", id}
 //   server -> client  text   {t:"head", id, status, statusText, headers} | {t:"err", id, error}
@@ -15,6 +15,9 @@
 //                     text   {t:"end", id}
 //                     or, for a response the relay has whole (cache, prefetch) and a req with whole:true,
 //                     binary [u32 id | WHOLE][u32 n][n bytes: {status, statusText, headers}][body]
+//   a script req's `rewrite` is its rewrite-cache header (see rewriteKey): the relay may answer it
+//   with the script rewritten under it (see sendScript), its head then holding
+//   rewritten: {tag, offsets, jsLength} and its body the rewrite's js then map
 //   the shared rewrite cache (RelayTransport's rewriteCache, used by the controller's rewriter threads):
 //   client -> server  text   {t:"rwget", id, key, url?}   (url for big scripts: see speculate)
 //                     text   {t:"rwput", id, key, header, body:true} + binary [u32 id][script]
@@ -1239,10 +1242,29 @@ const DEFAULT_CODEC = [
 const isDefaultCodec = (src) => DEFAULT_CODEC.some((re) => re.test(String(src).replace(/\s+/g, "")));
 const encodeDefault = (u) => (u ? encodeURIComponent(u) : u);
 const refuse = () => { throw new Error("not the default codec"); };
+// what rewriteKey hashes besides the header and the script (see getBuildTag in jscache.ts), so
+// the main thread can key scripts itself (see prerewrite); null if a probe key doesn't match
+async function postBuildTag() {
+	let buildTag = null;
+	try {
+		const sj = globalThis.$scramjet;
+		const v = sj.versionInfo;
+		const sha = (x) => crypto.createHash("sha256").update(x).digest("hex");
+		const tag = [v.version, v.build, v.date, sha(fs.readFileSync(wasmPath))].join(" ");
+		const probe = new Uint8Array([1, 2, 3]);
+		if ((await sj.rewriteKey("probe", probe)) === sha(tag + "\nprobe\n" + sha(probe))) buildTag = tag;
+	} catch {}
+	parentPort.postMessage({ buildTag, stamp });
+}
+try {
+	load();
+	postBuildTag();
+} catch {}
 parentPort.on("message", async ({ id, header, js }) => {
 	let reloaded = false;
 	try {
 		reloaded = load();
+		if (reloaded) await postBuildTag();
 		const sj = globalThis.$scramjet;
 		const h = JSON.parse(header);
 		if (!Number.isInteger(h.prefixLength) || h.prefixLength < 2 || h.prefixLength > 1024)
@@ -1287,9 +1309,12 @@ type RewriteJob = {
 class RewritePool {
 	private idle: Worker[] = [];
 	private queue: RewriteJob[] = [];
-	// the hints (client keys) of jobs queued or running, so a script sent twice is rewritten once
-	private hints = new Set<string>();
+	// the hints (client keys) of jobs queued or running, so a script sent twice is rewritten once,
+	// and who else waits for each
+	private hints = new Map<string, NonNullable<RewriteJob["done"]>[]>();
 	private running = new Map<Worker, RewriteJob>();
+	/** what the threads' rewriteKey hashes besides header and script, once one has said */
+	buildTag: string | null = null;
 
 	constructor(size: number) {
 		for (let i = 0; i < size; i++) {
@@ -1302,8 +1327,7 @@ class RewritePool {
 			worker.on("error", (e) => {
 				console.warn("[relay] rewrite worker failed:", e);
 				const job = this.running.get(worker);
-				if (job) this.hints.delete(job.hint);
-				job?.done?.(null);
+				if (job) this.finish(job, null);
 				this.running.delete(worker);
 			});
 			this.idle.push(worker);
@@ -1311,9 +1335,13 @@ class RewritePool {
 	}
 
 	submit(job: RewriteJob) {
-		if (this.hints.has(job.hint) || (!job.first && this.queue.length >= 32))
-			return job.done?.(null);
-		this.hints.add(job.hint);
+		const waiting = this.hints.get(job.hint);
+		if (waiting) {
+			if (job.done) waiting.push(job.done);
+			return;
+		}
+		if (!job.first && this.queue.length >= 32) return job.done?.(null);
+		this.hints.set(job.hint, []);
 		if (job.first) this.queue.unshift(job);
 		else this.queue.push(job);
 		this.pump();
@@ -1328,10 +1356,20 @@ class RewritePool {
 		}
 	}
 
+	private finish(job: RewriteJob, result: { key: string; entry: RewriteEntry } | null) {
+		const waiting = this.hints.get(job.hint) ?? [];
+		this.hints.delete(job.hint);
+		job.done?.(result);
+		for (const done of waiting) done(result);
+	}
+
 	private done(worker: Worker, m: any) {
+		if ("buildTag" in m) {
+			this.buildTag = m.buildTag;
+			return;
+		}
 		const job = this.running.get(worker);
 		this.running.delete(worker);
-		if (job) this.hints.delete(job.hint);
 		// a rebuilt scramjet makes different keys and output: what's kept was made by the old one
 		if (m.reloaded) {
 			rewriteCache.clear();
@@ -1349,13 +1387,13 @@ class RewritePool {
 				if (variant) twinWorker!.add(m.key, job.header, job.input!, m.entry, m.stamp);
 				addTwin(job.header, m.length, m.edges, variant ? m.key : undefined);
 			}
-			job?.done?.({ key: m.key, entry: m.entry });
+			if (job) this.finish(job, { key: m.key, entry: m.entry });
 			if (LOG)
 				console.log(
 					`[relay] rewrite cache stored ${m.key.slice(0, 12)} (${Math.round(m.entry.js.byteLength / 1024)}KB${job?.first ? ", speculative" : m.key === job?.hint ? "" : ", client key differs"})`
 				);
 		} else {
-			job?.done?.(null);
+			if (job) this.finish(job, null);
 			if (LOG)
 				console.log(`[relay] rewrite not kept: ${m.error ?? "parse errors or prefix in the script"}`);
 		}
@@ -1399,6 +1437,68 @@ function rewritePut(msg: any, body: Buffer) {
 	getRewritePool()?.submit({ header: msg.header, js, hint: msg.key });
 }
 
+// ---- scripts sent rewritten ----
+// A client that has the relay's rewrite cache sends its rewrite-cache header with each script
+// request (RelayTransport's `rewrite`). For a big enough script, the relay then answers with the
+// rewrite instead of the script: from its cache, from a speculative rewrite of it, or rewritten
+// now, by the rewrite threads. The browser skips hashing the script, asking for its rewrite and
+// getting both (YouTube's 10 MB bundle: ~85 ms of hashing, ~100 ms of round trip, the 10 MB).
+const PREREWRITE_MIN_BYTES = 64 * 1024;
+// a module the client wouldn't rewrite (core's body.ts: not a JavaScript MIME type) must not come
+// rewritten, so only these
+const MODULE_TYPE = /^\s*(?:text|application)\/javascript\s*(?:;|$)/i;
+const sha256 = (x: string | Uint8Array) => crypto.createHash("sha256").update(x).digest("hex");
+
+// the rewrite of a script response under the client's header, or null to send the script as is
+async function prerewrite(
+	url: string,
+	r: PrefetchedResponse,
+	rwHeader: string
+): Promise<{ key: string; entry: RewriteEntry } | null> {
+	if (
+		r.status !== 200 ||
+		r.body.byteLength < PREREWRITE_MIN_BYTES ||
+		r.body.byteLength > MAX_REWRITE_INPUT ||
+		rwHeader.length > 64 * 1024
+	)
+		return null;
+	let h: any;
+	try {
+		h = JSON.parse(rwHeader);
+	} catch {
+		return null;
+	}
+	// the header names the script it's for
+	if (h.source !== url) return null;
+	if (h.isModule) {
+		// the client reads every Content-Type joined, so only a lone one is certain
+		const types = r.headers.filter(([k]) => k.toLowerCase() === "content-type");
+		if (types.length !== 1 || !MODULE_TYPE.test(types[0][1])) return null;
+	}
+	const pool = getRewritePool();
+	if (!pool?.buildTag) return null;
+	// rewriteKey's, as the threads compute it
+	const key = sha256(pool.buildTag + "\n" + rwHeader + "\n" + sha256(r.body));
+	const hit = rewriteCacheGet(key);
+	if (hit) return { key, entry: hit };
+	const pending = speculated.get(url);
+	if (pending) {
+		const done = await pending;
+		if (done?.key === key) return done;
+	}
+	return new Promise((resolve) =>
+		pool.submit({
+			header: rwHeader,
+			js: r.body.buffer.slice(r.body.byteOffset, r.body.byteOffset + r.body.byteLength) as ArrayBuffer,
+			// the key, as rwput's: the same script sent by a client to rewrite is rewritten once
+			hint: key,
+			first: true,
+			// a key of its own would be a build the tag isn't for
+			done: (done) => resolve(done?.key === key ? done : null),
+		})
+	);
+}
+
 function handleMuxSocket(ws: WebSocket) {
 	const session = new RelaySession();
 	const live = new Map<number, AbortController>();
@@ -1430,6 +1530,41 @@ function handleMuxSocket(ws: WebSocket) {
 		if (ws.readyState === WebSocket.OPEN) ws.send(frame);
 	};
 
+	// a script, rewritten under the client's header if it can be (see prerewrite)
+	const sendScript = async (msg: any, r: PrefetchedResponse, header: string) => {
+		const started = performance.now();
+		const done = await prerewrite(msg.url, r, header).catch(() => null);
+		if (!done) return sendResponse(msg, r);
+		const { entry } = done;
+		const head = Buffer.from(
+			JSON.stringify({
+				status: r.status,
+				statusText: r.statusText,
+				headers: r.headers,
+				rewritten: { tag: entry.tag, offsets: entry.offsets, jsLength: entry.js.byteLength },
+			})
+		);
+		const mapLength = entry.map?.byteLength ?? 0;
+		if (!msg.whole) {
+			sendJson({ t: "head", id: msg.id, ...JSON.parse(head.toString()) });
+			sendChunk(msg.id, entry.js);
+			if (entry.map) sendChunk(msg.id, entry.map);
+			sendJson({ t: "end", id: msg.id });
+		} else {
+			const frame = Buffer.allocUnsafe(8 + head.byteLength + entry.js.byteLength + mapLength);
+			frame.writeUInt32LE((msg.id | WHOLE) >>> 0, 0);
+			frame.writeUInt32LE(head.byteLength, 4);
+			frame.set(head, 8);
+			frame.set(entry.js, 8 + head.byteLength);
+			if (entry.map) frame.set(entry.map, 8 + head.byteLength + entry.js.byteLength);
+			if (ws.readyState === WebSocket.OPEN) ws.send(frame);
+		}
+		if (LOG)
+			console.log(
+				`[relay] sent rewritten (${Math.round(entry.js.byteLength / 1024)}KB, ${Math.round(performance.now() - started)}ms) ${msg.url.slice(0, 100)}`
+			);
+	};
+
 	const sendRewrite = (id: number, entry: RewriteEntry) => {
 		sendJson({ t: "rwhit", id, tag: entry.tag, offsets: entry.offsets, jsLength: entry.js.byteLength });
 		const frame = Buffer.allocUnsafe(4 + entry.js.byteLength + (entry.map?.byteLength ?? 0));
@@ -1446,6 +1581,9 @@ function handleMuxSocket(ws: WebSocket) {
 		try {
 			const headers: RawHeaders = msg.headers;
 			const dest = header(headers, "sec-fetch-dest").toLowerCase();
+			// the client's rewrite-cache header for this script, if it takes it rewritten
+			const rewrite: string | null =
+				typeof msg.rewrite === "string" && msg.method === "GET" ? msg.rewrite : null;
 			if (dest === "document" || dest === "iframe") {
 				try {
 					for (const origin of learnedOrigins.get(new URL(msg.url).origin) ?? [])
@@ -1460,9 +1598,10 @@ function handleMuxSocket(ws: WebSocket) {
 				const hit = cacheLookup(msg.url, msg.method, headers);
 				if (hit) {
 					const r = fromCache(hit);
-					sendResponse(msg, r);
-					if (r.status === 200 && isScript(dest, header(r.headers, "content-type")))
-						speculate(msg.url, r.body, header(headers, "referer"));
+					const big = r.status === 200 && isScript(dest, header(r.headers, "content-type"));
+					if (big) speculate(msg.url, r.body, header(headers, "referer"));
+					if (rewrite) await sendScript(msg, r, rewrite);
+					else sendResponse(msg, r);
 					return;
 				}
 			}
@@ -1472,7 +1611,8 @@ function handleMuxSocket(ws: WebSocket) {
 			if (pre) {
 				const r = await pre.entry.promise.catch(() => null);
 				if (r && (pre.sameCookies || shareable(r))) {
-					sendResponse(msg, r);
+					if (rewrite) await sendScript(msg, r, rewrite);
+					else sendResponse(msg, r);
 					return;
 				}
 			}
@@ -1495,7 +1635,10 @@ function handleMuxSocket(ws: WebSocket) {
 			});
 			const raw: RawHeaders = [];
 			for (const [k, v] of r.headers) if (!DROP.has(k)) raw.push([k, v]);
-			sendJson({ t: "head", id: msg.id, status: r.status, statusText: r.statusText, headers: raw });
+			// a script that may go rewritten waits for its whole body, and its rewrite
+			const buffered = !!rewrite && r.status === 200;
+			if (!buffered)
+				sendJson({ t: "head", id: msg.id, status: r.status, statusText: r.statusText, headers: raw });
 			const headAt = performance.now();
 
 			const scanner =
@@ -1520,12 +1663,12 @@ function handleMuxSocket(ws: WebSocket) {
 			const chunks: Uint8Array[] = [];
 			if (r.body) {
 				for await (const chunk of r.body) {
-					sendChunk(msg.id, chunk);
-					if (keep || script) chunks.push(chunk);
+					if (!buffered) sendChunk(msg.id, chunk);
+					if (keep || script || buffered) chunks.push(chunk);
 					if (scanner) scanner.write(decoder!.decode(chunk, { stream: true }));
 				}
 			}
-			const whole = keep || script ? Buffer.concat(chunks) : null;
+			const whole = keep || script || buffered ? Buffer.concat(chunks) : null;
 			scanner?.end();
 			if (LOG)
 				console.log(
@@ -1538,8 +1681,10 @@ function handleMuxSocket(ws: WebSocket) {
 					headers: raw,
 					body: whole!,
 				});
-			sendJson({ t: "end", id: msg.id });
 			if (script) speculate(msg.url, whole!, header(headers, "referer"));
+			if (buffered)
+				await sendScript(msg, { status: r.status, statusText: r.statusText, headers: raw, body: whole as Buffer }, rewrite!);
+			else sendJson({ t: "end", id: msg.id });
 		} catch (e: any) {
 			sendJson({ t: "err", id: msg.id, error: String(e?.cause ?? e) });
 		} finally {

@@ -12,7 +12,8 @@ import {
 } from ".";
 import { rewriteUrl, unrewriteBlob, unrewriteUrl } from "@rewriters/url";
 import { QP, parseRequest } from "./parse";
-import { ScramjetHeaders } from "@/shared";
+import { ScramjetHeaders, flagEnabled } from "@/shared";
+import { REWRITE_HEADER, rewriteCacheHeader } from "@rewriters/js";
 import { isDocument, isRedirect, normalizeContentType } from "./util";
 import { rewriteBody } from "./body";
 import { Tap } from "@/Tap";
@@ -23,7 +24,7 @@ import {
 	rewriteResponseHeaders,
 	worstFetchSite,
 } from "./headers";
-import { _URL } from "@/shared/snapshot";
+import { Array_isArray, _URL } from "@/shared/snapshot";
 
 export async function doHandleFetch(
 	handler: ScramjetFetchHandler,
@@ -267,6 +268,21 @@ export async function doNetworkFetch(
 			earlyResponse = BareResponse.fromNativeResponse(resp);
 		}
 	} else {
+		// a script's rewrite-cache header, for a transport whose server can rewrite it (see
+		// REWRITE_HEADER); rewriteBody rewrites it under the same header
+		const headers = reqprops.init.headers;
+		if (
+			parsed.destination === "script" &&
+			request.method === "GET" &&
+			Array_isArray(headers) &&
+			flagEnabled("rewriteCache", handler.context, parsed.meta.base)
+		)
+			(headers as any)[REWRITE_HEADER] = rewriteCacheHeader(
+				new _URL(reqprops.url).href,
+				handler.context,
+				parsed.meta,
+				parsed.isModule
+			);
 		earlyResponse = await handler.client.fetch(reqprops.url, reqprops.init);
 	}
 

@@ -1,5 +1,10 @@
 import { BareResponse } from "@mercuryworkshop/proxy-transports";
 import {
+	REWRITTEN,
+	finishServerRewrite,
+	type ServerRewrite,
+} from "@rewriters/js";
+import {
 	BodyType,
 	ScramjetFetchHandler,
 	ScramjetFetchParsed,
@@ -76,13 +81,24 @@ export async function rewriteBody(
 					return response.body;
 				}
 
-				let rewritten = await rewriteJsCached(
-					new Uint8Array(await response.arrayBuffer()),
-					response.url,
-					handler.context,
-					parsed.meta,
-					parsed.isModule
-				);
+				// the transport's server sent it rewritten (see REWRITE_HEADER)
+				const server: ServerRewrite | undefined = (response.rawHeaders as any)?.[
+					REWRITTEN
+				];
+				let rewritten = server
+					? finishServerRewrite(
+							new Uint8Array(await response.arrayBuffer()),
+							server,
+							handler.context,
+							parsed.meta
+						)
+					: await rewriteJsCached(
+							new Uint8Array(await response.arrayBuffer()),
+							response.url,
+							handler.context,
+							parsed.meta,
+							parsed.isModule
+						);
 
 				if (
 					flagEnabled("debugSourceURL", handler.context, parsed.meta.origin)

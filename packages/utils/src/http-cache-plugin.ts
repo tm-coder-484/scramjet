@@ -429,6 +429,10 @@ export class HttpCachePlugin extends ManagedPlugin {
 
 			if ((req.cache as string) === "no-store") return;
 			if (!isCacheableMethod(req.method)) return;
+			// a script the transport's server sent rewritten (scramjet's REWRITTEN): its body isn't
+			// the site's, and rebuilding the response would lose the mark that says so
+			if ((props.response.rawHeaders as any)?.[Symbol.for("scramjet rewritten")])
+				return;
 
 			const headers = nativeHeadersFromRaw(props.response.rawHeaders);
 			if (!responseIsStorable(props.response.status, headers, req.method))

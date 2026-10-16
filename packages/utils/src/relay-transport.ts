@@ -33,6 +33,18 @@ export type RelayTransportOptions = {
 // devrelay.ts)
 const WHOLE = 0x80000000;
 const headDecoder = new TextDecoder();
+// scramjet's REWRITE_HEADER and REWRITTEN: a script request's rewrite-cache header, which the relay
+// may answer with the script rewritten under it, and the details of that rewrite on the response
+const REWRITE_HEADER = Symbol.for("scramjet rewrite header");
+const REWRITTEN = Symbol.for("scramjet rewritten");
+
+// the response's headers, marked with the relay's rewrite if it sent one (a field of its own
+// message, never a header, so a site can't fake it)
+function markRewrite(headers: any, rewritten: unknown) {
+	if (rewritten && typeof rewritten === "object" && headers && typeof headers === "object")
+		headers[REWRITTEN] = rewritten;
+	return headers;
+}
 
 type Pending = {
 	resolve: (r: TransferrableResponse) => void;
@@ -96,7 +108,7 @@ export class RelayTransport implements ProxyTransport {
 				});
 				s.resolve({
 					body,
-					headers: msg.headers,
+					headers: markRewrite(msg.headers, msg.rewritten),
 					status: msg.status,
 					statusText: msg.statusText,
 				});
@@ -141,7 +153,7 @@ export class RelayTransport implements ProxyTransport {
 					c.close();
 				},
 			}),
-			headers: head.headers,
+			headers: markRewrite(head.headers, head.rewritten),
 			status: head.status,
 			statusText: head.statusText,
 		});
@@ -178,6 +190,11 @@ export class RelayTransport implements ProxyTransport {
 				prefetch: !!this.options.prefetch,
 				cache: !!this.options.cache,
 				whole: true,
+				// with the shared rewrite cache, the relay may send a script rewritten
+				rewrite:
+					this.options.rewriteCache && typeof (headers as any)[REWRITE_HEADER] === "string"
+						? (headers as any)[REWRITE_HEADER]
+						: undefined,
 			})
 		);
 		if (bytes) {

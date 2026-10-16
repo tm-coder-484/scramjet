@@ -13,7 +13,9 @@ import {
 	storeRewrite,
 } from "./jscache";
 import {
+	Error,
 	JSON_stringify,
+	Symbol_for,
 	SyntaxError,
 	TextDecoder_decode,
 	TextEncoder_encode,
@@ -292,6 +294,67 @@ const MIN_OFFLOAD_BYTES = 4 * 1024;
 // already (see RemoteRewriteCache.get)
 const MIN_SPECULATED_BYTES = 1024 * 1024;
 
+// everything the rewriter output for a script depends on, except the prefix bytes and the script
+// itself: the rewrite cache's header (see rewriteKey)
+export function rewriteCacheHeader(
+	url: string | null,
+	context: ScramjetContext,
+	meta: URLMeta,
+	isModule: boolean
+): string {
+	return JSON_stringify({
+		globals: context.config.globals,
+		flags: rewriterFlags(context, meta.base),
+		prefixLength: TextEncoder_encode(context.prefix.pathname).length,
+		base: meta.base.href,
+		source: url || "(unknown)",
+		isModule,
+		// the cache is partitioned per requesting site
+		origin: meta.origin.origin,
+		// static import urls are tagged with it
+		initiator: initiatorOrigin(meta),
+		codec: `${context.interface.codecEncode}`,
+	});
+}
+
+// A transport that can have its server rewrite scripts (RelayTransport with devrelay.ts) answers
+// a script request with the rewritten script itself, when it has it or can make it: the browser
+// then neither hashes the script, nor looks it up, nor gets its bytes twice (YouTube's 10 MB
+// bundle: ~250 ms). The request carries its rewrite-cache header under REWRITE_HEADER on its raw
+// headers array, and such a response the rewrite's details under REWRITTEN on its rawHeaders.
+// Symbols, since a site's own headers are strings: no response header can claim a rewrite.
+export const REWRITE_HEADER = Symbol_for("scramjet rewrite header");
+export const REWRITTEN = Symbol_for("scramjet rewritten");
+
+/** the details of a script the transport's server rewrote: the body is js then map */
+export type ServerRewrite = {
+	tag: string;
+	// byte offsets in js where the prefix goes (a placeholder of the same length is there)
+	offsets: number[];
+	jsLength: number;
+};
+
+/** a script the transport's server rewrote under `header`, ready to run (see REWRITTEN) */
+export function finishServerRewrite(
+	body: Uint8Array,
+	rewrite: ServerRewrite,
+	context: ScramjetContext,
+	meta: URLMeta
+): string | Uint8Array {
+	const prefix = TextEncoder_encode(context.prefix.pathname);
+	const { jsLength, offsets } = rewrite;
+	if (!(jsLength >= 0 && jsLength <= body.byteLength))
+		throw new Error("bad server rewrite");
+	const js = body.subarray(0, jsLength);
+	for (const offset of offsets) {
+		if (!(offset >= 0 && offset + prefix.length <= jsLength))
+			throw new Error("bad server rewrite");
+		js.set(prefix, offset);
+	}
+	const map = body.byteLength > jsLength ? body.subarray(jsLength) : null;
+	return finishRewrite({ js, map, tag: rewrite.tag, errors: [] }, context, meta);
+}
+
 /**
  * The rewriter output for a script body, from the cache (see jscache.ts) when it has it, and
  * stored there when it didn't. Throws if the rewrite fails; a failed rewrite is never cached.
@@ -307,21 +370,7 @@ export async function rewriteJsWithCache(
 	const base = meta.base;
 	const source = url || "(unknown)";
 	const prefix = TextEncoder_encode(context.prefix.pathname);
-
-	// everything the rewriter output depends on, except the prefix bytes and the script
-	const header = JSON_stringify({
-		globals: context.config.globals,
-		flags: rewriterFlags(context, base),
-		prefixLength: prefix.length,
-		base: base.href,
-		source,
-		isModule,
-		// the cache is partitioned per requesting site
-		origin: meta.origin.origin,
-		// static import urls are tagged with it
-		initiator: initiatorOrigin(meta),
-		codec: `${context.interface.codecEncode}`,
-	});
+	const header = rewriteCacheHeader(url, context, meta, isModule);
 
 	// a fresh page opens the database while the script is hashed, not after
 	openDb();
