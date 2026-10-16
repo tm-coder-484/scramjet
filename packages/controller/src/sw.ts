@@ -315,6 +315,8 @@ export async function route(event: FetchEvent): Promise<Response> {
 				: undefined
 		);
 
+		if (response.networkError) return Response.error();
+
 		return new Response(
 			response.bodyPort ? receiveBody(response.bodyPort) : response.body,
 			{

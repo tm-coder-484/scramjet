@@ -28,6 +28,11 @@ export type TransferResponse = {
 	body: BodyType;
 	/** when set, the body streams over this port instead (see bodystream.ts) */
 	bodyPort?: MessagePort;
+	/**
+	 * the request fails with a network error, as the browser would fail it (a CORS preflight the
+	 * server didn't allow): the page's fetch() rejects, its XHR errors
+	 */
+	networkError?: boolean;
 	headers: RawHeaders;
 	status: number;
 	statusText: string;

@@ -16,6 +16,7 @@ import { ScramjetHeaders, flagEnabled } from "@/shared";
 import { REWRITE_HEADER, rewriteCacheHeader } from "@rewriters/js";
 import { isDocument, isRedirect, normalizeContentType } from "./util";
 import { rewriteBody } from "./body";
+import { corsPreflight } from "./cors";
 import { Tap } from "@/Tap";
 import {
 	computeFetchSite,
@@ -65,6 +66,8 @@ export async function doHandleFetch(
 	}
 
 	const newheaders = rewriteRequestHeaders(request, handler, parsed);
+	if (flagEnabled("corsPreflight", handler.context, parsed.meta.base))
+		await corsPreflight(handler, request, parsed, newheaders);
 
 	let responseBody: BodyType;
 	const response = await doNetworkFetch(handler, request, parsed, newheaders);

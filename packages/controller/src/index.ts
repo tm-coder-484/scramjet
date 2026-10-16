@@ -451,6 +451,17 @@ export class Controller {
 				if (reqprops.setResponse) {
 					return [reqprops.setResponse, []];
 				}
+				if ((e as Error)?.name === "NetworkError")
+					return [
+						{
+							body: null as unknown as BodyType,
+							networkError: true,
+							status: 0,
+							statusText: "",
+							headers: [],
+						},
+						[],
+					];
 				throw e;
 			}
 		},

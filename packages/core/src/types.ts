@@ -31,6 +31,8 @@ export type ScramjetFlags = {
 	viewTransitions: boolean;
 	rewriteCache: boolean;
 	renderBlocking: boolean;
+	/** send the CORS preflights a browser would, and fail the requests they don't allow */
+	corsPreflight: boolean;
 };
 
 export interface ScramjetConfig {

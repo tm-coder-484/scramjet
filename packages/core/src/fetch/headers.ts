@@ -373,7 +373,7 @@ function requestIncludesCredentials(
  *      or implausible (e.g. "same-origin" / "navigate" leaking in from a
  *      proxy-URL computation).
  */
-function computeFetchMode(
+export function computeFetchMode(
 	request: ScramjetFetchRequest,
 	parsed: ScramjetFetchParsed
 ): string {
