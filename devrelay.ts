@@ -1231,6 +1231,9 @@ async function runTwinWorker() {
 	parentPort!.on("message", async (m) => {
 		if (m.t === "clear") return kept.clear();
 		if (m.t === "add") {
+			// a script this thread patched is kept with its literals already: finding them again
+			// (~1.5 s of CPU) would hold up the next twin's patch
+			if (kept.has(m.key)) return;
 			const input = Buffer.from(m.input.buffer, m.input.byteOffset, m.input.byteLength);
 			let isModule = false;
 			try {
@@ -1443,7 +1446,9 @@ class RewritePool {
 				// patched from it, so the twins thread gets its own copy (a script seen in one version
 				// only is never patched from)
 				const variant = !!job.input && !!twinWorker && job.hint.startsWith("speculative ");
-				if (variant) twinWorker!.add(m.key, job.header, job.input!, m.entry, m.stamp);
+				// unless the twins thread has it already: patched there, as it is when the patch beat this
+				if (variant && !twinWorker!.ready(m.key))
+					twinWorker!.add(m.key, job.header, job.input!, m.entry, m.stamp);
 				addTwin(job.header, m.length, m.edges, variant ? m.key : undefined);
 			}
 			if (job) this.finish(job, { key: m.key, entry: m.entry });
@@ -1507,6 +1512,13 @@ const PREREWRITE_MIN_BYTES = 64 * 1024;
 // rewritten, so only these
 const MODULE_TYPE = /^\s*(?:text|application)\/javascript\s*(?:;|$)/i;
 const sha256 = (x: string | Uint8Array) => crypto.createHash("sha256").update(x).digest("hex");
+// a cached response's body is the same Buffer on every hit: its hash is taken once (~25 ms for 10 MB)
+const bodyHashes = new WeakMap<Uint8Array, string>();
+function bodyHash(body: Uint8Array) {
+	let hash = bodyHashes.get(body);
+	if (hash === undefined) bodyHashes.set(body, (hash = sha256(body)));
+	return hash;
+}
 
 // the rewrite of a script response under the client's header, or null to send the script as is
 async function prerewrite(
@@ -1537,7 +1549,7 @@ async function prerewrite(
 	const pool = getRewritePool();
 	if (!pool?.buildTag) return null;
 	// rewriteKey's, as the threads compute it
-	const key = sha256(pool.buildTag + "\n" + rwHeader + "\n" + sha256(r.body));
+	const key = sha256(pool.buildTag + "\n" + rwHeader + "\n" + bodyHash(r.body));
 	const hit = rewriteCacheGet(key);
 	if (hit) return { key, entry: hit };
 	const pending = speculated.get(url);
