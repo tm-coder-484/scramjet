@@ -63,6 +63,8 @@ export interface ScramjetFetchParsed {
 	isFakeDataURL: boolean;
 	// set when the request came from an <a download> link: the value of its download attribute
 	downloadName?: string;
+	// the request is an EventSource's (the page's request headers then include the browser's own)
+	isEventSource?: boolean;
 	referrerPolicy?: string;
 	trackedClient?: ScramjetFetchTrackedClient;
 }

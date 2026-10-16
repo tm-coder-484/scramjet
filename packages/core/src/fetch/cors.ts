@@ -142,8 +142,9 @@ function allows(
 		return false;
 	for (const name of names) {
 		if (entry.headers.includes(name)) continue;
-		// a `*` never covers Authorization
-		if (entry.anyHeader && name !== "authorization") continue;
+		// Fetch says a `*` doesn't cover Authorization, but Chromium lets it (it only warns), and
+		// sites rely on that: an API answering `*` to a request with a bearer token
+		if (entry.anyHeader) continue;
 		return false;
 	}
 	return true;
@@ -172,6 +173,9 @@ export async function corsPreflight(
 ): Promise<void> {
 	// only the requests a page makes with fetch(), XHR and the like: an element's never needs one
 	if (parsed.destination !== "") return;
+	// nor an EventSource's: its Cache-Control and Last-Event-ID are the browser's, and Chromium
+	// never preflights one
+	if (parsed.isEventSource) return;
 	if (computeFetchMode(request, parsed) !== "cors") return;
 	const origin = headers.get("origin");
 	if (!origin || origin === parsed.url.origin) return;

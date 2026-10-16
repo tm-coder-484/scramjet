@@ -5,7 +5,9 @@ export default function (client: ScramjetClient) {
 	client.Proxy("EventSource", {
 		construct(ctx) {
 			const url = String(ctx.args[0]);
-			ctx.args[0] = client.rewriteUrl(url);
+			// marked, so the service worker can tell the browser's own headers on it (Cache-Control,
+			// Last-Event-ID) from ones a page set (see fetch/cors.ts)
+			ctx.args[0] = client.rewriteUrl(url, { eventSource: true });
 		},
 	});
 

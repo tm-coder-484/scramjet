@@ -109,6 +109,8 @@ function corsPreflightTest(props: {
 	page: string;
 	/** the target's answer to OPTIONS (default: 204, allowing the page's origin) */
 	preflight?: (origin: string) => Preflight;
+	/** the target's answer to the request itself (default: text/plain "ok") */
+	response?: { contentType: string; body: string };
 	check: Check;
 }): Test {
 	let sourceServer: http.Server | undefined;
@@ -146,9 +148,9 @@ function corsPreflightTest(props: {
 		}
 		res.writeHead(200, {
 			"Access-Control-Allow-Origin": origin(),
-			"Content-Type": "text/plain",
+			"Content-Type": props.response?.contentType ?? "text/plain",
 		});
-		res.end("ok");
+		res.end(props.response?.body ?? "ok");
 	};
 
 	const clearCookie = props.cookie
@@ -369,6 +371,50 @@ export default [
 			expectSequence(seen, "GET") ??
 			headerProblem(seen[0], "x-custom", "1") ??
 			okProblem(outcome),
+	}),
+
+	corsPreflightTest({
+		name: "cors-preflight-wildcard-covers-authorization",
+		// Fetch says a `*` in Access-Control-Allow-Headers doesn't cover Authorization; Chromium
+		// lets it, and APIs that take bearer tokens rely on that
+		page: `
+			const res = await fetch(target("/inspect"), { headers: { Authorization: "Bearer runway" } });
+			return { ok: res.ok, status: res.status };
+		`,
+		preflight: () => ({
+			status: 204,
+			headers: {
+				"Access-Control-Allow-Origin": "*",
+				"Access-Control-Allow-Headers": "*",
+			},
+		}),
+		check: ({ seen, outcome, origin }) =>
+			expectSequence(seen, "OPTIONS,GET") ??
+			preflightProblem(seen[0], origin, "GET", "authorization") ??
+			headerProblem(seen[1], "authorization", "Bearer runway") ??
+			okProblem(outcome),
+	}),
+
+	corsPreflightTest({
+		name: "cors-preflight-eventsource-skipped",
+		// an EventSource's request carries the browser's own Cache-Control (and Last-Event-ID when
+		// it reconnects), which aren't the page's and never make it ask
+		page: `
+			return await new Promise((resolve) => {
+				const es = new EventSource(target("/inspect"));
+				es.onmessage = (e) => { es.close(); resolve({ message: e.data }); };
+				es.onerror = () => { es.close(); resolve({ error: true }); };
+			});
+		`,
+		// a server that doesn't answer preflights at all, as many event-stream endpoints don't
+		preflight: () => ({ status: 405, headers: {} }),
+		response: { contentType: "text/event-stream", body: "data: hi\n\n" },
+		check: ({ seen, outcome }) =>
+			expectSequence(seen, "GET") ??
+			headerProblem(seen[0], "accept", "text/event-stream") ??
+			(outcome.message === "hi"
+				? undefined
+				: `the EventSource got ${JSON.stringify(outcome)}, expected the message "hi"`),
 	}),
 
 	corsPreflightTest({

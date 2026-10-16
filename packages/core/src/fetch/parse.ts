@@ -22,6 +22,7 @@ export const QP = {
 	crossSiteRedirect: "$csr",
 	fakeDataURL: "$fakedataurl",
 	download: "$dl",
+	eventSource: "$es",
 } as const;
 
 export type QueryParamKey = keyof typeof QP;
@@ -146,6 +147,7 @@ export function parseRequest(
 		isIframe: params.isIframe === "1",
 		isFakeDataURL: params.fakeDataURL === "1",
 		downloadName: params.download,
+		isEventSource: params.eventSource === "1",
 	};
 
 	if (request.rawClientUrl) {

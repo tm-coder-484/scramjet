@@ -30,6 +30,8 @@ export type RewriteUrlOptions = {
 	destination?: RequestDestination;
 	// the download attribute of the <a> this url is for
 	download?: string;
+	// the url is an EventSource's
+	eventSource?: boolean;
 };
 
 export type URLMeta = {
@@ -340,6 +342,7 @@ function rewriteQuery(
 	if (options?.credentials) add(QP.credentials, options.credentials);
 	if (options?.destination) add(QP.destination, options.destination);
 	if (options?.download !== undefined) add(QP.download, options.download);
+	if (options?.eventSource) add(QP.eventSource, "1");
 	if (initiatorOrigin) add(QP.initiatorOrigin, initiatorOrigin);
 
 	const query = params.length ? "?" + params.join("&") : "";
