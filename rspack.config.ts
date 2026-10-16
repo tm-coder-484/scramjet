@@ -299,7 +299,7 @@ const createGenericConfig = (options: Partial<RspackOptions>) => {
 				},
 			},
 		},
-		plugin: [rsDoctorPlugin],
+		plugins: [rsDoctorPlugin],
 		optimization: {
 			minimizer: [
 				new rspack.SwcJsMinimizerRspackPlugin({

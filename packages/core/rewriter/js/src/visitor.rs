@@ -660,7 +660,8 @@ where
 		if let Some(source) = &it.source {
 			self.rewrite_url(source, true);
 		}
-		// the initializer of `export const x = <expr>` is ordinary code (import.meta, location, ...)
+		// the declaration body is normal code and must be rewritten, we just can't touch the
+		// specifiers below since those are binding names, not references
 		if let Some(declaration) = &it.declaration {
 			self.visit_declaration(declaration);
 		}
