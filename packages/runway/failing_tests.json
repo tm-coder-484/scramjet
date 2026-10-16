@@ -62,6 +62,7 @@
 		"pmwrap-getter-invocation-count",
 		"pmwrap-identity",
 		"pmwrap-prototype-method",
+		"referer-document-referrer-is-not-current-location",
 		"serialization-xmlserializer-live",
 		"serialization-xmlserializer-parsed-and-svg",
 		"storage-event-child-frame",
