@@ -15,6 +15,11 @@
 //                     text   {t:"end", id}
 //                     or, for a response the relay has whole (cache, prefetch) and a req with whole:true,
 //                     binary [u32 id | WHOLE][u32 n][n bytes: {status, statusText, headers}][body]
+//                     or, when that body is big and the req had bulk:true,
+//                     text   {t:"bulk", id, status, statusText, headers, token}: the client GETs the
+//                            body from http(s)://<host>/relay/body/<token>, once (see putBulk)
+//   client -> server  text   {t:"bulkpull", id, token}: that GET failed, send the body here instead
+//                            (as chunks and an end)
 //   a script req's `rewrite` is its rewrite-cache header (see rewriteKey): the relay may answer it
 //   with the script rewritten under it (see sendScript), its head then holding
 //   rewritten: {tag, offsets, jsLength} and its body the rewrite's js then map
@@ -50,6 +55,60 @@ const REQUEST_DROP = new Set(["host", "connection", "content-length"]);
 const LOG = !!process.env.RELAY_LOG;
 // the high bit of a binary frame's id: the frame is a whole response (see the protocol above)
 const WHOLE = 0x80000000;
+
+// Bodies of this many bytes or more go over plain HTTP (see putBulk): a websocket delivers its
+// messages one after another, so a page's small responses waited behind its big scripts and
+// stylesheets (GitHub's front page sends ~10 MB of them: its other responses waited ~130 ms for
+// the socket), and the browser takes an HTTP body much faster than websocket messages.
+const BULK_MIN = 32 * 1024;
+// a body the client hasn't fetched by then is dropped (the request was aborted, say)
+const BULK_TTL = 60_000;
+const bulkBodies = new Map<string, { parts: Uint8Array[]; timer: NodeJS.Timeout }>();
+
+// keeps a body for the client to fetch once from /relay/body/<token>, and returns the token
+function putBulk(parts: Uint8Array[]): string {
+	const token = crypto.randomBytes(18).toString("base64url");
+	const timer = setTimeout(() => bulkBodies.delete(token), BULK_TTL);
+	timer.unref();
+	bulkBodies.set(token, { parts, timer });
+	return token;
+}
+
+function takeBulk(token: unknown): Uint8Array[] | null {
+	if (typeof token !== "string") return null;
+	const entry = bulkBodies.get(token);
+	if (!entry) return null;
+	bulkBodies.delete(token);
+	clearTimeout(entry.timer);
+	return entry.parts;
+}
+
+// GET /relay/body/<token>. The token is the only key (it's unguessable, and good for one fetch),
+// so any origin may read it; the page's origin is echoed, with credentials, for a dev server
+// whose port forwarding wants its cookie (a Codespace's private ports)
+function serveBulk(req: http.IncomingMessage, res: http.ServerResponse): boolean {
+	const url = new URL(req.url || "/", "http://relay");
+	if (!url.pathname.startsWith("/relay/body/")) return false;
+	const parts = req.method === "GET" ? takeBulk(url.pathname.slice("/relay/body/".length)) : null;
+	const origin = req.headers.origin;
+	const cors: Record<string, string> = origin
+		? { "access-control-allow-origin": origin, "access-control-allow-credentials": "true", vary: "origin" }
+		: { "access-control-allow-origin": "*" };
+	if (!parts) {
+		res.writeHead(404, cors);
+		res.end();
+		return true;
+	}
+	res.writeHead(200, {
+		...cors,
+		"content-type": "application/octet-stream",
+		"content-length": String(parts.reduce((n, p) => n + p.byteLength, 0)),
+		"cache-control": "no-store",
+	});
+	for (const part of parts) res.write(part);
+	res.end();
+	return true;
+}
 
 // DNS answers are kept for a minute, like Chromium's host cache, and a lookup in flight is shared
 const dnsCache = new Map<string, { expires: number; addresses: dns.LookupAddress[] }>();
@@ -1515,6 +1574,11 @@ function handleMuxSocket(ws: WebSocket) {
 	};
 	// a response the relay already has whole: one message where head, body and end took three
 	const sendResponse = (msg: any, r: PrefetchedResponse) => {
+		if (msg.bulk && r.body.byteLength >= BULK_MIN) {
+			const token = putBulk([r.body]);
+			sendJson({ t: "bulk", id: msg.id, status: r.status, statusText: r.statusText, headers: r.headers, token });
+			return;
+		}
 		if (!msg.whole) {
 			sendJson({ t: "head", id: msg.id, status: r.status, statusText: r.statusText, headers: r.headers });
 			if (r.body.byteLength) sendChunk(msg.id, r.body);
@@ -1545,7 +1609,10 @@ function handleMuxSocket(ws: WebSocket) {
 			})
 		);
 		const mapLength = entry.map?.byteLength ?? 0;
-		if (!msg.whole) {
+		if (msg.bulk && entry.js.byteLength + mapLength >= BULK_MIN) {
+			const token = putBulk(entry.map ? [entry.js, entry.map] : [entry.js]);
+			sendJson({ t: "bulk", id: msg.id, ...JSON.parse(head.toString()), token });
+		} else if (!msg.whole) {
 			sendJson({ t: "head", id: msg.id, ...JSON.parse(head.toString()) });
 			sendChunk(msg.id, entry.js);
 			if (entry.map) sendChunk(msg.id, entry.map);
@@ -1734,6 +1801,11 @@ function handleMuxSocket(ws: WebSocket) {
 			waitingForBody.set(msg.id, msg);
 		} else if (msg.t === "abort") {
 			live.get(msg.id)?.abort();
+		} else if (msg.t === "bulkpull") {
+			const parts = takeBulk(msg.token);
+			if (!parts) return sendJson({ t: "err", id: msg.id, error: "the body is gone" });
+			for (const part of parts) sendChunk(msg.id, part);
+			sendJson({ t: "end", id: msg.id });
 		}
 	});
 	ws.on("close", () => {
@@ -1785,11 +1857,12 @@ function handleWebSocketRelay(client: WebSocket, url: URL) {
 /**
  * Serves the relay on `server` at /relay and /relay/ws. Upgrades for other paths are left to
  * whatever else listens on the server (call this first, and route the rest yourself).
- * Returns a function that handles an upgrade, or returns false when it isn't the relay's.
+ * Returns a function that handles an upgrade, or returns false when it isn't the relay's. Its
+ * `request` handles the relay's HTTP requests (big bodies, at /relay/body/) the same way.
  */
 export function createRelay() {
 	const wss = new WebSocketServer({ noServer: true, perMessageDeflate: false });
-	return (req: http.IncomingMessage, socket: any, head: Buffer): boolean => {
+	const upgrade = (req: http.IncomingMessage, socket: any, head: Buffer): boolean => {
 		const url = new URL(req.url || "/", "http://relay");
 		if (url.pathname === "/relay" || url.pathname === "/relay/") {
 			wss.handleUpgrade(req, socket, head, (ws) => handleMuxSocket(ws));
@@ -1801,6 +1874,7 @@ export function createRelay() {
 		}
 		return false;
 	};
+	return Object.assign(upgrade, { request: serveBulk });
 }
 
 // this module is the twins thread too (see TwinWorker)

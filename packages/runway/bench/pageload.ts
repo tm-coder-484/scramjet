@@ -134,6 +134,7 @@ async function startHost(): Promise<http.Server> {
 	const { createRelay } = await import(path.join(ROOT, "devrelay.ts"));
 	const relay = createRelay();
 	const server = http.createServer((req, res) => {
+		if (relay.request(req, res)) return;
 		const url = new URL(req.url || "/", "http://host");
 		if (url.pathname === "/") {
 			res.writeHead(200, { "content-type": "text/html" });

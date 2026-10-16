@@ -27,6 +27,12 @@ export type RelayTransportOptions = {
 	 * scripts anyone loaded through the relay before (YouTube's 10MB bundle: ~600ms).
 	 */
 	rewriteCache?: boolean;
+	/**
+	 * fetch big response bodies from the relay over plain HTTP (http(s)://<host>/relay/body/...)
+	 * instead of the websocket, so the page's small responses don't wait behind them. On by
+	 * default; if the relay's HTTP endpoint can't be reached, bodies go over the websocket again.
+	 */
+	bulk?: boolean;
 };
 
 // the high bit of a binary frame's id: the frame holds a whole response, head and body (see
@@ -50,6 +56,8 @@ type Pending = {
 	resolve: (r: TransferrableResponse) => void;
 	reject: (e: unknown) => void;
 	controller: ReadableStreamDefaultController<Uint8Array> | null;
+	// a body being fetched over HTTP (see pullBulk)
+	bulk?: AbortController;
 };
 
 /**
@@ -68,8 +76,18 @@ export class RelayTransport implements ProxyTransport {
 	/** the relay's shared rewrite cache, read by the controller's rewriter threads */
 	rewriteCacheUrl?: string;
 
+	// where big bodies are fetched from, while that works (see pullBulk)
+	private bulkUrl: string | null = null;
+
 	constructor(private options: RelayTransportOptions) {
 		if (options.rewriteCache) this.rewriteCacheUrl = options.url;
+		if (options.bulk !== false) {
+			const url = new URL(options.url);
+			url.protocol = url.protocol === "wss:" ? "https:" : "http:";
+			url.pathname = url.pathname.replace(/\/?$/, "/body/");
+			url.search = "";
+			this.bulkUrl = url.href;
+		}
 	}
 
 	async init() {
@@ -112,6 +130,23 @@ export class RelayTransport implements ProxyTransport {
 					status: msg.status,
 					statusText: msg.statusText,
 				});
+			} else if (msg.t === "bulk") {
+				const body = new ReadableStream<Uint8Array>({
+					start: (c) => {
+						s.controller = c;
+					},
+					cancel: () => {
+						this.streams.delete(msg.id);
+						s.bulk?.abort();
+					},
+				});
+				s.resolve({
+					body,
+					headers: markRewrite(msg.headers, msg.rewritten),
+					status: msg.status,
+					statusText: msg.statusText,
+				});
+				this.pullBulk(msg.id, msg.token, s);
 			} else if (msg.t === "end") {
 				this.streams.delete(msg.id);
 				s.controller?.close();
@@ -159,6 +194,42 @@ export class RelayTransport implements ProxyTransport {
 		});
 	}
 
+	// a big body, from the relay's HTTP endpoint. If that fails before any of it came, the relay
+	// sends it over the websocket instead, and so does every big body after it
+	private async pullBulk(id: number, token: string, s: Pending) {
+		const ac = new AbortController();
+		s.bulk = ac;
+		let started = false;
+		try {
+			const r = await fetch(this.bulkUrl + token, {
+				credentials: "include",
+				cache: "no-store",
+				signal: ac.signal,
+			});
+			if (!r.ok || !r.body) throw new Error(`relay body: ${r.status}`);
+			const reader = r.body.getReader();
+			for (;;) {
+				const { done, value } = await reader.read();
+				if (done) break;
+				started = true;
+				s.controller!.enqueue(value);
+			}
+			this.streams.delete(id);
+			s.controller!.close();
+		} catch (e) {
+			// aborted or cancelled
+			if (this.streams.get(id) !== s) return;
+			if (started) {
+				this.streams.delete(id);
+				s.controller!.error(e);
+				return;
+			}
+			this.bulkUrl = null;
+			s.bulk = undefined;
+			this.send(JSON.stringify({ t: "bulkpull", id, token }));
+		}
+	}
+
 	private send(m: string | Uint8Array) {
 		const ws = this.open();
 		if (ws.readyState === WebSocket.OPEN) ws.send(m);
@@ -190,6 +261,7 @@ export class RelayTransport implements ProxyTransport {
 				prefetch: !!this.options.prefetch,
 				cache: !!this.options.cache,
 				whole: true,
+				bulk: this.bulkUrl !== null,
 				// with the shared rewrite cache, the relay may send a script rewritten
 				rewrite:
 					this.options.rewriteCache && typeof (headers as any)[REWRITE_HEADER] === "string"
@@ -207,6 +279,7 @@ export class RelayTransport implements ProxyTransport {
 			const s = this.streams.get(id);
 			if (!s) return;
 			this.streams.delete(id);
+			s.bulk?.abort();
 			this.send(JSON.stringify({ t: "abort", id }));
 			const err = new DOMException("The request was aborted", "AbortError");
 			if (s.controller) s.controller.error(err);

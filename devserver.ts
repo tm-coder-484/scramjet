@@ -41,15 +41,15 @@ if (process.env.VITE_WISP_URL) {
 	process.env.VITE_WISP_URL = `ws://localhost:${WISP_PORT}/`;
 }
 
+// the relay transport (devrelay.ts) shares the wisp port, at /relay
+const relay = createRelay();
 const wispserver = http.createServer((req, res) => {
+	if (relay.request(req, res)) return;
 	res.writeHead(200, { "Content-Type": "text/plain" });
 	res.end("wisp server js rewrite");
 });
 wisp.options.allow_private_ips = true;
 wisp.options.allow_loopback_ips = true;
-
-// the relay transport (devrelay.ts) shares the wisp port, at /relay
-const relay = createRelay();
 wispserver.on("upgrade", (req, socket, head) => {
 	if (relay(req, socket, head)) return;
 	wisp.routeRequest(req, socket, head);
