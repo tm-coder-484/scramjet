@@ -325,6 +325,10 @@ export function rewriteCacheHeader(
 // Symbols, since a site's own headers are strings: no response header can claim a rewrite.
 export const REWRITE_HEADER = Symbol_for("scramjet rewrite header");
 export const REWRITTEN = Symbol_for("scramjet rewritten");
+// on a script request with REWRITE_HEADER: the prefix, so the server can send the rewrite finished
+// (as finishServerRewrite would make it). Its body is then the script to run, which can pass
+// through untouched (see NATIVE_BODY)
+export const REWRITE_FINISH = Symbol_for("scramjet rewrite finish");
 // on a transport response's raw headers: a function that hands over the url its body can be
 // fetched from directly, once, instead of being read (see ScramjetFetchResponse.nativeBody)
 export const NATIVE_BODY = Symbol_for("scramjet native body");
@@ -335,6 +339,8 @@ export type ServerRewrite = {
 	// byte offsets in js where the prefix goes (a placeholder of the same length is there)
 	offsets: number[];
 	jsLength: number;
+	// sent finished (see REWRITE_FINISH)
+	finished?: boolean;
 };
 
 /** a script the transport's server rewrote under `header`, ready to run (see REWRITTEN) */

@@ -43,6 +43,8 @@ const headDecoder = new TextDecoder();
 // may answer with the script rewritten under it, and the details of that rewrite on the response
 const REWRITE_HEADER = Symbol.for("scramjet rewrite header");
 const REWRITTEN = Symbol.for("scramjet rewritten");
+// scramjet's REWRITE_FINISH: the prefix, for the relay to send the rewrite finished
+const REWRITE_FINISH = Symbol.for("scramjet rewrite finish");
 // scramjet's NATIVE_BODY: on a response whose body is at the relay's HTTP endpoint, a function that
 // gives its url to fetch it from, once, instead of reading the body here. The service worker then
 // fetches it itself, and the browser streams it to the page without any of it passing through
@@ -301,6 +303,10 @@ export class RelayTransport implements ProxyTransport {
 				rewrite:
 					this.options.rewriteCache && typeof (headers as any)[REWRITE_HEADER] === "string"
 						? (headers as any)[REWRITE_HEADER]
+						: undefined,
+				finish:
+					this.options.rewriteCache && typeof (headers as any)[REWRITE_FINISH] === "string"
+						? (headers as any)[REWRITE_FINISH]
 						: undefined,
 			})
 		);

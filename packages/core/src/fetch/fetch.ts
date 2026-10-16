@@ -13,7 +13,12 @@ import {
 import { rewriteUrl, unrewriteBlob, unrewriteUrl } from "@rewriters/url";
 import { QP, parseRequest } from "./parse";
 import { ScramjetHeaders, flagEnabled } from "@/shared";
-import { NATIVE_BODY, REWRITE_HEADER, rewriteCacheHeader } from "@rewriters/js";
+import {
+	NATIVE_BODY,
+	REWRITE_FINISH,
+	REWRITE_HEADER,
+	rewriteCacheHeader,
+} from "@rewriters/js";
 import { isDocument, isRedirect, normalizeContentType } from "./util";
 import { rewriteBody } from "./body";
 import { corsPreflight } from "./cors";
@@ -288,13 +293,17 @@ export async function doNetworkFetch(
 			request.method === "GET" &&
 			Array_isArray(headers) &&
 			flagEnabled("rewriteCache", handler.context, parsed.meta.base)
-		)
+		) {
 			(headers as any)[REWRITE_HEADER] = rewriteCacheHeader(
 				new _URL(reqprops.url).href,
 				handler.context,
 				parsed.meta,
 				parsed.isModule
 			);
+			// a finished rewrite has no sourceURL comment to add
+			if (!flagEnabled("debugSourceURL", handler.context, parsed.meta.origin))
+				(headers as any)[REWRITE_FINISH] = handler.context.prefix.pathname;
+		}
 		earlyResponse = await handler.client.fetch(reqprops.url, reqprops.init);
 	}
 

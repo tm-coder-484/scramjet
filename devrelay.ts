@@ -7,7 +7,7 @@
 // encrypted bytes. That's fine for your own machine or Codespace, not for a public deployment.
 //
 // Protocol, on ws://<host>/relay (one socket per RelayTransport):
-//   client -> server  text   {t:"req", id, url, method, headers, body:bool, prefetch?:bool, cache?:bool, whole?:bool, rewrite?}
+//   client -> server  text   {t:"req", id, url, method, headers, body:bool, prefetch?:bool, cache?:bool, whole?:bool, rewrite?, finish?}
 //                     binary [u32 id][request body]   (follows a req with body:true)
 //                     text   {t:"abort", id}
 //   server -> client  text   {t:"head", id, status, statusText, headers} | {t:"err", id, error}
@@ -24,7 +24,9 @@
 //                            (as chunks and an end)
 //   a script req's `rewrite` is its rewrite-cache header (see rewriteKey): the relay may answer it
 //   with the script rewritten under it (see sendScript), its head then holding
-//   rewritten: {tag, offsets, jsLength} and its body the rewrite's js then map
+//   rewritten: {tag, offsets, jsLength} and its body the rewrite's js then map. With `finish` (the
+//   client's prefix) it may send it finished instead (see finishScript): rewritten: {tag, finished:
+//   true, offsets: [], jsLength} and its body the script to run
 //   the shared rewrite cache (RelayTransport's rewriteCache, used by the controller's rewriter threads):
 //   client -> server  text   {t:"rwget", id, key, url?}   (url for big scripts: see speculate)
 //                     text   {t:"rwput", id, key, header, body:true} + binary [u32 id][script]
@@ -1625,7 +1627,10 @@ function rewritePut(msg: any, body: Buffer) {
 // rewrite instead of the script: from its cache, from a speculative rewrite of it, or rewritten
 // now, by the rewrite threads. The browser skips hashing the script, asking for its rewrite and
 // getting both (YouTube's 10 MB bundle: ~85 ms of hashing, ~100 ms of round trip, the 10 MB).
-const PREREWRITE_MIN_BYTES = 64 * 1024;
+// Small scripts too: from the size the browser would hand to its rewriter threads (core's
+// MIN_OFFLOAD_BYTES), each one it rewrites itself costs it a hash, a cache lookup, a round trip
+// to this cache and messages between its threads (GitHub's ~100 modules: −4%)
+const PREREWRITE_MIN_BYTES = 4 * 1024;
 // a module the client wouldn't rewrite (core's body.ts: not a JavaScript MIME type) must not come
 // rewritten, so only these
 const MODULE_TYPE = /^\s*(?:text|application)\/javascript\s*(?:;|$)/i;
@@ -1688,6 +1693,44 @@ async function prerewrite(
 	);
 }
 
+// A rewrite the way the client would finish it (core's finishServerRewrite): its prefix in place
+// and its sourcemap call prepended (prependToScript), so the body is the script to run. The
+// service worker can then fetch it from here itself (NATIVE_BODY), and the controller neither
+// reads, patches nor passes on its bytes (with the 4 KB threshold, A/B: GitHub, DuckDuckGo, React
+// and YouTube −5–6%). null if the header or prefix doesn't fit: the client finishes it then
+const STRICT_MODE = /^\s*(['"])use strict\1;?/;
+const strictDecoder = new TextDecoder("utf-8", { ignoreBOM: true });
+function finishScript(entry: RewriteEntry, rwHeader: string, prefix: string): Buffer | null {
+	let h: any;
+	try {
+		h = JSON.parse(rwHeader);
+	} catch {
+		return null;
+	}
+	const p = Buffer.from(prefix);
+	if (p.byteLength !== h.prefixLength) return null;
+	const js = Buffer.from(entry.js);
+	for (const o of entry.offsets) {
+		if (!(o >= 0 && o + p.byteLength <= js.byteLength)) return null;
+		p.copy(js, o);
+	}
+	const map = entry.map ? Buffer.from(entry.map.buffer, entry.map.byteOffset, entry.map.byteLength) : null;
+	// a map that records no changes (its first u32: the number of changes) is never pushed
+	if (!h.flags?.sourcemaps || !map || (map.byteLength >= 4 && map.readUInt32LE(0) === 0)) return js;
+	const pushfn = h.globals?.pushsourcemapfn;
+	if (typeof pushfn !== "string") return null;
+	const line = `${pushfn}("${map.toString("base64")}", "${entry.tag}");`;
+	const head = strictDecoder.decode(js.subarray(0, 256));
+	const lead = /^\s*/.exec(head)![0].length;
+	if (lead + 16 <= head.length) {
+		const match = STRICT_MODE.exec(head);
+		const at = match ? Buffer.byteLength(match[0]) : 0;
+		return Buffer.concat([js.subarray(0, at), Buffer.from(match ? `\n${line}` : `${line}\n`), js.subarray(at)]);
+	}
+	const text = strictDecoder.decode(js);
+	return Buffer.from(STRICT_MODE.test(text) ? text.replace(STRICT_MODE, (m) => `${m}\n${line}`) : `${line}\n${text}`);
+}
+
 function handleMuxSocket(ws: WebSocket) {
 	const session = new RelaySession();
 	const live = new Map<number, AbortController>();
@@ -1729,13 +1772,19 @@ function handleMuxSocket(ws: WebSocket) {
 		const started = performance.now();
 		const done = await prerewrite(msg.url, r, header).catch(() => null);
 		if (!done) return sendResponse(msg, r);
-		const { entry } = done;
+		const finished =
+			typeof msg.finish === "string" ? finishScript(done.entry, header, msg.finish) : null;
+		const entry: RewriteEntry = finished
+			? { js: finished, map: null, offsets: [], tag: done.entry.tag }
+			: done.entry;
 		const head = Buffer.from(
 			JSON.stringify({
 				status: r.status,
 				statusText: r.statusText,
 				headers: r.headers,
-				rewritten: { tag: entry.tag, offsets: entry.offsets, jsLength: entry.js.byteLength },
+				rewritten: finished
+					? { tag: entry.tag, finished: true, offsets: [], jsLength: finished.byteLength }
+					: { tag: entry.tag, offsets: entry.offsets, jsLength: entry.js.byteLength },
 			})
 		);
 		const mapLength = entry.map?.byteLength ?? 0;
@@ -1758,7 +1807,7 @@ function handleMuxSocket(ws: WebSocket) {
 		}
 		if (LOG)
 			console.log(
-				`[relay] sent rewritten (${Math.round(entry.js.byteLength / 1024)}KB, ${Math.round(performance.now() - started)}ms) ${msg.url.slice(0, 100)}`
+				`[relay] sent rewritten${finished ? " and finished" : ""} (${Math.round(entry.js.byteLength / 1024)}KB, ${Math.round(performance.now() - started)}ms) ${msg.url.slice(0, 100)}`
 			);
 	};
 

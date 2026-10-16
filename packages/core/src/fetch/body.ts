@@ -1,5 +1,6 @@
 import { BareResponse } from "@mercuryworkshop/proxy-transports";
 import {
+	NATIVE_BODY,
 	REWRITTEN,
 	finishServerRewrite,
 	type ServerRewrite,
@@ -85,6 +86,12 @@ export async function rewriteBody(
 				const server: ServerRewrite | undefined = (response.rawHeaders as any)?.[
 					REWRITTEN
 				];
+				// and finished (see REWRITE_FINISH): the body is the script to run, which the service
+				// worker may fetch itself, past this thread
+				if (server?.finished)
+					return (response.rawHeaders as any)[NATIVE_BODY]
+						? response.body
+						: await response.arrayBuffer();
 				let rewritten = server
 					? finishServerRewrite(
 							new Uint8Array(await response.arrayBuffer()),
