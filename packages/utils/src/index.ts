@@ -10,6 +10,7 @@ export {
 } from "./http-cache-plugin";
 export { UrlWatcherPlugin, type UrlWatcherOptions } from "./url-watcher";
 export { CatchEscapedLinksPlugin } from "./catch-escaped-links";
+export { RelayTransport, type RelayTransportOptions } from "./relay-transport";
 export {
 	setupAlwaysLastBubble,
 	type AddAlwaysLastEventListener,

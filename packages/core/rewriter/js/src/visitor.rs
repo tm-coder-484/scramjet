@@ -4,7 +4,7 @@ use coverage_macro::coverage_checked;
 use oxc::{
 	allocator::{Allocator, StringBuilder},
 	ast::ast::{
-		AssignmentExpression, AssignmentTarget, AssignmentTargetMaybeDefault,
+		AssignmentExpression, AssignmentTarget, AssignmentTargetMaybeDefault, BinaryOperator,
 		AssignmentTargetProperty, AssignmentTargetPropertyIdentifier, BindingPattern,
 		BindingPatternKind, BindingProperty, CallExpression, ComputedMemberExpression,
 		DebuggerStatement, ExportAllDeclaration, ExportNamedDeclaration, Expression, ForStatement,
@@ -34,6 +34,30 @@ macro_rules! skip_field { ($($t:tt)*) => {}; }
 //
 // maybe move this out of this lib?
 const UNSAFE_GLOBALS: &[&str] = &["parent", "top", "location", "eval"];
+
+// `(eval)(x)` and `((eval))(x)` are still direct evals: parentheses do not change the callee
+fn unwrap_parens<'a, 'data>(mut expr: &'a Expression<'data>) -> &'a Expression<'data> {
+	while let Expression::ParenthesizedExpression(p) = expr {
+		expr = &p.expression;
+	}
+	expr
+}
+
+// a computed key that evaluates to a number, a bigint, a boolean, undefined or a typeof result,
+// whatever its operands: never one of UNSAFE_GLOBALS, so the wrapper would hand it back as is.
+// hot loops index this way (bytes[i++], heap[p >> 2], a VM's code[pc++]), where the wrapper's
+// call is most of the access. `+` can make a string, and is wrapped
+fn never_unsafe_key(expr: &Expression) -> bool {
+	match unwrap_parens(expr) {
+		// x++ --x
+		Expression::UpdateExpression(_) => true,
+		// -x +x !x ~x typeof x void x delete x
+		Expression::UnaryExpression(_) => true,
+		// arithmetic but +, shifts, bitwise, comparisons, in, instanceof
+		Expression::BinaryExpression(b) => b.operator != BinaryOperator::Addition,
+		_ => false,
+	}
+}
 
 pub struct Visitor<'alloc, 'data, E>
 where
@@ -77,22 +101,40 @@ where
 
 	fn handle_computed_member_expression(&mut self, it: &ComputedMemberExpression<'data>) {
 		if self.flags.disable_computed_wrap { return };
+		// the receiver is passed to the wrapper so it can tell a null-prototype dictionary apart
+		// from a window or location. it is only passed when it can be repeated verbatim without
+		// side effects: a plain identifier (that is not rewritten, see UNSAFE_GLOBALS) or `this`
+		let receiver: Option<Atom<'data>> = match &it.object {
+			Expression::Identifier(id) if !UNSAFE_GLOBALS.contains(&id.name.as_str()) => {
+				Some(id.name)
+			}
+			Expression::ThisExpression(_) => Some(self.alloc.alloc_str("this").into()),
+			_ => None,
+		};
 		match &it.expression {
 			Expression::NullLiteral(_)
 			| Expression::BigIntLiteral(_)
 			| Expression::NumericLiteral(_)
 			| Expression::RegExpLiteral(_)
 			| Expression::BooleanLiteral(_) => {}
+			key if never_unsafe_key(key) => {}
 			Expression::StringLiteral(lit) => {
 				if UNSAFE_GLOBALS.contains(&lit.value.as_str()) {
-					self.jschanges
-						.add(rewrite!(it.expression.span(), WrapProperty,));
+					self.add_wrap_property(it.expression.span(), receiver);
 				}
 			}
 			_ => {
-				self.jschanges
-					.add(rewrite!(it.expression.span(), WrapProperty,));
+				self.add_wrap_property(it.expression.span(), receiver);
 			}
+		}
+	}
+
+	fn add_wrap_property(&mut self, span: Span, receiver: Option<Atom<'data>>) {
+		match receiver {
+			Some(receiver) => self
+				.jschanges
+				.add(rewrite!(span, WrapPropertyWithReceiver { receiver })),
+			None => self.jschanges.add(rewrite!(span, WrapProperty,)),
 		}
 	}
 
@@ -559,13 +601,20 @@ where
 	#[coverage_checked(CallExpression)]
 	fn visit_call_expression(&mut self, it: &CallExpression<'data>) {
 		audit_skip!(it.callee, "top(0): none of the unsafe globals can be called as functions, other than eval which we handle above");
-		if let Expression::Identifier(s) = &it.callee {
+		if let Expression::Identifier(s) = unwrap_parens(&it.callee) {
 			// if it's optional that actually makes it an indirect eval which is handled separately
 			if s.name == "eval" && !it.optional {
+				// the rewritten span starts at the first argument. the text between the callee and
+				// the argument list can be whitespace, comments or parentheses, so it cannot be
+				// found by offset from the callee
+				let inner_start = it
+					.arguments
+					.first()
+					.map_or(it.span.end - 1, |arg| arg.span().start);
 				self.jschanges.add(rewrite!(
 					it.span,
 					Eval {
-						inner: Span::new(s.span.end + 1, it.span.end - 1),
+						inner: Span::new(inner_start, it.span.end - 1),
 					}
 				));
 
@@ -833,6 +882,28 @@ where
 
 	#[coverage_checked(UnaryExpression)]
 	fn visit_unary_expression(&mut self, it: &UnaryExpression<'data>) {
+		// `delete o.parent` must delete the real key. the alias `$scramjet__parent` only exists on
+		// Object.prototype, so deleting it removes nothing and still reports success
+		if matches!(it.operator, UnaryOperator::Delete) {
+			match &it.argument {
+				Expression::StaticMemberExpression(s)
+					if UNSAFE_GLOBALS.contains(&s.property.name.as_str()) =>
+				{
+					audit_skip!(it.argument, "delete keeps the raw key, only the object can contain rewrites");
+					walk::walk_expression(self, &s.object);
+					return;
+				}
+				// any computed key, not just literal ones: `$prop` would map a runtime "top" to the
+				// alias too, so the key is kept raw and only the object and key expression are walked
+				Expression::ComputedMemberExpression(c) => {
+					audit_skip!(it.argument, "delete keeps the raw key, only the object and key can contain rewrites");
+					walk::walk_expression(self, &c.object);
+					walk::walk_expression(self, &c.expression);
+					return;
+				}
+				_ => {}
+			}
+		}
 		if matches!(it.operator, UnaryOperator::Typeof) {
 			match it.argument {
 				Expression::Identifier(_) => {

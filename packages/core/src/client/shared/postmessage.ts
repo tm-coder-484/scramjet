@@ -1,8 +1,16 @@
 import { iswindow } from "@client/entry";
 import { SCRAMJETCLIENT } from "@/symbols";
 import { ScramjetClient } from "@client/index";
-import { Object_defineProperty } from "@/shared/snapshot";
+import { Object_defineProperty, String, _WeakMap } from "@/shared/snapshot";
 import { POLLUTANT } from "./realm";
+
+// the helpers below only depend on the caller's realm, so they are built once per realm (keyed by
+// that realm's Function). every Function() call goes through the Function hook (a rewrite and two
+// compiles), which made each postMessage several hundred microseconds slower than the native call
+const realmHelpers = new _WeakMap() as WeakMap<
+	object,
+	{ callerGlobalThisProxied: Self; wrappedPostMessage: any }
+>;
 
 export default function (client: ScramjetClient, self: Self) {
 	if (iswindow)
@@ -36,14 +44,20 @@ export default function (client: ScramjetClient, self: Self) {
 					constructor: { constructor: Function },
 				} = pollutant;
 
-				// invoking stolen function will give us the caller's globalThis, remember scramjet has already proxied it!!!
-				const callerGlobalThisProxied: Self = Function("return globalThis")();
+				let helpers = realmHelpers.get(Function);
+				if (!helpers) {
+					helpers = {
+						// invoking stolen function will give us the caller's globalThis, remember scramjet has already proxied it!!!
+						callerGlobalThisProxied: Function("return globalThis")(),
+						// this WOULD be enough but the source argument of MessageEvent has to return the caller's window
+						// and if we just call it normally it would be coming from here, which WILL NOT BE THE CALLER'S because the accessor is from the parent
+						// so with the stolen function we wrap postmessage so the source will truly be the caller's window (remember that function is scramjet's!!!)
+						wrappedPostMessage: Function("...args", "this(...args)"),
+					};
+					realmHelpers.set(Function, helpers);
+				}
+				const { callerGlobalThisProxied, wrappedPostMessage } = helpers;
 				const callerClient = callerGlobalThisProxied[SCRAMJETCLIENT];
-
-				// this WOULD be enough but the source argument of MessageEvent has to return the caller's window
-				// and if we just call it normally it would be coming from here, which WILL NOT BE THE CALLER'S because the accessor is from the parent
-				// so with the stolen function we wrap postmessage so the source will truly be the caller's window (remember that function is scramjet's!!!)
-				const wrappedPostMessage = Function("...args", "this(...args)");
 
 				// console.log(
 				// 	callerClient,
@@ -73,12 +87,40 @@ export default function (client: ScramjetClient, self: Self) {
 			},
 		});
 
+	// every proxied site shares one real origin, so channel names are namespaced per proxied origin.
+	// an about: frame (e.g. an iframe without src) has no origin of its own, so it uses its creator's
+	const channelOrigin = () => {
+		if (client.url.protocol === "about:" && self.parent !== self) {
+			try {
+				const parent = (self.parent as Self)[SCRAMJETCLIENT];
+				if (parent) return parent.url.origin;
+			} catch {
+				// a real cross-origin parent: keep this frame's own origin
+			}
+		}
+		return client.url.origin;
+	};
+
+	client.Proxy("BroadcastChannel", {
+		construct(ctx) {
+			if (ctx.args.length === 0) return;
+			ctx.args[0] = `${channelOrigin()}@${String(ctx.args[0])}`;
+		},
+	});
+
+	client.Trap("BroadcastChannel.prototype.name", {
+		get(ctx) {
+			const name = String(ctx.get());
+			return name.substring(name.indexOf("@") + 1);
+		},
+	});
+
 	client.Proxy("BroadcastChannel.prototype.postMessage", {
 		apply(ctx) {
 			ctx.args[0] = {
 				$scramjet$messagetype: "window",
 				// TODO: need to actually look up the broadcastchannel itself in box i think
-				$scramjet$origin: client.url.origin,
+				$scramjet$origin: channelOrigin(),
 				$scramjet$data: ctx.args[0],
 			};
 		},

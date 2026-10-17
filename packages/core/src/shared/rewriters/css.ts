@@ -21,10 +21,13 @@ function handleCss(
 	meta?: URLMeta
 ) {
 	// regex from vk6 (https://github.com/ading2210)
+	// block comments are matched too, so that a url() inside one is left alone. url() is matched
+	// in any case with [uU][rR][lL], not a (?i:) group: those are new (Chrome 125, Node 23), and a
+	// bundle that has one fails to load anywhere older
 	const urlRegex =
-		/(?i:url)\((?:\s*"((?:\\.|[^"])+)"\s*|\s*'((?:\\.|[^'])+)'\s*|((?!\s*['"])(?!\s*\))(?:\\.|[^)])+?))\)/gm;
+		/\/\*[\s\S]*?\*\/|[uU][rR][lL]\((?:\s*"((?:\\.|[^"])+)"\s*|\s*'((?:\\.|[^'])+)'\s*|((?!\s*['"])(?!\s*\))(?:\\.|[^)])+?))\)/gm;
 	const Atruleregex =
-		/@import\s+((?i:url)\s*?\(.{0,9999}?\)|['"].{0,9999}?['"]|.{0,9999}?)($|\s|;)/gm;
+		/@import\s+([uU][rR][lL]\s*?\(.{0,9999}?\)|['"].{0,9999}?['"]|.{0,9999}?)($|\s|;)/gm;
 	css = String(css);
 	css = css.replace(
 		urlRegex,
@@ -34,6 +37,7 @@ function handleCss(
 			singleQuotedUrl: string | undefined,
 			unquotedUrl: string | undefined
 		) => {
+			if (match.startsWith("/*")) return match;
 			const url = doubleQuotedUrl ?? singleQuotedUrl ?? unquotedUrl;
 			const encodedUrl =
 				type === "rewrite"

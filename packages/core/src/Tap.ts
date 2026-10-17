@@ -126,6 +126,12 @@ export class Tap {
 		return Promise_all(results);
 	}
 
+	static hasTaps<T extends Description>(hook: T): boolean {
+		const internal = hook as unknown as InternalHookDescription;
+		const callbacks = internal.tap.callbacks[internal.key];
+		return callbacks !== undefined && callbacks.length > 0;
+	}
+
 	static tap<T extends Description>(
 		hook: T,
 		callback: Callback<T>,

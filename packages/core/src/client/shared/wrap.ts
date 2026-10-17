@@ -2,9 +2,121 @@ import { iswindow } from "@client/entry";
 import { SCRAMJETCLIENT } from "@/symbols";
 import { ScramjetClient } from "@client/index";
 // import { argdbg } from "@client/shared/err";
-import { Object_defineProperty } from "@/shared/snapshot";
+import {
+	Object_defineProperty,
+	Object_getOwnPropertyDescriptor,
+	Object_getPrototypeOf,
+	Reflect_apply,
+	Reflect_ownKeys,
+	Reflect_set,
+} from "@/shared/snapshot";
+
+// window.location and document.location are [LegacyUnforgeable] accessors, so they can't be redefined.
+// a write through Reflect.set or Object.assign runs the native setter, which would navigate to a
+// javascript: url without rewriting its code. those two entry points route the value through
+// client.url, the same path `location = x` takes after rewriting
+function hookLocationWrites(client: ScramjetClient, self: GlobalThis) {
+	const realWindow = self;
+	const realDocument = self.document;
+	const nativeAssign = self.Object.assign;
+	const nativeSet = self.Reflect.set;
+
+	// these are plain methods rather than client.Proxy or a Proxy trap. client.Proxy allocates a context
+	// object and closures per call, and a Proxy trap allocates an argument array per call; together that
+	// was about +70% on Object.assign and +87% on Reflect.set in the benchmark. a method has no
+	// prototype and is not constructible, like the natives. the common case is one identity check
+	// against the two cached objects, then a direct native call with no argument array
+	const { assign, set } = {
+		assign(target: any, source: any) {
+			if (target === realWindow || target === realDocument)
+				return assignIntoLocationTarget(client, nativeAssign, arguments);
+
+			switch (arguments.length) {
+				case 2:
+					return nativeAssign(target, source);
+				case 1:
+					return nativeAssign(target);
+				default:
+					return Reflect_apply(nativeAssign, undefined, arguments);
+			}
+		},
+		set(target: any, key: any, value: any) {
+			if (
+				(target === realWindow || target === realDocument) &&
+				key === "location" &&
+				(arguments.length < 4 || arguments[3] === target)
+			) {
+				client.url = value;
+
+				return true;
+			}
+
+			if (arguments.length < 4) return nativeSet(target, key, value);
+
+			return nativeSet(target, key, value, arguments[3]);
+		},
+	};
+
+	// the hooks report the native source text to Function.prototype.toString
+	client.box.unproxy.set(assign, nativeAssign);
+	client.box.unproxy.set(set, nativeSet);
+	Object_defineProperty(self.Object, "assign", {
+		value: assign,
+		writable: true,
+		enumerable: false,
+		configurable: true,
+	});
+	Object_defineProperty(self.Reflect, "set", {
+		value: set,
+		writable: true,
+		enumerable: false,
+		configurable: true,
+	});
+}
+
+// Object.assign(window, src) with a source that has an own enumerable `location` must not reach the
+// native location setter, so those sources are copied key by key like [[Set]] does
+function assignIntoLocationTarget(
+	client: ScramjetClient,
+	nativeAssign: (...args: any[]) => any,
+	args: ArrayLike<any>
+) {
+	let hasLocation = false;
+	for (let i = 1; i < args.length; i++) {
+		const source = args[i];
+		if (source === null || source === undefined) continue;
+		if (Object_getOwnPropertyDescriptor(source, "location")?.enumerable) {
+			hasLocation = true;
+			break;
+		}
+	}
+	if (!hasLocation) return Reflect_apply(nativeAssign, undefined, args);
+
+	const target = args[0];
+	for (let i = 1; i < args.length; i++) {
+		const source = args[i];
+		if (source === null || source === undefined) continue;
+		const from: any = Object(source);
+		for (const key of Reflect_ownKeys(from)) {
+			if (!Object_getOwnPropertyDescriptor(from, key)?.enumerable) continue;
+			const value = from[key];
+			if (key === "location") {
+				client.url = value;
+			} else if (!Reflect_set(target, key, value)) {
+				throw new TypeError(
+					`Cannot assign to read only property '${String(key)}' of object`
+				);
+			}
+		}
+	}
+
+	return target;
+}
 
 export function createWrapFn(client: ScramjetClient, self: GlobalThis) {
+	// the native eval as it was when scramjet loaded. page code may replace window.eval, and such a
+	// replacement must be honoured, so the check cannot compare against the current self.eval
+	const nativeEval = self.eval;
 	let wrappedParent: GlobalThis | null = null;
 	let wrappedTop: GlobalThis | null = null;
 	if (iswindow) {
@@ -41,7 +153,7 @@ export function createWrapFn(client: ScramjetClient, self: GlobalThis) {
 
 	return function (identifier: any) {
 		if (identifier === self.location) return client.locationProxy;
-		if (identifier === self.eval) {
+		if (identifier === nativeEval) {
 			return client.indirectEval;
 		}
 		if (iswindow) {
@@ -55,6 +167,29 @@ export function createWrapFn(client: ScramjetClient, self: GlobalThis) {
 	};
 }
 
+// decides whether `receiver[key]` can safely use the raw key instead of the `$scramjet__` alias.
+// only a null-prototype object is treated as a plain dictionary: Window, Location and Document
+// always have a prototype. cross-origin windows and locations report a null prototype, so they
+// are excluded by the `self` check, which is readable cross-origin and returns the window itself.
+// anything that throws (including proxies that throw) falls back to the alias.
+function isNullProtoDictionary(receiver: any, alias: string): boolean {
+	try {
+		if (receiver === null) return false;
+		const t = typeof receiver;
+		if (t !== "object" && t !== "function") return false;
+		if (Object_getPrototypeOf(receiver) !== null) return false;
+		if (alias in receiver) return false;
+
+		const selfRef = receiver.self;
+		if (selfRef !== null && selfRef !== undefined && selfRef.self === selfRef)
+			return false;
+
+		return true;
+	} catch {
+		return false;
+	}
+}
+
 export const order = 4;
 export default function (client: ScramjetClient, self: GlobalThis) {
 	Object_defineProperty(self, client.config.globals.wrapfn, {
@@ -64,16 +199,34 @@ export default function (client: ScramjetClient, self: GlobalThis) {
 		enumerable: false,
 	});
 	Object_defineProperty(self, client.config.globals.wrappropertyfn, {
-		value: function (str) {
-			if (
-				str === "location" ||
-				str === "parent" ||
-				str === "top" ||
-				str === "eval"
-			)
-				return client.config.globals.wrappropertybase + str;
+		// receiver is only passed for `receiver[key]`, where it is a plain identifier or `this`
+		// every computed member access in rewritten code goes through this (obj[$prop(key, obj)]),
+		// so the common case has to be cheap: a key that isn't a string, or is a string of another
+		// length, returns after one typeof and one length check. call sites see every type of key,
+		// and four plain === tests against such keys cost about twice as much
+		value: function (str: any, receiver?: any) {
+			if (typeof str !== "string") return str;
+			switch (str.length) {
+				case 8:
+					if (str !== "location") return str;
+					break;
+				case 6:
+					if (str !== "parent") return str;
+					break;
+				case 3:
+					if (str !== "top") return str;
+					break;
+				case 4:
+					if (str !== "eval") return str;
+					break;
+				default:
+					return str;
+			}
 
-			return str;
+			const alias = client.config.globals.wrappropertybase + str;
+			if (isNullProtoDictionary(receiver, alias)) return str;
+
+			return alias;
 		},
 		writable: false,
 		configurable: false,
@@ -190,4 +343,6 @@ export default function (client: ScramjetClient, self: GlobalThis) {
 		writable: false,
 		configurable: false,
 	});
+
+	if (iswindow) hookLocationWrites(client, self);
 }

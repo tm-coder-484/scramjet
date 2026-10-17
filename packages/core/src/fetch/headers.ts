@@ -1,4 +1,5 @@
 import {
+	isHtmlMimeType,
 	rewriteUrl,
 	ScramjetContext,
 	ScramjetHeaders,
@@ -53,9 +54,16 @@ function rewriteLinkHeader(
 	context: ScramjetContext,
 	meta: URLMeta
 ) {
-	return link.replace(/<([^>]+)>/gi, (_match, p1) => {
-		return `<${rewriteUrl(p1, context, meta)}>`;
-	});
+	return (
+		link
+			.replace(/<([^>]+)>/gi, (_match, p1) => {
+				return `<${rewriteUrl(p1, context, meta)}>`;
+			})
+			// a preload's integrity is the hash of the original resource, not of the rewritten one the
+			// proxy serves, so the browser would block it (and the stylesheet or script using the
+			// preload with it). dropped, as the integrity attribute of elements is
+			.replace(/;\s*integrity\s*=\s*(?:"(?:[^"\\]|\\.)*"|[^;,]*)/gi, "")
+	);
 }
 
 export async function rewriteResponseHeaders(
@@ -162,9 +170,50 @@ export function rewriteRequestHeaders(
 		headers.set("Cookie", cookies);
 	}
 
+	// the browser's network stack adds this after the service worker, so the request here has none,
+	// and a transport would send none or its own (undici's fetch sends "*"): sites then pick another
+	// language, or another variant of the page
+	if (!headers.has("accept-language")) {
+		const languages = acceptLanguage();
+		if (languages) headers.set("Accept-Language", languages);
+	}
+
 	applyFetchMetadataHeaders(headers, request, parsed, handler);
 
 	return headers;
+}
+
+let acceptLanguageFor: string | undefined;
+let acceptLanguageValue = "";
+
+// the Accept-Language Chromium sends for navigator.languages: a regional language's base language
+// is added after the last language of its group (en-US becomes "en-US,en") unless the list has it,
+// and the q-values after the first fall by 0.1, down to 0.1
+function acceptLanguage(): string {
+	const languages: readonly string[] = globalThis.navigator?.languages ?? [];
+	const key = languages.join(",");
+	if (key === acceptLanguageFor) return acceptLanguageValue;
+	const expanded: string[] = [];
+	for (let i = 0; i < languages.length; i++) {
+		const language = languages[i];
+		if (!expanded.includes(language)) expanded.push(language);
+		const base = language.split("-")[0];
+		const next = languages[i + 1];
+		if (
+			base !== language &&
+			next?.split("-")[0] !== base &&
+			!languages.includes(base) &&
+			!expanded.includes(base)
+		)
+			expanded.push(base);
+	}
+	acceptLanguageFor = key;
+	acceptLanguageValue = expanded
+		.map((language, i) =>
+			i === 0 ? language : `${language};q=${Math.max(10 - i, 1) / 10}`
+		)
+		.join(",");
+	return acceptLanguageValue;
 }
 
 /**
@@ -324,7 +373,7 @@ function requestIncludesCredentials(
  *      or implausible (e.g. "same-origin" / "navigate" leaking in from a
  *      proxy-URL computation).
  */
-function computeFetchMode(
+export function computeFetchMode(
 	request: ScramjetFetchRequest,
 	parsed: ScramjetFetchParsed
 ): string {
@@ -525,4 +574,79 @@ function registrableDomain(hostname: string): string {
 
 	// For longer hostnames, use the last two labels as a rough eTLD+1
 	return labels.slice(-2).join(".");
+}
+
+function encodeFilename(name: string) {
+	// RFC 8187 ext-value; encodeURIComponent leaves a few characters that aren't attr-chars
+	return (
+		"UTF-8''" +
+		encodeURIComponent(name).replace(
+			/['()*]/g,
+			(c) => "%" + c.charCodeAt(0).toString(16).toUpperCase()
+		)
+	);
+}
+
+function filenameFromUrl(url: URL) {
+	if (url.protocol === "data:") return "download";
+	const segments = url.pathname.split("/");
+	const name = segments[segments.length - 1];
+	try {
+		return decodeURIComponent(name);
+	} catch {
+		return name;
+	}
+}
+
+/**
+ * Without this, a browser saving a proxied response names the file after the
+ * proxy url (e.g. "https___example.com_file.zip").
+ * - <a download> requests (see QP.download) are forced to download. Filename
+ *   precedence matches browsers: the server's, then the download attribute's,
+ *   then the url's. Unsuccessful ones become 204 so the page stays put.
+ * - Other navigations keep the browser's render-or-download decision and only
+ *   gain a filename.
+ */
+export function rewriteContentDisposition(
+	parsed: ScramjetFetchParsed,
+	headers: ScramjetHeaders,
+	status: number
+): number {
+	const disposition = headers.get("content-disposition");
+	const hasFilename = !!disposition && /filename\*?\s*=/i.test(disposition);
+
+	if (parsed.downloadName !== undefined) {
+		if (status < 200 || status > 299) return 204;
+		if (hasFilename) {
+			headers.set(
+				"content-disposition",
+				disposition.replace(/^[^;]*/, "attachment")
+			);
+		} else {
+			const name = parsed.downloadName || filenameFromUrl(parsed.url);
+			headers.set(
+				"content-disposition",
+				name ? `attachment; filename*=${encodeFilename(name)}` : "attachment"
+			);
+		}
+		return status;
+	}
+
+	if (
+		(parsed.destination === "document" || parsed.destination === "iframe") &&
+		status >= 200 &&
+		status <= 299 &&
+		!hasFilename &&
+		!isHtmlMimeType(headers.get("content-type") ?? "")
+	) {
+		const name = filenameFromUrl(parsed.url);
+		if (name) {
+			const type = disposition ? disposition.split(";")[0].trim() : "inline";
+			headers.set(
+				"content-disposition",
+				`${type || "inline"}; filename*=${encodeFilename(name)}`
+			);
+		}
+	}
+	return status;
 }

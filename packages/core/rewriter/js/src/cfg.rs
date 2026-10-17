@@ -34,6 +34,10 @@ pub struct Config {
 #[derive(Debug)]
 pub struct Flags {
 	pub base: String,
+	// the origin static imports are fetched for (the realm's, which is the document's): it tags
+	// their urls the way dynamic import() and <script type=module> are tagged, so a module gets one
+	// url however it's imported. empty: the base url's origin
+	pub origin: String,
 	pub sourcetag: String,
 
 	pub is_module: bool,

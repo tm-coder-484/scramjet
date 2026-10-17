@@ -178,6 +178,12 @@ function responseIsStorable(
 	const cc = parseCacheControl(headers.get("cache-control"));
 	if (cc["no-store"]) return false;
 
+	// A Response built from Set-Cookie headers silently drops them (Set-Cookie is a
+	// forbidden response header name), and rebuildBareResponseWithBuffer() swaps the
+	// upstream response for one built that way, so the cookie would never be stored.
+	// Such responses are not worth caching anyway.
+	if (headers.has("set-cookie")) return false;
+
 	// "Vary: *" means "never reusable".
 	const vary = headers.get("vary");
 	if (vary && vary.split(",").some((v) => v.trim() === "*")) return false;
@@ -423,6 +429,10 @@ export class HttpCachePlugin extends ManagedPlugin {
 
 			if ((req.cache as string) === "no-store") return;
 			if (!isCacheableMethod(req.method)) return;
+			// a script the transport's server sent rewritten (scramjet's REWRITTEN): its body isn't
+			// the site's, and rebuilding the response would lose the mark that says so
+			if ((props.response.rawHeaders as any)?.[Symbol.for("scramjet rewritten")])
+				return;
 
 			const headers = nativeHeadersFromRaw(props.response.rawHeaders);
 			if (!responseIsStorable(props.response.status, headers, req.method))

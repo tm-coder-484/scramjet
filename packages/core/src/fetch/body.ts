@@ -1,5 +1,11 @@
 import { BareResponse } from "@mercuryworkshop/proxy-transports";
 import {
+	NATIVE_BODY,
+	REWRITTEN,
+	finishServerRewrite,
+	type ServerRewrite,
+} from "@rewriters/js";
+import {
 	BodyType,
 	ScramjetFetchHandler,
 	ScramjetFetchParsed,
@@ -11,11 +17,15 @@ import {
 	isJavascriptMimeType,
 	rewriteCss,
 	rewriteHtml,
-	rewriteJs,
+	rewriteJsCached,
 	rewriteWorkers,
 } from "@/shared";
 import { sniffEncoding } from "@/shared/sniffEncoding";
 import { _TextDecoder } from "@/shared/snapshot";
+import {
+	canStreamHtml,
+	rewriteHtmlStreamOffloaded,
+} from "@/shared/rewriters/htmlStream";
 
 export async function rewriteBody(
 	handler: ScramjetFetchHandler,
@@ -27,6 +37,23 @@ export async function rewriteBody(
 		case "iframe":
 		case "document":
 			if (isHtmlMimeType(response.headers.get("content-type") ?? "")) {
+				// stream the document unless a plugin needs the whole tree (see canStreamHtml)
+				if (response.body && canStreamHtml(handler.context)) {
+					return rewriteHtmlStreamOffloaded(
+						response.body,
+						response.headers.get("content-type"),
+						handler.context,
+						parsed.meta,
+						{
+							loadScripts: true,
+							inline: true,
+							source: parsed.url.href,
+							headers: response.rawHeaders,
+							history: parsed.trackedClient!.history,
+						}
+					);
+				}
+
 				const buf = await response.arrayBuffer();
 				const bytes = new Uint8Array(buf);
 				const encoding = sniffEncoding(
@@ -55,13 +82,30 @@ export async function rewriteBody(
 					return response.body;
 				}
 
-				let rewritten = rewriteJs(
-					new Uint8Array(await response.arrayBuffer()),
-					response.url,
-					handler.context,
-					parsed.meta,
-					parsed.isModule
-				);
+				// the transport's server sent it rewritten (see REWRITE_HEADER)
+				const server: ServerRewrite | undefined = (response.rawHeaders as any)?.[
+					REWRITTEN
+				];
+				// and finished (see REWRITE_FINISH): the body is the script to run, which the service
+				// worker may fetch itself, past this thread
+				if (server?.finished)
+					return (response.rawHeaders as any)[NATIVE_BODY]
+						? response.body
+						: await response.arrayBuffer();
+				let rewritten = server
+					? finishServerRewrite(
+							new Uint8Array(await response.arrayBuffer()),
+							server,
+							handler.context,
+							parsed.meta
+						)
+					: await rewriteJsCached(
+							new Uint8Array(await response.arrayBuffer()),
+							response.url,
+							handler.context,
+							parsed.meta,
+							parsed.isModule
+						);
 
 				if (
 					flagEnabled("debugSourceURL", handler.context, parsed.meta.origin)
@@ -72,6 +116,15 @@ export async function rewriteBody(
 					rewritten += `\n//# sourceURL=${parsed.url.href}`;
 				}
 
+				// the rewriter's output is always its own copy: as an ArrayBuffer, the controller
+				// transfers it to the service worker instead of copying it
+				if (
+					typeof rewritten !== "string" &&
+					rewritten.byteOffset === 0 &&
+					rewritten.byteLength === rewritten.buffer.byteLength
+				)
+					return rewritten.buffer as ArrayBuffer;
+
 				return rewritten as unknown as ArrayBuffer;
 			}
 			return response.body;
@@ -80,7 +133,7 @@ export async function rewriteBody(
 			return rewriteCss(await response.text(), handler.context, parsed.meta);
 		case "sharedworker":
 		case "worker":
-			return rewriteWorkers(
+			return await rewriteWorkers(
 				new Uint8Array(await response.arrayBuffer()),
 				response.url,
 				handler.context,

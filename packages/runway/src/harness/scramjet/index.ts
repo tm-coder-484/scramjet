@@ -3,6 +3,7 @@ import path from "path";
 import { fileURLToPath } from "url";
 import http from "http";
 import { server as wisp, logging } from "@mercuryworkshop/wisp-js/server";
+import { startTurnServer } from "../../../../../devturn.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 
@@ -11,6 +12,7 @@ const packageRoot = path.resolve(__dirname, "../../..");
 
 export const PORT = 4500;
 export const WISP_PORT = 4501;
+export const TURN_PORT = 4503;
 
 export async function startHarness() {
 	const app = express();
@@ -63,4 +65,15 @@ export async function startHarness() {
 	wispServer.listen(WISP_PORT, () => {
 		console.log(`    Wisp server listening on port ${WISP_PORT}`);
 	});
+
+	// WebRTC relay (scramjetConfig.webrtcRelay in public/index.html). Test peers are on
+	// this machine, so relaying to loopback is allowed here.
+	await startTurnServer({
+		port: TURN_PORT,
+		username: "runway",
+		credential: "runway",
+		relayAddress: "127.0.0.1",
+		allowPrivatePeers: true,
+	});
+	console.log(`    TURN relay listening on port ${TURN_PORT}`);
 }

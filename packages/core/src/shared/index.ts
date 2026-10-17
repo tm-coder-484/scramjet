@@ -11,6 +11,7 @@ export * from "./headers";
 export * from "./htmlRules";
 export * from "./mime";
 export * from "./rewriters";
+export { bytesToBase64 } from "./util";
 
 export function flagEnabled(
 	flag: keyof ScramjetFlags,
@@ -31,9 +32,10 @@ export type ScramjetInterface = {
 	codecEncode: (input: string) => string;
 	codecDecode: (input: string) => string;
 
+	// handler is null when the document is streamed and has no tree (see htmlStream.ts)
 	getInjectScripts(
 		meta: URLMeta,
-		handler: DomHandler,
+		handler: DomHandler | null,
 		htmlcontext: HtmlContext,
 		script: (src: string) => Element
 	): Element[];

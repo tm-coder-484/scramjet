@@ -20,10 +20,26 @@ export type TransferRequest = {
 	initialHeaders: RawHeaders;
 	rawClientUrl?: string;
 	clientId?: string;
+	/** the service worker can take a streamed body as `bodyPort` (see bodystream.ts) */
+	acceptsBodyPort?: boolean;
+	/** the service worker can fetch the body itself, from `bodyUrl` */
+	acceptsBodyUrl?: boolean;
 };
 
 export type TransferResponse = {
 	body: BodyType;
+	/** when set, the body streams over this port instead (see bodystream.ts) */
+	bodyPort?: MessagePort;
+	/**
+	 * when set, the service worker fetches the body from here itself (the transport's server has
+	 * it: see ScramjetFetchResponse.nativeBody), and the browser streams it to the page
+	 */
+	bodyUrl?: string;
+	/**
+	 * the request fails with a network error, as the browser would fail it (a CORS preflight the
+	 * server didn't allow): the page's fetch() rejects, its XHR errors
+	 */
+	networkError?: boolean;
 	headers: RawHeaders;
 	status: number;
 	statusText: string;
@@ -85,6 +101,8 @@ export type TransportToController = {
 			  }
 		),
 	];
+	// a new transport for a child realm (a worker), served by the same controller
+	fork: [MessagePort];
 };
 
 export type ControllerToTransport = {

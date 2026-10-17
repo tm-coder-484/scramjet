@@ -53,6 +53,11 @@ pub(crate) enum RewriteType<'alloc: 'data, 'data> {
 	/// `cfg.wrapprop({})`
 	WrapProperty,
 
+	/// `cfg.wrapprop({}, receiver)`, for `receiver[{}]` where `receiver` is a plain identifier or `this`
+	WrapPropertyWithReceiver {
+		receiver: Atom<'data>,
+	},
+
 	// dead code only if debug is disabled
 	#[allow(dead_code)]
 	/// `$scramerr(name)`
@@ -149,6 +154,10 @@ impl<'alloc: 'data, 'data> RewriteType<'alloc, 'data> {
 			Self::WrapProperty => smallvec![
 				change!(span!(start), WrapPropertyLeft),
 				change!(span!(end), WrapPropertyRight),
+			],
+			Self::WrapPropertyWithReceiver { receiver } => smallvec![
+				change!(span!(start), WrapPropertyLeft),
+				change!(span!(end), WrapPropertyWithReceiverRight { receiver }),
 			],
 			Self::WrapObjectAssignment {
 				restids,

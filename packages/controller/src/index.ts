@@ -8,6 +8,8 @@ import {
 	CookieJar,
 	defaultConfig as scramjetDefaultConfig,
 	rewriteUrl,
+	bytesToBase64,
+	getWasmBytes,
 	ScramjetFetchHandler,
 	ScramjetHeaders,
 	setWasm,
@@ -20,7 +22,13 @@ import {
 	type TrackedHistoryState,
 	Plugin,
 } from "@mercuryworkshop/scramjet";
-import { CONTROLLERFRAME } from "./symbols";
+import {
+	CONTROLLERFRAME,
+	DEFAULT_PREFIX,
+	WASM_DIGEST,
+	WASM_MODULE,
+	PLAIN_NATIVES,
+} from "./symbols";
 import type {
 	FrameInitHooks,
 	SerializedCookieSyncEntry,
@@ -30,8 +38,17 @@ import type {
 	SWbound,
 	WebSocketMessage,
 	FrameErrorHooks,
+	BodyType,
 } from "./types";
 import { assertRuntimeScramjetVersion } from "./version";
+import { endAfter, sendBody, takePort } from "./bodystream";
+import {
+	WARMUP_ORIGIN,
+	WARMUP_SETTLE,
+	WARMUP_TIMEOUT,
+	warmUpRewriters,
+	installWarmupResponder,
+} from "./warmup";
 
 export { VERSION } from "./version";
 export { assertRuntimeScramjetVersion } from "./version";
@@ -40,15 +57,19 @@ export type Config = {
 	prefix: string;
 	scramjetPath: string;
 	injectPath: string;
+	workerPath: string;
+	rewriterPath: string;
 	wasmPath: string;
 	virtualWasmPath: string;
 	codec: Record<"encode" | "decode", (input: string) => string>;
 };
 
 export const config: Config = {
-	prefix: "/~/sj/",
+	prefix: DEFAULT_PREFIX,
 	scramjetPath: "/scramjet/scramjet.js",
 	injectPath: "/controller/controller.inject.js",
+	workerPath: "/controller/controller.worker.js",
+	rewriterPath: "/controller/controller.rewriter.js",
 	wasmPath: "/scramjet/scramjet.wasm",
 	virtualWasmPath: "scramjet.wasm.js",
 	codec: {
@@ -70,7 +91,8 @@ const scramjetConfig: Partial<ScramjetConfig> = {
 		...scramjetDefaultConfig.flags,
 		allowFailedIntercepts: true,
 	},
-	maskedfiles: ["inject.js", "scramjet.wasm.js"],
+	// scramjet.wasm: the document fallback fetches the wasm file directly (inject.ts fetchWasmSync)
+	maskedfiles: ["inject.js", "scramjet.wasm.js", "scramjet.wasm"],
 };
 
 type PersistedCookieState = {
@@ -202,15 +224,49 @@ function makeId(): string {
 
 const deepMerge = deepmerge();
 
+/**
+ * Run request handling (the transport, cookies and all rewriting) in a dedicated worker
+ * instead of on this page's main thread. Proxied frames are same-origin with this page, so
+ * they share its main thread: without a worker, every request waits whenever the proxied
+ * site runs script or lays out. Fetch hooks tapped on this page's frames are not called in
+ * this mode; install them in the worker with `setupFrame`.
+ */
+export type ControllerWorkerInit = {
+	/** classic scripts the worker loads first, e.g. the transport implementation */
+	scripts?: string[];
+	/** creates the transport inside the worker; serialized with toString, so it can't close over anything */
+	transport: (() => ProxyTransport) | string;
+	/** runs in the worker for each frame, e.g. to install plugins on its fetch hooks; serialized like `transport` */
+	setupFrame?: ((frame: Frame) => void) | string;
+	/** the worker script, defaults to config.workerPath */
+	path?: string;
+};
+
 type ControllerInit = {
-	serviceworker: ServiceWorker;
-	transport: ProxyTransport;
+	serviceworker?: ServiceWorker;
+	transport?: ProxyTransport;
 	config?: Partial<Config>;
 	scramjetConfig?: Partial<ScramjetConfig>;
+	worker?: ControllerWorkerInit;
+	/**
+	 * Before `wait()` resolves, load a made-up site in a hidden frame (served without the
+	 * network, see warmup.ts), so the first real page isn't rewritten and booted by cold code.
+	 * Adds ~1s to startup, once. Default true; skipped without `document.body`.
+	 */
+	warmup?: boolean;
+	/** @internal set by the worker: the facade's id, and how to reach the service worker */
+	headless?: {
+		id: string;
+		postToServiceWorker: (message: any, transfer: Transferable[]) => void;
+	};
 };
 
 type FrameOptions = {
-	plugins: ManagedPlugin[];
+	plugins?: ManagedPlugin[];
+	/** @internal the worker reuses the facade's frame ids */
+	id?: string;
+	/** @internal the hidden frame of the warm-up, whose requests never reach the transport */
+	warmup?: boolean;
 };
 
 export class Controller {
@@ -259,7 +315,32 @@ export class Controller {
 		}
 
 		const resp = await fetch(this.config.wasmPath);
-		setWasm(await resp.arrayBuffer());
+		const bytes = await resp.arrayBuffer();
+		setWasm(bytes);
+		// compiled once here, off the main thread. documents adopt the Module from this window
+		// (inject.ts findHostWasm), so they neither get the payload nor compile it themselves
+		const [module, digest] = await Promise.all([
+			WebAssembly.compile(bytes),
+			sha256Hex(bytes),
+		]);
+		setWasm(module, digest);
+		Object.defineProperty(globalThis, WASM_MODULE, {
+			value: module,
+			enumerable: false,
+			configurable: true,
+		});
+		Object.defineProperty(globalThis, WASM_DIGEST, {
+			value: digest,
+			enumerable: false,
+			configurable: true,
+		});
+		// made here, so it keeps no document's realm alive (see core's sharePlainNatives)
+		if (!(PLAIN_NATIVES in globalThis))
+			Object.defineProperty(globalThis, PLAIN_NATIVES, {
+				value: Object.create(null),
+				enumerable: false,
+				configurable: true,
+			});
 		this.wasmAlreadyFetched = true;
 	}
 
@@ -272,26 +353,16 @@ export class Controller {
 		},
 		request: async (data) => {
 			const path = new URL(data.rawUrl).pathname;
-			const frame = this.frames.find((f) => path.startsWith(f.prefix));
+			const frame = await this.findFrame(path);
 			if (!frame) throw new Error("No frame found for request");
 			try {
 				// doesn't actually *load* every request, but hold up requests until the promise finishes
 				await this.loadSavedCookies();
 
 				if (path === frame.prefix + this.config.virtualWasmPath) {
+					// built on first request only, by workers and documents without a host module
 					if (!this.wasmPayload) {
-						const resp = await fetch(this.config.wasmPath);
-						const buf = await resp.arrayBuffer();
-						const b64 = btoa(
-							new Uint8Array(buf)
-								.reduce(
-									(data, byte) => (data.push(String.fromCharCode(byte)), data),
-									[] as any
-								)
-								.join("")
-						);
-
-						this.wasmPayload = `self.WASM = '${b64}';`;
+						this.wasmPayload = `self.WASM = '${bytesToBase64(getWasmBytes())}';`;
 					}
 
 					return [
@@ -323,6 +394,53 @@ export class Controller {
 					clientId: data.clientId,
 				});
 
+				// the response's cookies are still on their way to the page: its bytes go now, its end
+				// once they're there (see cookieSync)
+				if (fetchresponse.cookieSync)
+					fetchresponse.body = endAfter(
+						fetchresponse.body,
+						fetchresponse.cookieSync
+					);
+
+				// a body the transport's server can serve itself goes straight from there to the
+				// service worker, past this thread
+				const bodyUrl =
+					data.acceptsBodyUrl && !fetchresponse.cookieSync
+						? fetchresponse.nativeBody?.()
+						: null;
+				if (bodyUrl)
+					return [
+						{
+							body: null as unknown as BodyType,
+							bodyUrl,
+							status: fetchresponse.status,
+							statusText: fetchresponse.statusText,
+							headers: fetchresponse.headers.toRawHeaders(),
+						},
+						[],
+					];
+
+				// a streamed body goes over a port, pushed chunk by chunk, when the service worker
+				// knows how to take it: a transferred stream costs a round trip per chunk
+				if (
+					data.acceptsBodyPort &&
+					fetchresponse.body instanceof ReadableStream
+				) {
+					// a document rewritten on a rewriter thread comes from there directly
+					const bodyPort =
+						takePort(fetchresponse.body) ?? sendBody(fetchresponse.body);
+					return [
+						{
+							body: null as unknown as BodyType,
+							bodyPort,
+							status: fetchresponse.status,
+							statusText: fetchresponse.statusText,
+							headers: fetchresponse.headers.toRawHeaders(),
+						},
+						[bodyPort],
+					];
+				}
+
 				return [
 					{
 						body: fetchresponse.body,
@@ -351,6 +469,17 @@ export class Controller {
 				if (reqprops.setResponse) {
 					return [reqprops.setResponse, []];
 				}
+				if ((e as Error)?.name === "NetworkError")
+					return [
+						{
+							body: null as unknown as BodyType,
+							networkError: true,
+							status: 0,
+							statusText: "",
+							headers: [],
+						},
+						[],
+					];
 				throw e;
 			}
 		},
@@ -373,8 +502,11 @@ export class Controller {
 							this.cookieJar.clear();
 						}
 						this.applyCookieSyncEntries(cookies);
-						await this.persistCookies();
-						await this.propagateCookieSync(cookies, options);
+						// the page doesn't need the jar on disk to see its cookies: both go at once
+						await Promise.all([
+							this.persistCookies(),
+							this.propagateCookieSync(cookies, options),
+						]);
 					},
 					connect: async ({ url, protocols, requestHeaders, port }) => {
 						let resolve: (arg: TransportToController["connect"][1]) => void;
@@ -431,6 +563,9 @@ export class Controller {
 
 						return [await promise, []];
 					},
+					fork: async (port) => {
+						await this.methods.initRemoteTransport(port);
+					},
 				},
 				"transport",
 				(data, transfer) => port.postMessage(data, transfer)
@@ -450,7 +585,7 @@ export class Controller {
 
 	constructor(public init: ControllerInit) {
 		assertRuntimeScramjetVersion();
-		this.id = makeId();
+		this.id = init.headless?.id ?? makeId();
 		this.config = deepMerge(config, init.config || {}) as Config;
 		this.scramjetConfig = deepMerge(scramjetConfig, scramjetDefaultConfig);
 		this.scramjetConfig = deepMerge(
@@ -458,7 +593,18 @@ export class Controller {
 			init.scramjetConfig || {}
 		) as ScramjetConfig;
 		this.prefix = this.config.prefix + this.id + "/";
-		this.serviceWorkerController = init.serviceworker;
+		this.serviceWorkerController = init.serviceworker!;
+		this.transport = init.transport!;
+
+		if (init.worker) {
+			// this page still compiles the rewriter: its frames take the compiled module from it
+			this.ready = Promise.all([
+				this.startWorker(init.worker),
+				this.loadScramjetWasm(),
+			]).then(() => this.warmUp());
+			this.rpc = null!;
+			return;
+		}
 
 		this.ready = Promise.all([
 			new Promise<void>((resolve) => {
@@ -466,7 +612,7 @@ export class Controller {
 			}),
 			this.loadScramjetWasm(),
 			this.loadSavedCookies(true),
-		]).then(() => undefined);
+		]).then(() => this.warmUp());
 
 		this.rpc = new RpcHelper<Controllerbound, SWbound>(
 			this.methods,
@@ -478,7 +624,6 @@ export class Controller {
 				this.port.postMessage(data, transfer);
 			}
 		);
-		this.transport = init.transport;
 
 		this.cookieSyncChannel.addEventListener(
 			"message",
@@ -486,42 +631,119 @@ export class Controller {
 		);
 		this.setupMessagePort();
 
-		navigator.serviceWorker.addEventListener("message", (e) => {
-			if (
-				e.data?.$controller$setCookie &&
-				typeof e.data.$controller$setCookie === "object"
-			) {
-				const payload = e.data.$controller$setCookie as {
-					cookies?: SerializedCookieSyncEntry[];
-					options?: CookieSyncOptions;
-					id?: string;
-				};
+		// a headless controller (in the worker) gets these forwarded by its page
+		if (!init.headless) {
+			navigator.serviceWorker.addEventListener("message", (e) => {
+				this.handleServiceWorkerMessage(e.data);
+			});
+		}
+	}
 
-				if (payload.options?.clear) {
-					this.cookieJar.clear();
-				}
-				this.applyCookieSyncEntries(payload.cookies);
+	private postToServiceWorker(message: any, transfer: Transferable[] = []) {
+		if (this.init.headless) {
+			this.init.headless.postToServiceWorker(message, transfer);
+		} else {
+			this.serviceWorkerController.postMessage(message, transfer);
+		}
+	}
 
-				if (typeof payload.id === "string") {
-					this.serviceWorkerController.postMessage({
-						$sw$setCookieDone: {
-							id: payload.id,
-						},
-					});
-				}
+	/** @internal handles a message the service worker posted to this page */
+	handleServiceWorkerMessage(data: any) {
+		if (
+			data?.$controller$setCookie &&
+			typeof data.$controller$setCookie === "object"
+		) {
+			const payload = data.$controller$setCookie as {
+				cookies?: SerializedCookieSyncEntry[];
+				options?: CookieSyncOptions;
+				id?: string;
+			};
 
+			if (payload.options?.clear) {
+				this.cookieJar.clear();
+			}
+			this.applyCookieSyncEntries(payload.cookies);
+
+			if (typeof payload.id === "string") {
+				this.postToServiceWorker({
+					$sw$setCookieDone: {
+						id: payload.id,
+					},
+				});
+			}
+
+			return;
+		}
+
+		if (data?.$controller$swrevive) {
+			const known = data.$controller$swrevive.known;
+			if (Array.isArray(known)) {
+				if (known.includes(this.id)) return;
+			} else if (this.guardServiceWorkerRevive) {
+				// older service workers don't say who they know. if we just spawned it,
+				// it will send this even though it's not actually dead
 				return;
 			}
+			this.setupMessagePort();
+		}
+	}
 
-			if (e.data.$controller$swrevive) {
-				// if we just spawned the service worker, it will send this even though it's not actually dead
-				// TODO: pretty jank, fix at some point
-				if (this.guardServiceWorkerRevive) {
-					return;
+	private worker: Worker | null = null;
+
+	// worker mode: this page keeps the frames and the API, a headless Controller in a worker
+	// does the rest. it talks to the service worker through this page, except for the request
+	// port, which goes straight from the service worker to the worker
+	private startWorker(workerInit: ControllerWorkerInit): Promise<void> {
+		const abs = (path: string) => new URL(path, location.href).href;
+		const url = new URL(abs(workerInit.path ?? this.config.workerPath));
+		url.searchParams.set("scramjet", abs(this.config.scramjetPath));
+		const worker = new Worker(url, { name: "scramjet controller" });
+		this.worker = worker;
+
+		const ready = new Promise<void>((resolve, reject) => {
+			worker.addEventListener("message", (e) => {
+				const data = e.data;
+				if (data?.$worker$ready) {
+					this.isReady = true;
+					resolve();
+				} else if (data?.$worker$error) {
+					reject(new Error(data.$worker$error));
+				} else if (data?.$worker$toSW) {
+					this.serviceWorkerController.postMessage(
+						data.$worker$toSW,
+						e.ports as unknown as Transferable[]
+					);
 				}
-				this.setupMessagePort();
+			});
+			worker.addEventListener("error", (e) =>
+				reject(new Error("controller worker failed to start: " + e.message))
+			);
+		});
+
+		navigator.serviceWorker.addEventListener("message", (e) => {
+			if (e.data?.$controller$setCookie || e.data?.$controller$swrevive) {
+				worker.postMessage({ $worker$sw: e.data });
 			}
 		});
+
+		const { encode, decode } = this.config.codec;
+		worker.postMessage({
+			$worker$init: {
+				id: this.id,
+				config: {
+					...this.config,
+					codec: { encode: encode.toString(), decode: decode.toString() },
+				},
+				scramjetConfig: this.scramjetConfig,
+				scripts: (workerInit.scripts ?? []).map(abs),
+				// the page's warm-up frame covers the worker's own (see warmUp)
+				frameWarmup: this.willWarmUp(),
+				transport: workerInit.transport.toString(),
+				setupFrame: workerInit.setupFrame?.toString(),
+			},
+		});
+
+		return ready;
 	}
 
 	private setupMessagePort() {
@@ -540,11 +762,15 @@ export class Controller {
 		this.port.addEventListener("message", this.onTabChannelMessage);
 		this.port.start();
 
-		this.serviceWorkerController.postMessage(
+		this.postToServiceWorker(
 			{
 				$controller$init: {
 					prefix: this.prefix,
 					id: this.id,
+					// the scripts every document loads, which the service worker serves from its cache
+					client: [this.config.scramjetPath, this.config.injectPath].map(
+						(path) => new URL(path, location.href).href
+					),
 				},
 			},
 			[channel.port2]
@@ -605,7 +831,34 @@ export class Controller {
 		return this.cookieSyncPromise;
 	}
 
-	async persistCookies(): Promise<void> {
+	// the write in flight, and the one queued behind it: a burst of responses that set cookies
+	// (Cloudflare sets some on ~90) makes one write after the current one, not one each
+	private persisting: Promise<void> | null = null;
+	private persistQueued: Promise<void> | null = null;
+
+	/** writes the jar to IndexedDB, as it is when the write starts, for other tabs and reloads */
+	persistCookies(): Promise<void> {
+		if (!this.persisting) {
+			const done = () => {
+				this.persisting = null;
+			};
+			this.persisting = this.writeCookies();
+			this.persisting.then(done, done);
+			return this.persisting;
+		}
+		return (this.persistQueued ??= this.persisting.then(
+			() => {
+				this.persistQueued = null;
+				return this.persistCookies();
+			},
+			() => {
+				this.persistQueued = null;
+				return this.persistCookies();
+			}
+		));
+	}
+
+	private async writeCookies(): Promise<void> {
 		const updatedAt = await writeCookieState(
 			this.cookieJar.dump(),
 			this.cookieUpdatedAt
@@ -621,7 +874,36 @@ export class Controller {
 		});
 	}
 
+	/**
+	 * In worker mode, sends `scramjetConfig` to the worker again after it was changed in place
+	 * (flags, webrtcRelay...). Pages loaded after this use the new config. A no-op otherwise.
+	 */
+	pushConfig() {
+		this.worker?.postMessage({ $worker$config: this.scramjetConfig });
+	}
+
+	private frameWaiters: (() => void)[] = [];
+
+	/** @internal the frame a proxied url belongs to. in a worker, the page may not have told us about it yet */
+	async findFrame(path: string): Promise<Frame | undefined> {
+		const deadline = Date.now() + 5000;
+		let frame = this.frames.find((f) => path.startsWith(f.prefix));
+		while (!frame && this.init.headless && Date.now() < deadline) {
+			await new Promise<void>((resolve) => {
+				this.frameWaiters.push(resolve);
+				setTimeout(resolve, deadline - Date.now());
+			});
+			frame = this.frames.find((f) => path.startsWith(f.prefix));
+		}
+		return frame;
+	}
+
 	setTransport(transport: ProxyTransport) {
+		if (this.worker) {
+			throw new Error(
+				"setTransport isn't supported for a controller running in a worker"
+			);
+		}
 		this.transport = transport;
 		for (const frame of this.frames) {
 			frame.controller.transport = transport;
@@ -638,12 +920,75 @@ export class Controller {
 		element ??= document.createElement("iframe");
 		const frame = new Frame(this, element, options);
 		this.frames.push(frame);
+		this.worker?.postMessage({
+			$worker$frame: { id: frame.id, warmup: options.warmup },
+		});
+		if (options.warmup && !this.worker) installWarmupResponder(frame);
+		for (const resolve of this.frameWaiters.splice(0)) resolve();
 		return frame;
+	}
+
+	/** @internal forgets a frame (the warm-up's) */
+	removeFrame(frame: Frame) {
+		const i = this.frames.indexOf(frame);
+		if (i !== -1) this.frames.splice(i, 1);
+		this.worker?.postMessage({ $worker$frameGone: { id: frame.id } });
+	}
+
+	private willWarmUp(): boolean {
+		return (
+			!this.init.headless &&
+			this.init.warmup !== false &&
+			typeof document !== "undefined" &&
+			!!document.body
+		);
+	}
+
+	// the made-up site in a hidden frame (see warmup.ts), once, before wait() resolves. a failure
+	// or a timeout only loses the speedup
+	private async warmUp(): Promise<void> {
+		if (!this.willWarmUp()) return;
+		const element = document.createElement("iframe");
+		element.setAttribute("aria-hidden", "true");
+		element.tabIndex = -1;
+		// laid out at a desktop size, out of sight
+		element.style.cssText =
+			"position:fixed;left:-20000px;top:0;width:1280px;height:800px;border:0;visibility:hidden;pointer-events:none";
+		let frame: Frame | undefined;
+		try {
+			frame = this.createFrame(element, { warmup: true });
+			frame.go(WARMUP_ORIGIN + "/");
+			await new Promise<void>((resolve) => {
+				element.addEventListener("load", () => resolve(), { once: true });
+				setTimeout(resolve, WARMUP_TIMEOUT);
+				document.body.appendChild(element);
+			});
+			const settled = new Promise((resolve) =>
+				setTimeout(resolve, WARMUP_SETTLE)
+			);
+			// meanwhile, the thread that rewrites documents runs them some more
+			if (this.worker) this.worker.postMessage({ $worker$warmup: true });
+			else await warmUpRewriters(this);
+			await settled;
+		} catch {
+			// only a missed speedup
+		} finally {
+			element.remove();
+			if (frame) this.removeFrame(frame);
+		}
 	}
 
 	async wait(): Promise<void> {
 		await this.ready;
 	}
+}
+
+// sha256 hex of the rewriter, the same digest the core's rewrite cache keys on
+async function sha256Hex(bytes: ArrayBuffer): Promise<string> {
+	const digest = await crypto.subtle.digest("SHA-256", bytes);
+	return Array.from(new Uint8Array(digest), (b) =>
+		b.toString(16).padStart(2, "0")
+	).join("");
 }
 
 function base64Encode(text: string) {
@@ -683,9 +1028,10 @@ function yieldGetInjectScripts(
 					.join("")
 			);
 		}
+		// no wasm payload here: documents take the host's compiled module, or fetch the wasm
+		// file synchronously when there is no host (inject.ts loadWasm)
 		return [
 			script(config.scramjetPath),
-			script(prefix.href + config.virtualWasmPath),
 			script(config.injectPath),
 			script(
 				"data:text/javascript;charset=utf-8;base64," +
@@ -738,34 +1084,17 @@ export class Frame {
 
 					str += script(this.controller.config.scramjetPath);
 					str += script(this.prefix + this.controller.config.virtualWasmPath);
+					str += script(this.controller.config.injectPath);
 					str += script(
 						"data:text/javascript;charset=utf-8;base64," +
 							base64Encode(`
-					(()=>{
-						const { ScramjetClient, CookieJar, setWasm } = $scramjet;
-
-						setWasm(Uint8Array.from(atob(self.WASM), (c) => c.charCodeAt(0)));
-						delete self.WASM;
-
-						const sjconfig = ${JSON.stringify(this.controller.scramjetConfig)};
-						const prefix = new URL("${this.prefix}", location.href);
-
-						const context = {
-							config: sjconfig,
-							prefix,
-							interface: {
-								codecEncode: ${this.controller.config.codec.encode.toString()},
-								codecDecode: ${this.controller.config.codec.decode.toString()},
-							},
-						};
-
-						const client = new ScramjetClient(globalThis, {
-							context,
-							transport: null,
-						});
-
-						client.hook();
-					})();
+					$scramjetController.loadWorker({
+						sjconfig: ${JSON.stringify(this.controller.scramjetConfig)},
+						prefix: new URL("${this.prefix}", location.href),
+						cookies: ${JSON.stringify(this.controller.cookieJar.dump())},
+						codecEncode: ${this.controller.config.codec.encode.toString()},
+						codecDecode: ${this.controller.config.codec.decode.toString()},
+					});
 					`)
 					);
 
@@ -783,7 +1112,7 @@ export class Frame {
 		public element: HTMLIFrameElement,
 		public options: FrameOptions = {}
 	) {
-		this.id = makeId();
+		this.id = options.id ?? makeId();
 		this.prefix = this.controller.prefix + this.id + "/";
 
 		this.fetchHandler = new ScramjetFetchHandler({
@@ -791,14 +1120,17 @@ export class Frame {
 			context: this.context,
 			transport: controller.transport,
 			async sendSetCookie(cookies, options) {
-				await controller.persistCookies();
-				await controller.propagateCookieSync(
-					cookies.map(({ url, cookie }) => ({
-						url: url.href,
-						cookie,
-					})),
-					options
-				);
+				// the page doesn't need the jar on disk to see its cookies: both go at once
+				await Promise.all([
+					controller.persistCookies(),
+					controller.propagateCookieSync(
+						cookies.map(({ url, cookie }) => ({
+							url: url.href,
+							cookie,
+						})),
+						options
+					),
+				]);
 			},
 			async fetchBlobUrl(url) {
 				return BareResponse.fromNativeResponse(await fetch(url));

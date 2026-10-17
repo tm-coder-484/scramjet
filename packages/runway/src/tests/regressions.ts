@@ -1,7 +1,81 @@
 import { basicTest, serverTest } from "../testcommon.ts";
 // historical regressions
 
+// what a hooked function must still be in a realm `w`: methods aren't constructible and have no
+// prototype, constructors construct. returns what's wrong (a string per failure)
+const CONSTRUCTIBILITY_CHECK = `function checkConstructibility(w, where) {
+	const bad = [];
+	const methods = {
+		fetch: w.fetch,
+		setAttribute: w.Element.prototype.setAttribute,
+		addEventListener: w.EventTarget.prototype.addEventListener,
+		pushState: w.History.prototype.pushState,
+		querySelector: w.Document.prototype.querySelector,
+		createObjectURL: w.URL.createObjectURL,
+		appendChild: w.Node.prototype.appendChild,
+	};
+	for (const [name, f] of Object.entries(methods)) {
+		if (typeof f !== "function") { bad.push(where + ": " + name + " is " + typeof f); continue; }
+		if ("prototype" in f) bad.push(where + ": " + name + " has a prototype");
+		let threw = null;
+		try { new f(); } catch (e) { threw = e; }
+		if (!threw || threw.name !== "TypeError") bad.push(where + ": new " + name + " should throw a TypeError, got " + threw);
+	}
+	const ctors = [
+		["Image", () => new w.Image().tagName === "IMG"],
+		["URL", () => new w.URL("https://example.com/a").pathname === "/a"],
+		["Function", () => new w.Function("return 7")() === 7],
+		["MutationObserver", () => typeof new w.MutationObserver(() => {}).observe === "function"],
+		["Blob", () => new w.Blob(["ab"]).size === 2],
+		["Request", () => new w.Request("https://example.com/").method === "GET"],
+	];
+	for (const [name, make] of ctors) {
+		try { if (!make()) bad.push(where + ": new " + name + " made the wrong thing"); }
+		catch (e) { bad.push(where + ": new " + name + " threw " + e); }
+	}
+	return bad;
+}`;
+
 export default [
+	// scramjet/core
+	// non-JS <script> data islands (Spotify, GitHub) read undefined from textContent/innerText
+	// because HTMLScriptElement.prototype had a trap with no own accessor to read from
+	basicTest({
+		name: "regression-script-data-island-textcontent",
+		js: `
+			const json = document.createElement("script");
+			json.type = "application/json";
+			json.textContent = '{"a":1,"b":[2,3]}';
+			document.head.appendChild(json);
+			assertEqual(json.textContent, '{"a":1,"b":[2,3]}', "json textContent");
+			assertEqual(json.innerText, '{"a":1,"b":[2,3]}', "json innerText");
+			assertEqual(JSON.parse(json.textContent).b[1], 3, "json parses");
+
+			const plain = document.createElement("script");
+			plain.type = "text/plain";
+			plain.id = "plain-island";
+			plain.textContent = "hello island";
+			document.head.appendChild(plain);
+			assertEqual(document.getElementById("plain-island").textContent, "hello island", "plain textContent");
+
+			const js = document.createElement("script");
+			js.textContent = "window.__r4Ran = 7;";
+			document.head.appendChild(js);
+			assertEqual(js.textContent, "window.__r4Ran = 7;", "js textContent returns source");
+			assertEqual(js.text, "window.__r4Ran = 7;", "js text returns source");
+			assertEqual(window.__r4Ran, 7, "js script ran");
+
+			js.textContent = "window.__r4Ran = 8;";
+			assertEqual(js.text, "window.__r4Ran = 8;", "text set after creation reads back");
+
+			const s = document.createElement("script");
+			s.type = "text/plain";
+			s.textContent = "before";
+			s.textContent = "after";
+			assertEqual(s.textContent, "after", "second write on non-JS script");
+		`,
+	}),
+
 	// scramjet/core
 	// introduced by: ?
 	// fixed by: https://github.com/HeyPuter/browser.js/commit/1715a6aeb072284b58ce38f807f1b14f5151dd7a
@@ -257,6 +331,105 @@ export default [
 				}
 				res.writeHead(404);
 				res.end("not found");
+			});
+		},
+	}),
+
+	// scramjet/core
+	// computed keys named location/parent/top/eval were rewritten to the $scramjet__ alias even on
+	// null-prototype dictionaries, which have no Object.prototype getter to resolve the alias
+	basicTest({
+		name: "regression-nullproto-computed-keys",
+		js: `
+            for (const key of ["location", "parent", "top", "eval"]) {
+                const dict = Object.create(null);
+                dict[key] = key + "-value";
+                assertEqual(dict[key], key + "-value", "null-proto read of " + key);
+                assertEqual(key in dict, true, "null-proto has " + key);
+                delete dict[key];
+                assertEqual(dict[key], undefined, "null-proto delete of " + key);
+
+                const fn = Object.create(null);
+                fn[key] = () => "called " + key;
+                assertEqual(fn[key](), "called " + key, "null-proto call of " + key);
+
+                const plain = {};
+                plain[key] = key + "-plain";
+                assertEqual(plain[key], key + "-plain", "plain object read of " + key);
+
+                const viaThis = Object.create(null);
+                viaThis[key] = 7;
+                assertEqual((function () { return this[key]; }).call(viaThis), 7, "this receiver for " + key);
+            }
+            // the receiver form must not hand out the real window or location
+            assertEqual(window["location"].href, location.href, "window[location] stays proxied");
+            assertEqual(document["location"].href, location.href, "document[location] stays proxied");
+            assertEqual(self["location"].href, location.href, "self[location] stays proxied");
+        `,
+	}),
+	// scramjet/core
+	// hooked functions keep their constructibility in every realm: a method stays a method and a
+	// constructor stays one, in the page, an about:blank frame it reaches into, and another document.
+	// The client decides plain wrapper or Proxy once per hook name and shares that between documents
+	serverTest({
+		name: "regression-hooked-functions-constructibility",
+		autoPass: false,
+		js: `
+		${CONSTRUCTIBILITY_CHECK}
+		const bad = checkConstructibility(window, "page");
+		const blank = document.createElement("iframe");
+		document.body.appendChild(blank);
+		bad.push(...checkConstructibility(blank.contentWindow, "about:blank frame"));
+		const fromDoc = await new Promise((resolve, reject) => {
+			const timer = setTimeout(() => reject(new Error("second document never answered")), 10000);
+			window.addEventListener("message", (e) => {
+				if (!e.data || !Array.isArray(e.data.constructibility)) return;
+				clearTimeout(timer);
+				resolve(e.data.constructibility);
+			});
+			const doc = document.createElement("iframe");
+			doc.src = "/constructibility-frame.html";
+			document.body.appendChild(doc);
+		});
+		bad.push(...fromDoc);
+		assert(bad.length === 0, bad.join("; "));
+		pass("hooked functions keep their constructibility in every realm");
+	`,
+		start: async (server) => {
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				const path = (req.url || "").split("?")[0] || "";
+				if (path !== "/constructibility-frame.html") return;
+				res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
+				res.end(
+					`<!doctype html><script>${CONSTRUCTIBILITY_CHECK}
+parent.postMessage({ constructibility: checkConstructibility(window, "second document") }, "*");
+</script>`
+				);
+			});
+		},
+	}),
+	// scramjet/core
+	// a 3xx without a Location (and a 304 for the page's own conditional request) was taken for a
+	// redirect and failed the request (new URL(null)). fetch hands those to the page as they are.
+	// Not the 304 here: runway's libcurl transport can't make a 304 Response (it gives it a body)
+	serverTest({
+		name: "regression-3xx-without-location",
+		autoPass: false,
+		js: `
+		const noLocation = await fetch("/redirect-without-location");
+		assertEqual(noLocation.status, 302, "a 302 without a Location is the response");
+		assertEqual(await noLocation.text(), "nowhere to go", "and its body");
+		pass("a 3xx without a Location reaches the page");
+	`,
+		start: async (server) => {
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				const path = (req.url || "").split("?")[0] || "";
+				if (path === "/redirect-without-location") {
+					res.writeHead(302, { "Content-Type": "text/plain" });
+					res.end("nowhere to go");
+				}
 			});
 		},
 	}),

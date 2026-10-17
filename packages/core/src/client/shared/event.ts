@@ -1,17 +1,53 @@
 import { iswindow } from "@client/entry";
+import { SCRAMJETCLIENT } from "@/symbols";
 import { ScramjetClient } from "@client/index";
 import { getOwnPropertyDescriptorHandler } from "@client/helpers";
 import {
 	Object_defineProperty,
 	Reflect_apply,
+	Object_keys,
 	Reflect_get,
-	Reflect_ownKeys,
 	Symbol_for,
+	_WeakMap,
 } from "@/shared/snapshot";
+
+type Listener = (...args: any) => any;
 
 const realOnEvent = Symbol_for("scramjet original onevent function");
 
+// true for a window outside the proxy, e.g. the host page posting into the frame. such a window
+// must not reach the page, since its eval and other members are the real ones
+function isForeignWindow(source: any): boolean {
+	try {
+		if (source.window !== source) return false;
+
+		return !(SCRAMJETCLIENT in source);
+	} catch {
+		// a cross-origin window throws on the symbol check, and it is still foreign
+		return true;
+	}
+}
+
 export default function (client: ScramjetClient, self: Self) {
+	// the page gets one handle per foreign window, so repeated events from the same window compare equal
+	const foreignSources = new _WeakMap<object, object>();
+	function foreignSourceHandle(source: any): object {
+		let handle = foreignSources.get(source);
+		if (!handle) {
+			handle = {
+				// replies still reach the real window
+				postMessage(...args: any[]) {
+					return source.postMessage(...args);
+				},
+				// the page's own view of eval: the indirect eval rewrites its code, as `parent.eval` does
+				eval: client.indirectEval,
+			};
+			foreignSources.set(source, handle);
+		}
+
+		return handle;
+	}
+
 	const handlers = {
 		message: {
 			_init() {
@@ -28,9 +64,9 @@ export default function (client: ScramjetClient, self: Self) {
 			source() {
 				if (this.source === null) return null;
 
-				// const scram: ScramjetClient = this.source[SCRAMJETCLIENT];
-
-				// if (scram) return scram.globalProxy;
+				// messages between proxied windows keep the real window, as before
+				if (isForeignWindow(this.source))
+					return foreignSourceHandle(this.source);
 
 				return this.source;
 			},
@@ -69,8 +105,19 @@ export default function (client: ScramjetClient, self: Self) {
 		},
 	};
 
-	function wraplistener(listener: (...args: any) => any) {
-		return new Proxy(listener, {
+	// one wrapper per original listener: the same function always maps to the same
+	// proxy, so native addEventListener dedupes it and native removeEventListener
+	// matches (type, proxy, capture) exactly like the browser would
+	const proxiedListeners = new _WeakMap() as WeakMap<Listener, Listener>;
+	// the event currently being dispatched to a wrapped listener (backs window.event)
+	let currentEvent: Event | undefined;
+	let windowEventDefined = false;
+
+	function wraplistener(listener: Listener): Listener {
+		const existing = proxiedListeners.get(listener);
+		if (existing) return existing;
+
+		const proxied = new Proxy(listener, {
 			apply(target, that, args) {
 				const realEvent: Event = args[0];
 
@@ -112,59 +159,60 @@ export default function (client: ScramjetClient, self: Self) {
 					}
 				}
 
-				if (!self.event) {
+				// only where the browser doesn't provide it (e.g. workers), and only once:
+				// our getter reads undefined between dispatches, so checking self.event
+				// alone would redefine it on every call (e.g. every pointer move)
+				if (!windowEventDefined && !self.event) {
+					windowEventDefined = true;
 					Object_defineProperty(self, "event", {
 						get() {
-							return args[0];
+							return currentEvent;
 						},
 						configurable: true,
 					});
 				}
 
-				const rv = Reflect_apply(target, that, args);
-
-				return rv;
+				const prevEvent = currentEvent;
+				currentEvent = args[0];
+				try {
+					return Reflect_apply(target, that, args);
+				} finally {
+					currentEvent = prevEvent;
+				}
 			},
 			getOwnPropertyDescriptor: getOwnPropertyDescriptorHandler,
 		});
+
+		proxiedListeners.set(listener, proxied);
+		return proxied;
 	}
+
+	// a wrapper only changes what a listener sees for the types in handlers (trusted events are
+	// rewritten), and it tracks currentEvent for window.event. window has a native window.event, so
+	// other types need no wrapper there. add and remove decide by the same type, so a listener is
+	// wrapped and unwrapped consistently
+	const wrapEveryType = !iswindow || !("event" in self);
+	const needsWrap = (args: unknown[]) => {
+		const type = args[0];
+		return wrapEveryType || typeof type !== "string" || type in handlers;
+	};
 
 	client.Proxy("EventTarget.prototype.addEventListener", {
 		apply(ctx) {
 			if (typeof ctx.args[1] !== "function") return;
+			if (!needsWrap(ctx.args)) return;
 
-			const origlistener = ctx.args[1];
-			const proxylistener = wraplistener(origlistener);
-
-			ctx.args[1] = proxylistener;
-
-			let arr = client.eventcallbacks.get(ctx.this);
-			arr ||= [] as any;
-			arr.push({
-				event: ctx.args[0] as string,
-				originalCallback: origlistener,
-				proxiedCallback: proxylistener,
-			});
-			client.eventcallbacks.set(ctx.this, arr);
+			ctx.args[1] = wraplistener(ctx.args[1]);
 		},
 	});
 
 	client.Proxy("EventTarget.prototype.removeEventListener", {
 		apply(ctx) {
 			if (typeof ctx.args[1] !== "function") return;
+			if (!needsWrap(ctx.args)) return;
 
-			const arr = client.eventcallbacks.get(ctx.this);
-			if (!arr) return;
-
-			const i = arr.findIndex(
-				(e) => e.event === ctx.args[0] && e.originalCallback === ctx.args[1]
-			);
-			if (i === -1) return;
-
-			const r = arr.splice(i, 1);
-			client.eventcallbacks.set(ctx.this, arr);
-
-			ctx.args[1] = r[0].proxiedCallback;
+			// keep capture/options in args[2] untouched: the native call matches on them
+			ctx.args[1] = proxiedListeners.get(ctx.args[1]) ?? ctx.args[1];
 		},
 	});
 
@@ -176,40 +224,35 @@ export default function (client: ScramjetClient, self: Self) {
 	if (iswindow) targets.push(self.HTMLElement.prototype);
 	if (self.Worker) targets.push(self.Worker.prototype);
 
+	// only the on<type> properties for the types in handlers are trapped, so look those up by name:
+	// listing the window's own keys (over a thousand) cost more than the rest of this module
+	const onKeys = Object_keys(handlers).map((type) => "on" + type);
 	for (const target of targets) {
-		const keys = Reflect_ownKeys(target);
+		for (const key of onKeys) {
+			const descriptor = client.natives.call(
+				"Object.getOwnPropertyDescriptor",
+				null,
+				target,
+				key
+			);
+			if (!descriptor?.get || !descriptor.set || !descriptor.configurable)
+				continue;
 
-		for (const key of keys) {
-			if (
-				typeof key === "string" &&
-				key.startsWith("on") &&
-				handlers[key.slice(2)]
-			) {
-				const descriptor = client.natives.call(
-					"Object.getOwnPropertyDescriptor",
-					null,
-					target,
-					key
-				);
-				if (!descriptor.get || !descriptor.set || !descriptor.configurable)
-					continue;
+			// these are the `onmessage`, `onclick`, etc. properties
+			client.RawTrap(target, key, {
+				get(ctx) {
+					if (this[realOnEvent]) return this[realOnEvent];
 
-				// these are the `onmessage`, `onclick`, etc. properties
-				client.RawTrap(target, key, {
-					get(ctx) {
-						if (this[realOnEvent]) return this[realOnEvent];
+					return ctx.get();
+				},
+				set(ctx, value: any) {
+					this[realOnEvent] = value;
 
-						return ctx.get();
-					},
-					set(ctx, value: any) {
-						this[realOnEvent] = value;
+					if (typeof value !== "function") return ctx.set(value);
 
-						if (typeof value !== "function") return ctx.set(value);
-
-						ctx.set(wraplistener(value));
-					},
-				});
-			}
+					ctx.set(wraplistener(value));
+				},
+			});
 		}
 	}
 }

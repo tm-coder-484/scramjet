@@ -75,6 +75,8 @@ export type ScramjetClientInit = {
 		options?: CookieSyncOptions
 	) => Promise<void>;
 	shouldBlockMessageEvent?: (ev: MessageEvent) => boolean;
+	/** returns a transport port for a worker this realm creates, so the worker can open websockets */
+	createWorkerTransport?: () => MessagePort;
 	hookSubcontext: (self: Self, frame?: HTMLIFrameElement) => ScramjetClient;
 	initHeaders: RawHeaders;
 	history: TrackedHistoryState[];
@@ -154,6 +156,142 @@ export type ScramjetModule = {
 	order: number | undefined;
 	default: (client: ScramjetClient, self: GlobalThis) => void;
 };
+
+// the ctx a hook handler gets for an apply. return and call are on the prototype, so a hooked
+// call allocates this one object instead of two closures. no handler uses return/call detached
+class ApplyHookCtx {
+	fn: any;
+	"this": any;
+	args: any[];
+	newTarget: null = null;
+	earlyreturn = false;
+	returnValue: any = undefined;
+	invoke: (fn: any, that: any, args: any[]) => any;
+	constructor(
+		fn: any,
+		that: any,
+		args: any[],
+		invoke: (fn: any, that: any, args: any[]) => any
+	) {
+		this.fn = fn;
+		this["this"] = that;
+		this.args = args;
+		this.invoke = invoke;
+	}
+	return(r: any) {
+		this.earlyreturn = true;
+		this.returnValue = r;
+	}
+	call() {
+		this.earlyreturn = true;
+		return (this.returnValue = this.invoke(this.fn, this["this"], this.args));
+	}
+}
+
+// same as ApplyHookCtx, for a construct
+class ConstructHookCtx {
+	fn: any;
+	args: any[];
+	newTarget: any;
+	"this": null = null;
+	earlyreturn = false;
+	returnValue: any = undefined;
+	invoke: (fn: any, args: any[], newTarget: any) => any;
+	constructor(
+		fn: any,
+		args: any[],
+		newTarget: any,
+		invoke: (fn: any, args: any[], newTarget: any) => any
+	) {
+		this.fn = fn;
+		this.args = args;
+		this.newTarget = newTarget;
+		this.invoke = invoke;
+	}
+	return(r: any) {
+		this.earlyreturn = true;
+		this.returnValue = r;
+	}
+	call() {
+		this.earlyreturn = true;
+		return (this.returnValue = this.invoke(this.fn, this.args, this.newTarget));
+	}
+}
+
+const emptyFunction = function () {};
+
+// true for a function that is not constructible and has no prototype property: a prototype method,
+// a global function such as fetch, or a static such as URL.createObjectURL. these are the kind a plain
+// wrapper can stand in for. constructors (and bound functions of constructors) stay on Proxy
+function isPlainFunction(value: any): boolean {
+	if (typeof value !== "function") return false;
+	if (Reflect_has(value, "prototype")) return false;
+	// the real test: Reflect.construct throws when newTarget is not a constructor, and reads nothing
+	// from it since value has no prototype property. this runs for every hooked function in every
+	// frame, and most of a throw's cost is capturing the stack, which nothing reads here
+	const limit = Error.stackTraceLimit;
+	Error.stackTraceLimit = 0;
+	try {
+		Reflect_construct(emptyFunction, [], value);
+	} catch {
+		return true;
+	} finally {
+		Error.stackTraceLimit = limit;
+	}
+	return false;
+}
+
+// isPlainFunction's answer per hook name ("Element.prototype.append"). It is the same for every
+// realm's built-in at that name, and the throw it takes is slow in a fresh realm: booting the client
+// took ~25ms more per document, and per about:blank frame a page reaches into (YouTube's front page
+// boots four). A function with a prototype property is still never plain
+let plainByName: Record<string, boolean | undefined> = {
+	__proto__: null,
+} as unknown as Record<string, boolean | undefined>;
+
+/**
+ * Has this realm share isPlainFunction's answers with the page's other documents. `store` is a
+ * null-prototype object every document of the page gets (the controller's host page publishes it)
+ */
+export function sharePlainNatives(store: Record<string, boolean | undefined>) {
+	plainByName = store;
+}
+
+function isPlainNative(name: string | undefined, value: any): boolean {
+	if (typeof value !== "function" || Reflect_has(value, "prototype"))
+		return false;
+	if (name === undefined) return isPlainFunction(value);
+	let plain = plainByName[name];
+	if (plain === undefined) plainByName[name] = plain = isPlainFunction(value);
+	return plain;
+}
+
+// a method-shorthand function has no [[Construct]] and no prototype, like the native it wraps.
+// name and length are copied from the native
+function createMethodWrapper(
+	name: string,
+	value: AnyFunction,
+	applyHook: (fn: any, that: any, args: any[]) => any
+): AnyFunction {
+	const wrapper = {
+		[name](this: any, ...args: any[]) {
+			return applyHook(value, this, args);
+		},
+	}[name];
+	Object_defineProperty(wrapper, "length", {
+		value: value.length,
+		writable: false,
+		enumerable: false,
+		configurable: true,
+	});
+	Object_defineProperty(wrapper, "name", {
+		value: value.name,
+		writable: false,
+		enumerable: false,
+		configurable: true,
+	});
+	return wrapper;
+}
 
 function findBox(global: Window, seen: Window[]): SingletonBox | null {
 	if (seen.includes(global)) return null;
@@ -351,29 +489,66 @@ export class ScramjetClient {
 		};
 		// eslint-disable-next-line @typescript-eslint/no-this-alias
 		const client = this;
+		// the url of the first <base href>, resolved when it was last processed
+		let frozenBase: {
+			element: HTMLBaseElement;
+			href: string;
+			count: number;
+			url: string;
+		} | null = null;
 		this.meta = {
 			get origin() {
 				return client.url;
 			},
 			get base() {
-				if (iswindow) {
-					const base = client.natives.call(
-						"Document.prototype.querySelector",
-						client.global.document,
-						"base"
-					);
-					if (base) {
-						let url = base.getAttribute("href");
-						if (!url) return client.url;
-						const frag = url.indexOf("#");
-						url = url.substring(0, frag === -1 ? undefined : frag);
-						if (!url) return client.url;
+				if (!iswindow) return client.url;
 
-						return new _URL(url, client.url.origin);
+				const bases = client.natives.call(
+					"Document.prototype.getElementsByTagName",
+					client.global.document,
+					"base"
+				);
+				let base: HTMLBaseElement | null = null;
+				for (let i = 0; i < bases.length; i++) {
+					if (bases[i].hasAttribute("href")) {
+						base = bases[i] as HTMLBaseElement;
+						break;
 					}
 				}
+				if (!base) {
+					frozenBase = null;
+					return client.url;
+				}
 
-				return client.url;
+				// like the browser, resolve the base href against the document url only when the
+				// base is processed (inserted, href changed, bases added or removed), so a later
+				// pushState/replaceState doesn't move it (GeForce NOW's lazy chunks rely on this)
+				const href = base.getAttribute("href");
+				if (
+					frozenBase?.element !== base ||
+					frozenBase.href !== href ||
+					frozenBase.count !== bases.length
+				) {
+					let url = client.url;
+					try {
+						const parsed = new _URL(href, url);
+						if (
+							parsed.protocol !== "data:" &&
+							parsed.protocol !== "javascript:"
+						)
+							url = parsed;
+					} catch {
+						// an invalid href falls back to the document url
+					}
+					frozenBase = {
+						element: base,
+						href,
+						count: bases.length,
+						url: url.href,
+					};
+				}
+
+				return new _URL(frozenBase.url);
 			},
 			// TODO: very bad assumptions made here, window.parent never throws
 			get topFrameName() {
@@ -490,24 +665,29 @@ export class ScramjetClient {
 				if (!iswindow) return "";
 
 				// TODO: need to nullify the actual meta tag so it still sends unsafe-url
-				const meta = [
-					...client.natives.call(
-						"Document.prototype.querySelectorAll",
-						client.global.document,
-						"meta[name='referrer']"
-					),
-					...client.natives.call(
-						"Document.prototype.querySelectorAll",
-						client.global.document,
-						"meta[name='referrer-policy']"
-					),
-					...client.natives.call(
-						"Document.prototype.querySelectorAll",
-						client.global.document,
-						"meta[http-equiv='referrer-policy']"
-					),
+				// one walk for the <meta> tags (the engine caches a live tag collection until the DOM
+				// changes), then the three checks run on that short list. the last match wins, in the
+				// order: name=referrer, name=referrer-policy, http-equiv=referrer-policy (ASCII case-insensitive)
+				// a querySelectorAll with a selector list costs as much as three separate walks, so it is not used
+				const metas = client.natives.call(
+					"Document.prototype.getElementsByTagName",
+					client.global.document,
+					"meta"
+				);
+				const attr = (el: Element, name: string) =>
+					client.natives.call("Element.prototype.getAttribute", el, name);
+				const matchers: ((el: Element) => boolean)[] = [
+					(el) => attr(el, "name") === "referrer",
+					(el) => attr(el, "name") === "referrer-policy",
+					(el) =>
+						(attr(el, "http-equiv") ?? "").toLowerCase() === "referrer-policy",
 				];
-				const last = meta[meta.length - 1];
+				let last: Element | undefined;
+				for (const matches of matchers) {
+					for (let i = 0; i < metas.length; i++) {
+						if (matches(metas[i])) last = metas[i];
+					}
+				}
 				if (last) {
 					return last.getAttribute("content");
 				}
@@ -566,8 +746,33 @@ export class ScramjetClient {
 		}
 	}
 
+	// location.href is unrewritten (two URL parses) on every read of client.url, and client.url
+	// is read several times per URL rewrite (meta.origin, meta.base), so keep the last result
+	private lastRawHref: string | undefined;
+	private lastUnrewrittenHref: string | undefined;
+	// the parsed form of lastUnrewrittenHref, built lazily. it stays inside the client: it is only read
+	// by peekUrl(), and url hands out a fresh object each time since callers may mutate it
+	private cachedUrl: _URL | undefined;
+
+	private syncUrl(): string {
+		const raw = this.global.location.href;
+		if (raw !== this.lastRawHref || this.lastUnrewrittenHref === undefined) {
+			this.lastUnrewrittenHref = this.unrewriteUrl(raw);
+			this.lastRawHref = raw;
+			this.cachedUrl = undefined;
+		}
+		return this.lastUnrewrittenHref;
+	}
+
 	get url(): _URL {
-		return new _URL(this.unrewriteUrl(this.global.location.href));
+		return new _URL(this.syncUrl());
+	}
+
+	// read-only view of the current url, for reading its string properties (href, origin, ...).
+	// never pass it to code that might mutate it, use url for that
+	peekUrl(): _URL {
+		const href = this.syncUrl();
+		return this.cachedUrl ?? (this.cachedUrl = new _URL(href));
 	}
 
 	set url(url: _URL | string) {
@@ -631,7 +836,8 @@ export class ScramjetClient {
 
 		let applyFn: typeof Reflect_apply;
 		let constructFn: typeof Reflect_construct;
-		if (this.flagEnabled("debugTrampolines")) {
+		const debugTrampolines = this.flagEnabled("debugTrampolines");
+		if (debugTrampolines) {
 			let fnName: string;
 			if (debugname) {
 				fnName = debugname;
@@ -688,97 +894,66 @@ return { apply, construct };
 				args: any[],
 				newTarget: AnyFunction
 			) {
-				let returnValue: any = undefined;
-				let earlyreturn = false;
-
-				const ctx: ProxyCtx<any, "construct"> = {
-					fn: constructor,
-					this: null,
+				const ctx = new ConstructHookCtx(
+					constructor,
 					args,
-					newTarget: newTarget,
-					return: (r: any) => {
-						earlyreturn = true;
-						returnValue = r;
-					},
-					call: () => {
-						earlyreturn = true;
-						returnValue = constructFn(ctx.fn, ctx.args, ctx.newTarget);
+					newTarget,
+					constructFn
+				);
 
-						return returnValue;
-					},
-				};
+				handler.construct!(ctx as any as ProxyCtx<any, "construct">);
 
-				handler.construct(ctx);
-
-				if (earlyreturn) {
-					return returnValue;
+				if (ctx.earlyreturn) {
+					return ctx.returnValue;
 				}
 
 				return constructFn(ctx.fn, ctx.args, ctx.newTarget);
 			};
 		}
 
-		if (handler.apply) {
-			h.apply = (fn: any, that: any, args: any[]) => {
-				let returnValue: any = undefined;
-				let earlyreturn = false;
+		// the apply logic, shared by the Proxy apply trap and the plain wrapper below
+		// allowFailedIntercepts is read on the first call, exactly when the old per-call check first read it
+		// (flagEnabled caches per client, so every later read returns the same value)
+		let allowFailed: boolean | undefined;
+		// hoisted: one function per hook, not one per call
+		// eslint-disable-next-line @typescript-eslint/no-this-alias
+		const client = this;
+		const prepareStackTrace = function (err: any, s: any[]) {
+			if (
+				s[0].getFileName() &&
+				!s[0].getFileName().startsWith(client.context.prefix.href)
+			) {
+				return { stack: err.stack };
+			}
+		};
+		const applyHook = (fn: any, that: any, args: any[]) => {
+			const ctx = new ApplyHookCtx(fn, that, args, applyFn);
+			allowFailed ??= this.flagEnabled("allowFailedIntercepts");
 
-				const ctx: ProxyCtx<any, "apply"> = {
-					fn,
-					this: that,
-					args,
-					newTarget: null,
-					return: (r: any) => {
-						earlyreturn = true;
-						returnValue = r;
-					},
-					call: () => {
-						earlyreturn = true;
-						returnValue = applyFn(ctx.fn, ctx.this, ctx.args);
+			if (!debugTrampolines && allowFailed) {
+				// fast path, no error detection
+				handler.apply!(ctx as any as ProxyCtx<any, "apply">);
 
-						return returnValue;
-					},
-				};
-				if (
-					!this.flagEnabled("debugTrampolines") &&
-					this.flagEnabled("allowFailedIntercepts")
-				) {
-					// fast path, no error detection
-					handler.apply(ctx);
-
-					if (earlyreturn) {
-						return returnValue;
-					}
-					return applyFn(ctx.fn, ctx.this, ctx.args);
+				if (ctx.earlyreturn) {
+					return ctx.returnValue;
 				}
+				return applyFn(ctx.fn, ctx.this, ctx.args);
+			}
 
-				const pst = Error.prepareStackTrace;
+			const pst = Error.prepareStackTrace;
 
-				// eslint-disable-next-line @typescript-eslint/no-this-alias
-				const client = this;
-				Error.prepareStackTrace = function (err, s) {
-					if (
-						s[0].getFileName() &&
-						!s[0].getFileName().startsWith(client.context.prefix.href)
-					) {
-						return { stack: err.stack };
-					}
-				};
+			Error.prepareStackTrace = prepareStackTrace;
 
-				try {
-					handler.apply(ctx);
-				} catch (err) {
-					if (this.box.instanceof(err, "Error")) {
-						if (this.box.instanceof(err.stack, "Object")) {
-							//i'm not going to explain this
-							err.stack = err.stack.stack;
-							// eslint-disable-next-line scramjet-core/no-globals
-							console.error("ERROR FROM SCRAMJET INTERNALS", err);
-							if (!this.flagEnabled("allowFailedIntercepts")) {
-								Error.prepareStackTrace = pst;
-								throw err;
-							}
-						} else {
+			try {
+				handler.apply!(ctx as any as ProxyCtx<any, "apply">);
+			} catch (err) {
+				if (this.box.instanceof(err, "Error")) {
+					if (this.box.instanceof(err.stack, "Object")) {
+						//i'm not going to explain this
+						err.stack = err.stack.stack;
+						// eslint-disable-next-line scramjet-core/no-globals
+						console.error("ERROR FROM SCRAMJET INTERNALS", err);
+						if (!allowFailed) {
 							Error.prepareStackTrace = pst;
 							throw err;
 						}
@@ -786,21 +961,36 @@ return { apply, construct };
 						Error.prepareStackTrace = pst;
 						throw err;
 					}
+				} else {
+					Error.prepareStackTrace = pst;
+					throw err;
 				}
+			}
 
-				Error.prepareStackTrace = pst;
+			Error.prepareStackTrace = pst;
 
-				if (earlyreturn) {
-					return returnValue;
-				}
+			if (ctx.earlyreturn) {
+				return ctx.returnValue;
+			}
 
-				return applyFn(ctx.fn, ctx.this, ctx.args);
-			};
+			return applyFn(ctx.fn, ctx.this, ctx.args);
+		};
+
+		let proxy: any;
+		if (
+			handler.apply &&
+			!handler.construct &&
+			isPlainNative(debugname, value)
+		) {
+			// a non-constructible function without a prototype (method, global or static): a real
+			// function is much cheaper than a Proxy apply trap
+			proxy = createMethodWrapper(prop, value, applyHook);
+		} else {
+			if (handler.apply) h.apply = applyHook;
+			h.getOwnPropertyDescriptor = getOwnPropertyDescriptorHandler;
+			proxy = new Proxy(value, h);
 		}
-
-		const proxy = new Proxy(value, h);
 		this.box.unproxy.set(proxy, value);
-		h.getOwnPropertyDescriptor = getOwnPropertyDescriptorHandler;
 		// Preserve original property descriptor (enumerable, configurable, etc.)
 		Object_defineProperty(target, prop, {
 			value: proxy,

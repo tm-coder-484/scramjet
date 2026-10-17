@@ -41,6 +41,14 @@ export default function (client: ScramjetClient, _self: Self) {
 		],
 		{
 			apply(ctx) {
+				// entry names are stored as proxy urls, so an absolute url argument is looked up in that form
+				if (
+					typeof ctx.args[0] === "string" &&
+					/^https?:\/\//i.test(ctx.args[0])
+				) {
+					ctx.args[0] = client.rewriteUrl(ctx.args[0]);
+				}
+
 				const entries = ctx.call() as PerformanceEntry[];
 
 				return ctx.return(filterEntries(entries));

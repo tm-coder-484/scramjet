@@ -26,6 +26,7 @@ export const Object_getOwnPropertySymbols =
 export const Object_defineProperty = globalThis.Object.defineProperty;
 export const Object_defineProperties = globalThis.Object.defineProperties;
 export const Object_setPrototypeOf = globalThis.Object.setPrototypeOf;
+export const Object_getPrototypeOf = globalThis.Object.getPrototypeOf;
 
 export const Reflect_get = globalThis.Reflect.get;
 export const Reflect_set = globalThis.Reflect.set;
@@ -60,6 +61,7 @@ export const URL_revokeObjectURL = globalThis.URL.revokeObjectURL.bind(
 );
 
 export const Error = globalThis.Error;
+export const SyntaxError = globalThis.SyntaxError;
 export const Math_random = globalThis.Math.random;
 export const Math_min = globalThis.Math.min;
 
@@ -207,6 +209,7 @@ export type _Uint8Array = Wrapped<Uint8Array>;
 export const _TextDecoder = makeWrap(globalThis.TextDecoder);
 export type _TextDecoder = Wrapped<TextDecoder>;
 export const _TextEncoder = makeWrap(globalThis.TextEncoder);
+export const _ReadableStream = makeWrap(globalThis.ReadableStream);
 export type _TextEncoder = Wrapped<TextEncoder>;
 
 export function makeWrap<T extends object>(source: T): Wrapped<T> {

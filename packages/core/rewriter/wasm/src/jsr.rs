@@ -14,12 +14,14 @@ use crate::{
 	 get_obj, get_str, set_obj,
 };
 
-// slightly modified https://github.com/ungap/random-uuid/blob/main/index.js
+// 11 random hex digits, from one getRandomValues call (it was one call per digit, and every
+// rewrite, down to an inline event handler, makes a tag)
 #[wasm_bindgen(inline_js = r#"
 export function scramtag() {
-    return (""+1e10).replace(/[018]/g,
-      c => (c ^ crypto.getRandomValues(new Uint8Array(1))[0] & 15 >> c / 4).toString(16)
-    );
+    const bytes = crypto.getRandomValues(new Uint8Array(11));
+    let tag = "";
+    for (let i = 0; i < 11; i++) tag += (bytes[i] & 15).toString(16);
+    return tag;
 }
 "#)]
 extern "C" {
@@ -67,7 +69,13 @@ impl UrlRewriter for WasmUrlRewriter {
 
 		if module {
 			// TODO: keep this in sync with QP.isModule or find a way to make this use the real rewriteUrl function
-			let origin = Url::new(&flags.base).map_err(RewriterError::from)?.origin();
+			// $io is the origin the import is fetched for (the document's, see Flags::origin), as
+			// rewriteUrl tags dynamic imports: a different value would make it a different module
+			let origin = if flags.origin.is_empty() {
+				Url::new(&flags.base).map_err(RewriterError::from)?.origin()
+			} else {
+				flags.origin.clone()
+			};
 			let encoded_origin: String = encode_uri_component(&origin).into();
 			rewritten.push_str("?%24module=module&%24io=");
 			rewritten.push_str(&encoded_origin);

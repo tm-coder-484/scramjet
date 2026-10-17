@@ -12,17 +12,25 @@ import {
 } from ".";
 import { rewriteUrl, unrewriteBlob, unrewriteUrl } from "@rewriters/url";
 import { QP, parseRequest } from "./parse";
-import { ScramjetHeaders } from "@/shared";
+import { ScramjetHeaders, flagEnabled } from "@/shared";
+import {
+	NATIVE_BODY,
+	REWRITE_FINISH,
+	REWRITE_HEADER,
+	rewriteCacheHeader,
+} from "@rewriters/js";
 import { isDocument, isRedirect, normalizeContentType } from "./util";
 import { rewriteBody } from "./body";
+import { corsPreflight } from "./cors";
 import { Tap } from "@/Tap";
 import {
 	computeFetchSite,
+	rewriteContentDisposition,
 	rewriteRequestHeaders,
 	rewriteResponseHeaders,
 	worstFetchSite,
 } from "./headers";
-import { _URL } from "@/shared/snapshot";
+import { Array_isArray, _URL } from "@/shared/snapshot";
 
 export async function doHandleFetch(
 	handler: ScramjetFetchHandler,
@@ -63,17 +71,43 @@ export async function doHandleFetch(
 	}
 
 	const newheaders = rewriteRequestHeaders(request, handler, parsed);
+	if (flagEnabled("corsPreflight", handler.context, parsed.meta.base))
+		await corsPreflight(handler, request, parsed, newheaders);
 
 	let responseBody: BodyType;
 	const response = await doNetworkFetch(handler, request, parsed, newheaders);
 
 	// set-cookie needs to take the raw headers. after this, we can flatten the headers into a ScramjetHeaders object
-	await handleCookies(handler, request, parsed, response.rawHeaders);
+	const cookieSync = handleCookies(
+		handler,
+		request,
+		parsed,
+		response.rawHeaders
+	);
+	// the cookies reach the page's clients while the body is on its way, for a response the page
+	// can only use once all of it is in (see ScramjetFetchResponse.cookieSync). The rest wait here:
+	// a fetch() can read document.cookie as soon as it has the headers. By the browser's own
+	// destination: the one in the url (QP.destination) is the page's to set
+	const deferCookies =
+		cookieSync !== undefined &&
+		WHOLE_BODY_DESTINATIONS.has(request.rawDestination) &&
+		WHOLE_BODY_DESTINATIONS.has(parsed.destination) &&
+		!isRedirect(response);
+	if (cookieSync && !deferCookies) await cookieSync;
+	// whoever gets the response waits for it too, and ends its body either way
+	else
+		cookieSync?.catch((err) =>
+			console.error(
+				"scramjet: couldn't send a response's cookies to the page",
+				err
+			)
+		);
 
 	if (isDocument(parsed)) {
 		// for document.referer
 		parsed.trackedClient?.history.push({
 			url: parsed.url.href,
+			referrer: newheaders.get("Referer") ?? "",
 			refererPolicy: ScramjetHeaders.fromRawHeaders(response.rawHeaders).get(
 				"referrer-policy"
 			),
@@ -144,11 +178,19 @@ export async function doHandleFetch(
 		if (initiatorOriginUrl)
 			location.searchParams.set(QP.initiatorOrigin, initiatorOriginUrl.origin);
 		if (parsed.isModule) location.searchParams.set(QP.isModule, "module");
+		if (parsed.downloadName !== undefined)
+			location.searchParams.set(QP.download, parsed.downloadName);
 
 		responseHeaders.set("location", location.href);
 	}
 
-	if (response.body && !isRedirect(response)) {
+	let status = response.status;
+	if (!isRedirect(response)) {
+		status = rewriteContentDisposition(parsed, responseHeaders, status);
+		if (status === 204 && response.body) response.body.cancel().catch(() => {});
+	}
+
+	if (response.body && !isRedirect(response) && status !== 204) {
 		responseBody = await rewriteBody(handler, request, parsed, response);
 
 		// After rewriting HTML, the body is a JS string which will be encoded as
@@ -165,15 +207,48 @@ export async function doHandleFetch(
 		response: {
 			body: responseBody,
 			headers: responseHeaders,
-			status: response.status,
-			statusText: response.statusText,
+			status,
+			statusText: status === response.status ? response.statusText : "",
 		},
 	};
 
 	await Tap.dispatch(handler.hooks.fetch.response, respcontext, respprops);
 
+	// the body passes through as the transport gave it
+	const native = (response.rawHeaders as any)?.[NATIVE_BODY];
+	if (
+		typeof native === "function" &&
+		respprops.response.body != null &&
+		respprops.response.body === response.body
+	)
+		respprops.response.nativeBody = native;
+
+	if (deferCookies) {
+		// no body to hold back
+		if (respprops.response.body == null) await cookieSync;
+		else respprops.response.cookieSync = cookieSync;
+	}
 	return respprops.response;
 }
+
+// destinations whose response the page can only use once its last byte is in: a script runs, a
+// stylesheet applies, an image or font loads, a worker starts only then (an image may show, and
+// report its size, while it loads; its load event waits). Not "" (fetch, XHR, beacons), media, or
+// navigations
+const WHOLE_BODY_DESTINATIONS = new Set<string>([
+	"script",
+	"style",
+	"image",
+	"font",
+	"worker",
+	"sharedworker",
+	"manifest",
+	"track",
+	"xslt",
+	"audioworklet",
+	"paintworklet",
+	"json",
+]);
 
 export async function doNetworkFetch(
 	handler: ScramjetFetchHandler,
@@ -210,6 +285,25 @@ export async function doNetworkFetch(
 			earlyResponse = BareResponse.fromNativeResponse(resp);
 		}
 	} else {
+		// a script's rewrite-cache header, for a transport whose server can rewrite it (see
+		// REWRITE_HEADER); rewriteBody rewrites it under the same header
+		const headers = reqprops.init.headers;
+		if (
+			parsed.destination === "script" &&
+			request.method === "GET" &&
+			Array_isArray(headers) &&
+			flagEnabled("rewriteCache", handler.context, parsed.meta.base)
+		) {
+			(headers as any)[REWRITE_HEADER] = rewriteCacheHeader(
+				new _URL(reqprops.url).href,
+				handler.context,
+				parsed.meta,
+				parsed.isModule
+			);
+			// a finished rewrite has no sourceURL comment to add
+			if (!flagEnabled("debugSourceURL", handler.context, parsed.meta.origin))
+				(headers as any)[REWRITE_FINISH] = handler.context.prefix.pathname;
+		}
 		earlyResponse = await handler.client.fetch(reqprops.url, reqprops.init);
 	}
 
@@ -256,8 +350,11 @@ async function handleBlobOrDataUrlFetch(
 		);
 	}
 
+	const headers = ScramjetHeaders.fromRawHeaders(response.rawHeaders);
+	const status = rewriteContentDisposition(parsed, headers, response.status);
+
 	let body: BodyType;
-	if (response.body) {
+	if (response.body && status !== 204) {
 		body = await rewriteBody(
 			handler,
 			request,
@@ -265,8 +362,6 @@ async function handleBlobOrDataUrlFetch(
 			response as BareResponse
 		);
 	}
-	const headers = ScramjetHeaders.fromRawHeaders(response.rawHeaders);
-
 	// blob urls actually *can* set charsets, so we need to normalize them if it goes down the html path
 	normalizeContentType(parsed, headers);
 
@@ -279,8 +374,8 @@ async function handleBlobOrDataUrlFetch(
 
 	return {
 		body,
-		status: response.status,
-		statusText: response.statusText,
+		status,
+		statusText: status === response.status ? response.statusText : "",
 		headers: headers,
 	};
 }
@@ -295,18 +390,32 @@ export function registrableDomainForRedirect(hostname: string): string {
 	return labels.slice(-2).join(".");
 }
 
-async function handleCookies(
+// the last cookie sync that changed what a page can see, until the page's clients have it
+let visibleSync: Promise<void> | undefined;
+
+// stores the response's cookies in the jar, then sends them to the page's clients. Returns what the
+// response must wait for before the page may see it: the sync, if it changed what a page can see
+// through document.cookie. Many sites set the same cookie again on every response (Cloudflare's
+// on ~90 of its front page's), and each sync waits for a page's main thread. A response that only
+// sets cookies again waits for nothing, or for the sync that set those values if the page doesn't
+// have it yet. undefined when there's nothing to wait for
+function handleCookies(
 	handler: ScramjetFetchHandler,
 	request: ScramjetFetchRequest,
 	parsed: ScramjetFetchParsed,
 	rawHeaders: RawHeaders
-) {
+): Promise<void> | undefined {
 	const cookies = [];
+	let visible = false;
+	// the document that could see the cookies first: the one this response is, or the one that asked
+	// for it. Another site's cookies, or HttpOnly ones, it can't see
+	const observer = isDocument(parsed) ? parsed.url : parsed.clientUrl;
 
 	for (const [key, value] of rawHeaders) {
 		if (key.toLowerCase() !== "set-cookie") continue;
 
-		handler.context.cookieJar.setCookies(value, parsed.url);
+		if (handler.context.cookieJar.setCookies(value, parsed.url, observer))
+			visible = true;
 		cookies.push({
 			url: parsed.url,
 			cookie: value,
@@ -317,7 +426,23 @@ async function handleCookies(
 		return;
 	}
 
-	await handler.sendSetCookie(cookies, {
+	const sync = handler.sendSetCookie(cookies, {
 		destination: parsed.destination,
 	});
+	if (!visible) {
+		// still sent, for the new expiry, but nothing waits on it
+		sync.catch((err) =>
+			console.error(
+				"scramjet: couldn't send a response's cookies to the page",
+				err
+			)
+		);
+		return visibleSync;
+	}
+	visibleSync = sync;
+	const done = () => {
+		if (visibleSync === sync) visibleSync = undefined;
+	};
+	sync.then(done, done);
+	return sync;
 }

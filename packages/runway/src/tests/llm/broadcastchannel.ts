@@ -389,4 +389,28 @@ export default [
 			],
 		},
 	}),
+
+	basicTest({
+		name: "broadcastchannel-about-blank-frame-same-origin",
+		js: `
+			// an iframe with no src is about:blank; it must still reach its creator's channels
+			const name = "scramjet-bc-blank-" + Date.now() + "-" + Math.random();
+			const f = document.createElement("iframe");
+			document.body.appendChild(f);
+			await new Promise((r) => setTimeout(r, 200));
+			const parent = new BroadcastChannel(name);
+			const got = new Promise((resolve) => {
+				parent.addEventListener("message", (event) => resolve(event.data), { once: true });
+				setTimeout(() => resolve(null), 2000);
+			});
+			const child = new f.contentWindow.BroadcastChannel(name);
+			child.postMessage("from-blank");
+			const data = await got;
+			child.close();
+			parent.close();
+			assertEqual(data, "from-blank", "a message from an about:blank frame must arrive");
+			pass();
+		`,
+		autoPass: false,
+	}),
 ];

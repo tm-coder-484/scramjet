@@ -16,10 +16,28 @@ export type Cookie = {
 	sameSite?: string; // "strict"|"lax"|"none" or titlecase variants from parsers
 };
 
+// a document that may read cookies, by its URL's hostname and pathname
+export type CookieObserver = { hostname: string; pathname: string };
+
 export class CookieJar {
 	private cookies: Record<string, Cookie> = {};
 	// Index by domain (without leading dot)
 	private byDomain: Map<string, Cookie[]> = new Map();
+	// the last getCookies result, for the same host, path and call options. it stays valid until a
+	// cookie in it expires (expiry is the only time-dependent input), and any change to the jar clears it
+	private cached: {
+		hostname: string;
+		pathname: string;
+		fromJs: boolean;
+		sameSiteContext: string;
+		result: string;
+		computedAt: number;
+		validUntil: number;
+	} | null = null;
+
+	private invalidate() {
+		this.cached = null;
+	}
 
 	private defaultPath(url: URL): string {
 		const pathname = url.pathname;
@@ -61,8 +79,39 @@ export class CookieJar {
 		delete this.cookies[id];
 	}
 
-	setCookies(cookieString: string, url: URL) {
+	// whether document.cookie would show this cookie to a document at `observer` (HttpOnly ones it never
+	// shows to anyone)
+	private shownTo(
+		c: Cookie | undefined,
+		observer: CookieObserver | undefined
+	): boolean {
+		if (!c || c.httpOnly) return false;
+		if (!observer) return true;
+		const domain = c.domain!.slice(1);
+		const host = observer.hostname;
+		if (
+			c.hostOnly
+				? host !== domain
+				: host !== domain && !host.endsWith("." + domain)
+		)
+			return false;
+		return this.pathMatches(observer.pathname, c.path!);
+	}
+
+	/**
+	 * Stores the cookies of a Set-Cookie value. Returns whether that changed anything a page can see
+	 * through document.cookie (at `observer`, if given): a new cookie, another value or
+	 * HttpOnly/Secure flag, an earlier expiry, or a removal. Setting a cookie again as it is (with a
+	 * later expiry) changes nothing, and neither does an HttpOnly cookie
+	 */
+	setCookies(
+		cookieString: string,
+		url: URL,
+		observer?: CookieObserver
+	): boolean {
+		this.invalidate();
 		const parsedCookies = parse(cookieString);
+		let visible = false;
 
 		for (const parsedCookie of parsedCookies) {
 			const lowerName = parsedCookie.name.toLowerCase();
@@ -97,6 +146,7 @@ export class CookieJar {
 				if (!Number.isFinite(cookie.maxAge)) {
 					delete cookie.maxAge;
 				} else if (cookie.maxAge <= 0) {
+					if (this.shownTo(this.cookies[id], observer)) visible = true;
 					this.removeById(id);
 					continue;
 				} else {
@@ -105,10 +155,20 @@ export class CookieJar {
 			}
 
 			const prev = this.cookies[id];
+			if (
+				(this.shownTo(prev, observer) || this.shownTo(cookie, observer)) &&
+				(!prev ||
+					prev.value !== cookie.value ||
+					!!prev.httpOnly !== !!cookie.httpOnly ||
+					!!prev.secure !== !!cookie.secure ||
+					(cookie.expires ?? Infinity) < (prev.expires ?? Infinity))
+			)
+				visible = true;
 			if (prev) this.unindexCookie(prev);
 			this.cookies[id] = cookie;
 			this.indexCookie(cookie);
 		}
+		return visible;
 	}
 
 	// SameSite enforcement context passed to getCookies.
@@ -123,7 +183,20 @@ export class CookieJar {
 		const now = _Date.now();
 		const hostname = url.hostname;
 		const pathname = url.pathname;
+		const cached = this.cached;
+		if (
+			cached !== null &&
+			cached.hostname === hostname &&
+			cached.pathname === pathname &&
+			cached.fromJs === fromJs &&
+			cached.sameSiteContext === sameSiteContext &&
+			now >= cached.computedAt &&
+			now <= cached.validUntil
+		)
+			return cached.result;
 		const validCookies: Cookie[] = [];
+		// the earliest expiry among the cookies returned: once it passes, the result can change
+		let validUntil = Infinity;
 
 		// Walk the hostname's domain suffix chain
 		let key: string | undefined = hostname;
@@ -154,20 +227,33 @@ export class CookieJar {
 					// "strict" context: all cookies allowed (no filtering)
 
 					validCookies.push(cookie);
+					if (cookie.expires !== undefined && cookie.expires < validUntil)
+						validUntil = cookie.expires;
 				}
 			}
 			const dot = key.indexOf(".");
 			key = dot === -1 ? undefined : key.slice(dot + 1);
 		}
 
-		return validCookies
+		const result = validCookies
 			.map((cookie) =>
 				cookie.name ? `${cookie.name}=${cookie.value}` : cookie.value
 			)
 			.join("; ");
+		this.cached = {
+			hostname,
+			pathname,
+			fromJs,
+			sameSiteContext,
+			result,
+			computedAt: now,
+			validUntil,
+		};
+		return result;
 	}
 
 	load(cookies: string | Record<string, Cookie>) {
+		this.invalidate();
 		if (typeof cookies === "object") {
 			console.error("??");
 			return;
@@ -189,6 +275,7 @@ export class CookieJar {
 	}
 
 	clear() {
+		this.invalidate();
 		this.cookies = {};
 		this.byDomain.clear();
 	}

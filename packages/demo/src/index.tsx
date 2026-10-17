@@ -5,9 +5,49 @@ import EpoxyClient from "@mercuryworkshop/epoxy-transport";
 import { defaultConfigDev } from "@mercuryworkshop/scramjet";
 import { Controller } from "@mercuryworkshop/scramjet-controller";
 import { HttpCachePlugin } from "@mercuryworkshop/scramjet-utils";
-import { demoSettingsStore } from "./store";
+import { demoSettingsStore, getRelayUrl, getWebrtcRelay } from "./store";
 
 let app = document.getElementById("app")!;
+
+// Retries of a proxied url that the service worker missed, shared by this tab's documents.
+// A count older than RETRY_WINDOW_MS starts over, so the limit only bounds a burst of failures.
+const RETRY_KEY = "scramjet-proxy-retry";
+const MAX_RETRIES = 3;
+const RETRY_WINDOW_MS = 30000;
+
+function takeRetry(): boolean {
+	try {
+		const [count, at] = (sessionStorage.getItem(RETRY_KEY) ?? "0|0").split("|");
+		const n = Date.now() - Number(at) < RETRY_WINDOW_MS ? Number(count) : 0;
+		if (n >= MAX_RETRIES) return false;
+		sessionStorage.setItem(RETRY_KEY, `${n + 1}|${Date.now()}`);
+		return true;
+	} catch {
+		return false;
+	}
+}
+
+// This app must never mount inside its own site frame: the frame then shows a second omnibox.
+function isNestedInDemo(): boolean {
+	if (window.parent === window) return false;
+	try {
+		return !!window.parent.document.querySelector("form.url-form");
+	} catch {
+		return false;
+	}
+}
+
+// Retry the frame's url through the service worker, which handles it after a reload.
+function recoverNestedDemo() {
+	if (!takeRetry() || !navigator.serviceWorker) {
+		app.innerText =
+			"Could not load this page through the proxy. Reload the tab to try again.";
+		return;
+	}
+	navigator.serviceWorker.ready.then(() =>
+		setTimeout(() => location.reload(), 1000)
+	);
+}
 
 let controller: InstanceType<typeof Controller>;
 const cachePlugin = new HttpCachePlugin();
@@ -21,6 +61,25 @@ export function getTransport(): LibcurlClient | EpoxyClient {
 		default:
 			return new LibcurlClient({ wisp: wispUrl });
 	}
+}
+
+/**
+ * The relay transport runs with the controller in a worker, so requests never wait on this
+ * page's main thread, which the proxied site shares. The worker builds its own transport and
+ * plugins from these (they're serialized, so they can't close over anything here).
+ */
+function getRelayWorker() {
+	return {
+		scripts: ["/utils/scramjet-utils.js"],
+		transport: `() => new $scramjetUtils.RelayTransport({ url: ${JSON.stringify(getRelayUrl())}, prefetch: true, cache: true, rewriteCache: true })`,
+		// the worker's frames get the fetch-hook plugins this page would otherwise install
+		setupFrame: `(frame) => {
+			new $scramjetUtils.HttpCachePlugin().install(frame);
+			new $scramjetUtils.CatchEscapedLinksPlugin(
+				(url) => new URL("/?goto=" + encodeURIComponent(url.href), location.origin)
+			).install(frame);
+		}`,
+	};
 }
 
 async function waitForControllerOrReady(timeoutMs = 10000): Promise<void> {
@@ -95,8 +154,10 @@ async function init() {
 		}
 		controller = new Controller({
 			serviceworker: readySw,
-			transport: getTransport(),
-			scramjetConfig: defaultConfigDev,
+			...(demoSettingsStore.transport === "relay"
+				? { worker: getRelayWorker() }
+				: { transport: getTransport() }),
+			scramjetConfig: { ...defaultConfigDev, webrtcRelay: getWebrtcRelay() },
 		});
 		await controller.wait();
 		console.log(controller);
@@ -129,5 +190,9 @@ async function mount() {
 	}
 }
 
-init().then(() => mount());
+if (isNestedInDemo()) {
+	recoverNestedDemo();
+} else {
+	init().then(() => mount());
+}
 export { controller, cachePlugin };

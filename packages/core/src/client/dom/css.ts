@@ -1,11 +1,23 @@
 import { rewriteCss, unrewriteCss } from "@rewriters/css";
 import { ScramjetClient } from "@client/index";
-import { Reflect_apply, Reflect_get, Reflect_set } from "@/shared/snapshot";
+import {
+	Reflect_apply,
+	Reflect_get,
+	Reflect_set,
+	_WeakMap,
+} from "@/shared/snapshot";
+
+// rewriteCss only changes url(...) and @import (and backslash escapes could hide one from it), so a
+// string without any of these is returned as it is. the image functions are checked too, to be safe
+const cssMayNeedRewrite = (value: string) =>
+	/url\(|image-set\(|image\(|src\(|@import|\\/i.test(value);
 
 export default function (client: ScramjetClient) {
 	client.Proxy("CSSStyleDeclaration.prototype.setProperty", {
 		apply(ctx) {
 			if (!ctx.args[1]) return;
+			const value = ctx.args[1];
+			if (typeof value === "string" && !cssMayNeedRewrite(value)) return;
 			ctx.args[1] = rewriteCss(ctx.args[1], client.context, client.meta);
 		},
 	});
@@ -61,14 +73,19 @@ export default function (client: ScramjetClient) {
 		},
 	});
 
+	// one wrapper per style object, so repeated reads of el.style don't allocate and stay equal
+	const styleProxies = new _WeakMap<CSSStyleDeclaration, CSSStyleDeclaration>();
+
 	client.Trap("HTMLElement.prototype.style", {
 		get(ctx) {
 			// unfortunate and dumb hack. we have to trap every property of this
 			// since the prototype chain is fucked
 
 			const style = ctx.get() as CSSStyleDeclaration;
+			const existing = styleProxies.get(style);
+			if (existing) return existing;
 
-			return new Proxy(style, {
+			const proxy = new Proxy(style, {
 				get(target, prop) {
 					const value = Reflect_get(target, prop);
 
@@ -80,8 +97,10 @@ export default function (client: ScramjetClient) {
 						});
 					}
 
-					if (prop in CSSStyleDeclaration.prototype) return value;
-					if (!value) return value;
+					// camelCase url properties such as backgroundImage live on the prototype too,
+					// so only non-strings skip unrewriting. only url() values can hold a proxy url
+					if (typeof value !== "string" || !value.includes("url("))
+						return value;
 
 					return unrewriteCss(value, client.context);
 				},
@@ -89,6 +108,8 @@ export default function (client: ScramjetClient) {
 					if (prop == "cssText" || value == "" || typeof value !== "string") {
 						return Reflect_set(target, prop, value);
 					}
+					if (!cssMayNeedRewrite(value))
+						return Reflect_set(target, prop, value);
 
 					return Reflect_set(
 						target,
@@ -97,10 +118,43 @@ export default function (client: ScramjetClient) {
 					);
 				},
 			});
+			styleProxies.set(style, proxy);
+			return proxy;
 		},
 		set(ctx, value: string) {
 			// this will actually run the trap for cssText. don't rewrite it here
 			ctx.set(value);
+		},
+	});
+
+	// computed values hold the proxied url() forms; only url() values need unrewriting
+	const unrewriteComputed = (value: unknown) =>
+		typeof value === "string" && value.includes("url(")
+			? unrewriteCss(value, client.context)
+			: value;
+
+	client.Proxy("getComputedStyle", {
+		apply(ctx) {
+			const style = ctx.call() as CSSStyleDeclaration;
+
+			ctx.return(
+				new Proxy(style, {
+					get(target, prop) {
+						const value = Reflect_get(target, prop);
+
+						if (typeof value === "function") {
+							// e.g. getPropertyValue("background-image")
+							return new Proxy(value, {
+								apply(target, _that, args) {
+									return unrewriteComputed(Reflect_apply(target, style, args));
+								},
+							});
+						}
+
+						return unrewriteComputed(value);
+					},
+				})
+			);
 		},
 	});
 }

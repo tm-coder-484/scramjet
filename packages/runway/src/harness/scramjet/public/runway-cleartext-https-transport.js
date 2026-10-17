@@ -2,7 +2,10 @@
  * Wraps a ProxyTransport (e.g. LibcurlClient) so `https:` / `wss:` are executed cleartext
  * while BareCompatibleClient keeps the logical URL for `response.url` and redirects.
  *
- * **Site mapping** (`window.__runwayCleartextSite = { roots: string[], httpPort }`):
+ * The settings are read from `globalThis` (the harness page's window, or the controller worker's
+ * global scope in worker mode).
+ *
+ * **Site mapping** (`globalThis.__runwayCleartextSite = { roots: string[], httpPort }`):
  * For each root in `roots`, requests to `https://root/…` or `https://sub.root/…` (default
  * port 443) or `https://…:httpPort` when the port matches the runway server, are sent as
  * `http://127.0.0.1:httpPort/…` with `Host: <logical hostname>`.
@@ -74,10 +77,7 @@ class RunwayCleartextHttpsTransport {
 	 * @returns {{ url: URL; logicalHostname: string | null }}
 	 */
 	#rewriteWithMeta(remote) {
-		if (
-			typeof window !== "undefined" &&
-			window.__runwayCleartextHttps === false
-		) {
+		if (globalThis.__runwayCleartextHttps === false) {
 			return { url: remote, logicalHostname: null };
 		}
 		const url = new URL(remote.href);
@@ -89,10 +89,7 @@ class RunwayCleartextHttpsTransport {
 			return { url: remote, logicalHostname: null };
 		}
 
-		const snap =
-			typeof window !== "undefined" && window.__runwayCleartextSite != null
-				? window.__runwayCleartextSite
-				: null;
+		const snap = globalThis.__runwayCleartextSite ?? null;
 		const host = url.hostname;
 		const defaultTlsPort = url.port === "" || url.port === "443";
 		const defaultHttpPort = url.port === "" || url.port === "80";
@@ -124,10 +121,7 @@ class RunwayCleartextHttpsTransport {
 		// also applies. Below this point we only rewrite https/wss → http/ws.
 		if (!isHttps && !isWss) return { url: remote, logicalHostname: null };
 
-		const list =
-			typeof window !== "undefined"
-				? window.__runwayCleartextHttpsHosts
-				: undefined;
+		const list = globalThis.__runwayCleartextHttpsHosts;
 		const loopback =
 			host === "localhost" || host === "127.0.0.1" || host === "[::1]";
 		const explicit =
@@ -171,4 +165,5 @@ class RunwayCleartextHttpsTransport {
 	}
 }
 
-window.RunwayCleartextHttpsTransport = RunwayCleartextHttpsTransport;
+// globalThis, not window: the controller worker loads this script too (controller worker mode)
+globalThis.RunwayCleartextHttpsTransport = RunwayCleartextHttpsTransport;

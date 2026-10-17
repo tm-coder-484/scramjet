@@ -1,4 +1,4 @@
-import { basicTest } from "../../testcommon.ts";
+import { basicTest, serverTest } from "../../testcommon.ts";
 
 // URL-bearing element properties are reflected: the attribute keeps the page's
 // literal value while the IDL property resolves against the *real* document
@@ -84,6 +84,103 @@ export default [
 			assertEqual(img.srcset, "/a.png 1x, /b.png 2x", "srcset round trip");
 			assertEqual(img.getAttribute("srcset"), "/a.png 1x, /b.png 2x", "srcset attribute");
 			assert(!img.srcset.includes("/~/sj/"), "no proxy URL in srcset");
+		`,
+	}),
+	serverTest({
+		// srcset set from script has to go through the proxy like src does: unrewritten, the
+		// browser fetched the images straight from the site (from the proxy's own origin for a
+		// relative url, so this one fails to load). Reading it back gives what the page wrote,
+		// for parsed elements too: Apple's front page read the rewritten srcset of its <source>s
+		// and set it again, which rewrote it twice
+		name: "elurls-srcset-property-proxied",
+		autoPass: true,
+		js: `
+			const load = (img) => new Promise((r) => { img.onload = () => r(img.naturalWidth); img.onerror = () => r(0); setTimeout(() => r(-1), 3000); });
+			const img = document.createElement("img");
+			img.srcset = "/srcset-probe.png?img 1x";
+			document.body.appendChild(img);
+			assertEqual(await load(img), 1, "the img srcset loaded through the proxy");
+			assertEqual(img.srcset, "/srcset-probe.png?img 1x", "img.srcset reads back as set");
+
+			const p = document.createElement("picture");
+			const source = document.createElement("source");
+			source.srcset = "/srcset-probe.png?source";
+			const fallback = document.createElement("img");
+			fallback.src = "/missing.png";
+			p.append(source, fallback);
+			document.body.appendChild(p);
+			assertEqual(await load(fallback), 1, "the <source> srcset loaded through the proxy");
+
+			const d = document.createElement("div");
+			d.innerHTML = '<picture><source srcset="/srcset-probe.png?parsed 2x"><img srcset="/srcset-probe.png?parsed-img 1x"></picture>';
+			assertEqual(d.querySelector("source").srcset, "/srcset-probe.png?parsed 2x", "parsed source.srcset reads back as written");
+			assertEqual(d.querySelector("img").srcset, "/srcset-probe.png?parsed-img 1x", "parsed img.srcset reads back as written");
+			const again = document.createElement("img");
+			again.srcset = d.querySelector("img").srcset;
+			document.body.appendChild(again);
+			assertEqual(await load(again), 1, "a srcset read back and set again still loads");
+		`,
+		start: async (server) => {
+			// a 1x1 png
+			const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", "base64");
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				if (!(req.url || "").startsWith("/srcset-probe.png")) return;
+				res.writeHead(200, { "Content-Type": "image/png" });
+				res.end(png);
+			});
+		},
+	}),
+	serverTest({
+		// Lazy loading from <noscript>: with scripting on, its content is text, which the page parses
+		// and inserts once it wants the images (Apple's front page). That text has to be the page's
+		// own markup: with the rewritten urls in it, inserting it rewrote them twice
+		name: "elurls-noscript-lazy-load",
+		autoPass: true,
+		js: `
+			const holder = document.createElement("div");
+			holder.innerHTML = '<noscript><img src="/noscript-probe.png?a" alt="a"><source srcset="/noscript-probe.png?b 2x"></noscript>';
+			document.body.appendChild(holder);
+			const ns = holder.querySelector("noscript");
+			assertEqual(ns.textContent, '<img src="/noscript-probe.png?a" alt="a"><source srcset="/noscript-probe.png?b 2x">', "noscript text is the page's markup");
+			assertEqual(ns.innerText, ns.textContent, "innerText too");
+			assertEqual(ns.firstChild.data, ns.textContent, "and its text node's data");
+			const target = document.createElement("div");
+			target.innerHTML = ns.textContent;
+			document.body.appendChild(target);
+			const img = target.querySelector("img");
+			assertEqual(img.getAttribute("src"), "/noscript-probe.png?a", "the inserted img keeps the url it was written with");
+			const loaded = await new Promise((r) => { img.onload = () => r(img.naturalWidth); img.onerror = () => r(0); setTimeout(() => r(-1), 3000); });
+			assertEqual(loaded, 1, "the inserted img loaded through the proxy");
+		`,
+		start: async (server) => {
+			const png = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNkYAAAAAYAAjCB0C8AAAAASUVORK5CYII=", "base64");
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				if (!(req.url || "").startsWith("/noscript-probe.png")) return;
+				res.writeHead(200, { "Content-Type": "image/png" });
+				res.end(png);
+			});
+		},
+	}),
+	basicTest({
+		// URLs in a srcset may contain commas; every candidate must survive rewriting, or the
+		// browser picks a different (often far larger) image
+		name: "elurls-srcset-commas-in-urls",
+		js: `
+			const set = "/big.png?w=4000 4000w, /img.png?resize=300,225 300w, /img.png?resize=768,576 768w, /data,with,commas.png 1000w";
+			const img = document.createElement("img");
+			img.sizes = "300px";
+			img.srcset = set;
+			assertEqual(img.getAttribute("srcset"), set, "srcset attribute");
+			const d = document.createElement("div");
+			d.innerHTML = '<img sizes="300px" srcset="' + set + '">';
+			document.body.appendChild(d);
+			const parsed = d.querySelector("img");
+			assertEqual(parsed.getAttribute("srcset"), set, "parsed srcset attribute");
+			await new Promise((r) => { parsed.onload = parsed.onerror = r; setTimeout(r, 1000); });
+			assert(String(parsed.currentSrc).includes("resize=300") || String(parsed.currentSrc).includes("resize%3D300"),
+				"the 300w candidate was selected: " + parsed.currentSrc);
 		`,
 	}),
 	basicTest({
@@ -239,6 +336,32 @@ export default [
 			img.src = "img.png";
 			assertEqual(img.src, location.origin + "/basedir/img.png", "img src resolves against <base>");
 			assertEqual(new URL("x", document.baseURI).href, location.origin + "/basedir/x", "new URL against baseURI");
+		`,
+	}),
+	basicTest({
+		// a <base> url is resolved against the document url when the base is processed and
+		// then frozen: pushState/replaceState don't move it. GeForce NOW's lazy chunks are
+		// relative to <base href="#"> and load after it replaceStates a share url.
+		name: "elurls-base-href-frozen",
+		js: `
+			const original = location.href;
+			history.replaceState(null, "", "/deep/page.html");
+			const b = document.createElement("base");
+			b.setAttribute("href", "sub/");
+			document.head.prepend(b);
+			const resolve = () => {
+				const s = document.createElement("script");
+				s.src = "chunk.js";
+				return new URL(s.src).pathname;
+			};
+			assertEqual(resolve(), "/deep/sub/chunk.js", "relative base href resolves against the document url");
+			history.replaceState(null, "", "/elsewhere/other.html");
+			assertEqual(resolve(), "/deep/sub/chunk.js", "base url stays frozen across replaceState");
+			assertEqual(new URL(document.baseURI).pathname, "/deep/sub/", "baseURI stays frozen");
+			b.setAttribute("href", "next/");
+			assertEqual(resolve(), "/elsewhere/next/chunk.js", "changing href re-resolves against the current url");
+			b.remove();
+			history.replaceState(null, "", original);
 		`,
 	}),
 	basicTest({

@@ -187,4 +187,121 @@ export default [
 			});
 		},
 	}),
+	serverTest({
+		name: "cookies-script-set-cookie-race",
+		autoPass: false,
+		js: `
+		assert(!document.cookie.includes("runway_script_cookie=1"), "document.cookie should be empty");
+		const seen = new Promise((resolve, reject) => {
+			window.__cookieSeen = resolve;
+			const s = document.createElement("script");
+			s.src = "/set-cookie-script.js";
+			s.onerror = () => reject(new Error("script failed to load"));
+			document.head.appendChild(s);
+		});
+		// keep this thread busy while the response comes in, so the page takes its cookie late
+		const until = performance.now() + 300;
+		while (performance.now() < until) {}
+		const cookie = await seen;
+		assert(
+			cookie.includes("runway_script_cookie=1"),
+			"a script should see the cookie its own response set when it runs, saw: " + cookie
+		);
+		pass("script saw its own cookie");
+	`,
+		start: async (server) => {
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				const path = (req.url || "").split("?")[0] || "";
+				if (path !== "/set-cookie-script.js") return;
+				res.writeHead(200, {
+					"Content-Type": "text/javascript; charset=utf-8",
+					"Set-Cookie": "runway_script_cookie=1; Path=/",
+				});
+				res.end("window.__cookieSeen(document.cookie);");
+			});
+		},
+	}),
+	serverTest({
+		name: "cookies-stylesheet-set-cookie-race",
+		autoPass: false,
+		js: `
+		assert(!document.cookie.includes("runway_style_cookie=1"), "document.cookie should be empty");
+		const link = document.createElement("link");
+		link.rel = "stylesheet";
+		link.href = "/set-cookie-style.css";
+		const loaded = new Promise((resolve, reject) => {
+			link.onload = resolve;
+			link.onerror = () => reject(new Error("stylesheet failed to load"));
+		});
+		document.head.appendChild(link);
+		const until = performance.now() + 300;
+		while (performance.now() < until) {}
+		await loaded;
+		assert(
+			document.cookie.includes("runway_style_cookie=1"),
+			"a stylesheet's cookie should be visible by its load event, saw: " + document.cookie
+		);
+		assert(getComputedStyle(document.body).getPropertyValue("--runway-style").trim() === "1", "the stylesheet applied");
+		pass("stylesheet cookie visible on load");
+	`,
+		start: async (server) => {
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				const path = (req.url || "").split("?")[0] || "";
+				if (path !== "/set-cookie-style.css") return;
+				res.writeHead(200, {
+					"Content-Type": "text/css; charset=utf-8",
+					"Set-Cookie": "runway_style_cookie=1; Path=/",
+				});
+				res.end("body { --runway-style: 1; }");
+			});
+		},
+	}),
+	serverTest({
+		name: "cookies-repeated-set-cookie-race",
+		autoPass: false,
+		js: `
+		assert(!document.cookie.includes("runway_repeat_cookie=1"), "document.cookie should be empty");
+		// both responses set the same cookie; whichever the proxy handles second sets nothing new
+		const fetched = fetch("/set-same-cookie");
+		const seen = new Promise((resolve, reject) => {
+			window.__repeatSeen = resolve;
+			const s = document.createElement("script");
+			s.src = "/set-same-cookie.js";
+			s.onerror = () => reject(new Error("script failed to load"));
+			document.head.appendChild(s);
+		});
+		const until = performance.now() + 300;
+		while (performance.now() < until) {}
+		const cookie = await seen;
+		assert(
+			cookie.includes("runway_repeat_cookie=1"),
+			"a script should see the cookie its response set, even when another response set it first: " + cookie
+		);
+		await fetched;
+		for (let i = 0; i < 3; i++) await fetch("/set-same-cookie");
+		assert(document.cookie.includes("runway_repeat_cookie=1"), "still set after it was set again");
+		pass("repeated Set-Cookie seen by the script");
+	`,
+		start: async (server) => {
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				const path = (req.url || "").split("?")[0] || "";
+				if (path === "/set-same-cookie") {
+					res.writeHead(200, {
+						"Content-Type": "text/plain",
+						"Set-Cookie": "runway_repeat_cookie=1; Path=/",
+					});
+					res.end("ok");
+				} else if (path === "/set-same-cookie.js") {
+					res.writeHead(200, {
+						"Content-Type": "text/javascript",
+						"Set-Cookie": "runway_repeat_cookie=1; Path=/",
+					});
+					res.end("window.__repeatSeen(document.cookie);");
+				}
+			});
+		},
+	}),
 ];

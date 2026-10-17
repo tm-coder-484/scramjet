@@ -87,6 +87,7 @@ export default [
 			const c = getComputedStyle(d).backgroundImage;
 			assert(!c.includes("/~/sj/"), "computed style leaks the proxy URL: " + c);
 			assertEqual(c, 'url("' + location.origin + '/bg.png")', "computed style resolves to the real URL");
+			assertEqual(getComputedStyle(d).getPropertyValue("background-image"), c, "getPropertyValue on the computed style");
 		`,
 	}),
 	basicTest({

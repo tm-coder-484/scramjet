@@ -4,7 +4,7 @@ export default function (client: ScramjetClient, _self: Self) {
 	client.Trap("origin", {
 		get() {
 			// TODO: this isn't right!!
-			return client.url.origin;
+			return client.peekUrl().origin;
 		},
 		set() {
 			return false;

@@ -1,5 +1,5 @@
 import { ElementType, Parser } from "htmlparser2";
-import { ChildNode, DomHandler, Element, Comment } from "domhandler";
+import { ChildNode, DomHandler, Element, Comment, Text } from "domhandler";
 import render from "dom-serializer";
 import { URLMeta, rewriteUrl } from "@rewriters/url";
 import { rewriteCss } from "@rewriters/css";
@@ -14,7 +14,7 @@ import { TrackedHistoryState } from "@/fetch";
 import {
 	Performance_now,
 	atob,
-	Object_entries,
+	Object_keys,
 	JSON_parse,
 	JSON_stringify,
 	TextEncoder_encode,
@@ -22,6 +22,8 @@ import {
 	String_fromCodePoint,
 	btoa,
 	_URL,
+	_Set,
+	_Map,
 } from "@/shared/snapshot";
 import { flagEnabled } from "..";
 import {
@@ -47,9 +49,12 @@ export type HtmlContext = {
 	history?: TrackedHistoryState[];
 };
 
-const renderOptions = {
+export const renderOptions = {
 	encodeEntities: "utf8" as const,
 	decodeEntities: false,
+	// dom-serializer self-closes empty elements inside <svg>/<math> (`<path/>`), but the HTML
+	// serialization that innerHTML and outerHTML must return is always `<path></path>`
+	selfClosingTags: false,
 };
 function serializeHtmlNode(node: ChildNode) {
 	return render(node, renderOptions);
@@ -260,6 +265,12 @@ function rewriteHtmlInner(
 			}
 
 			headElement.children.unshift(...injectScripts);
+
+			const body = htmlRoot.children.find(
+				(child) => child.type === ElementType.Tag && child.name === "body"
+			);
+			if (body && flagEnabled("renderBlocking", context, meta.base))
+				(body as Element).children.unshift(renderBlockingScript());
 		}
 	}
 
@@ -280,6 +291,18 @@ function rewriteHtmlInner(
 	}
 
 	return render(handler.root, renderOptions);
+}
+
+// a script at the start of <body>, which the parser only runs once the stylesheets before it have
+// loaded, so the body waits for them. a top-level document is not rendered while its head
+// stylesheets load, but an iframe is laid out (and its text shaped) unstyled meanwhile, then again
+// once they arrive: ~100ms of extra main thread work for a long article. it removes itself.
+// off by default (the renderBlocking flag): while the parser waits here, Chromium also holds back
+// the body's scripts and images, which cost more than the layout it saves on most sites
+export function renderBlockingScript(): Element {
+	return new Element("script", { "scramjet-injected": "true" }, [
+		new Text("document.currentScript.remove()"),
+	]);
 }
 
 export function rewriteHtml(
@@ -341,48 +364,134 @@ export function unrewriteHtml(html: string, foreignContext?: ForeignContext) {
 	});
 }
 
-// i need to add the attributes in during rewriting
+type AttrRule = {
+	attr: string;
+	sel: "*" | string[];
+	fn: (typeof htmlRules)[number]["fn"];
+};
 
-function traverseParsedHtml(
-	node: any,
-	context: ScramjetContext,
-	meta: URLMeta
-) {
-	if (node.name === "base" && node.attribs.href !== undefined) {
-		meta.base = new _URL(node.attribs.href, meta.origin);
+type AttrRuleIndex = {
+	// rules that apply to each tag named by some selector, in htmlRules order
+	byTag: Map<string, AttrRule[]>;
+	// rules that apply to every element ("*"), in htmlRules order
+	wildcard: AttrRule[];
+};
+
+let attrRuleIndex: AttrRuleIndex | undefined;
+
+// built on first use: htmlRules imports this module, so it may not be initialized when this file loads
+function getAttrRuleIndex(): AttrRuleIndex {
+	if (attrRuleIndex) return attrRuleIndex;
+
+	const rules: AttrRule[] = [];
+	const tags = new _Set<string>();
+	for (const rule of htmlRules) {
+		for (const attr in rule) {
+			const sel = rule[attr.toLowerCase()];
+			if (typeof sel === "function") continue;
+			rules.push({ attr, sel, fn: rule.fn });
+			if (sel !== "*") for (const tag of sel) tags.add(tag);
+		}
 	}
 
+	const byTag = new _Map<string, AttrRule[]>();
+	for (const tag of tags) {
+		byTag.set(
+			tag,
+			rules.filter((rule) => rule.sel === "*" || rule.sel.includes(tag))
+		);
+	}
+	attrRuleIndex = {
+		byTag,
+		wildcard: rules.filter((rule) => rule.sel === "*"),
+	};
+	return attrRuleIndex;
+}
+
+/**
+ * Rewrites one element's own attributes: <base>, the htmlRules attribute rules, event handlers
+ * and <meta http-equiv>. Only the element itself is touched, never its children.
+ *
+ * Returns a comment when the element must be replaced by one (CSP meta), otherwise null.
+ */
+export function rewriteElementAttributes(
+	name: string | undefined,
+	attribs: Record<string, string | undefined>,
+	context: ScramjetContext,
+	meta: URLMeta
+): Comment | null {
+	if (name === "base" && attribs.href !== undefined) {
+		meta.base = new _URL(attribs.href, meta.origin);
+	}
+
+	const index = getAttrRuleIndex();
+	const rules = (name !== undefined && index.byTag.get(name)) || index.wildcard;
+	for (const { attr, fn } of rules) {
+		if (attribs[attr] === undefined) continue;
+		const value = attribs[attr];
+		const v = fn(value!, context, meta, attribs);
+
+		if (v === null) delete attribs[attr];
+		else attribs[attr] = v;
+		attribs[`scramjet-attr-${attr}`] = value;
+	}
+
+	for (const attr of Object_keys(attribs)) {
+		if (!eventAttributeSet.has(attr)) continue;
+		const value = attribs[attr];
+		attribs[`scramjet-attr-${attr}`] = value;
+		attribs[attr] = rewriteJs(
+			value as string,
+			`(inline ${attr} on element)`,
+			context,
+			meta
+		) as string;
+	}
+
+	if (name === "meta" && attribs["http-equiv"] !== undefined) {
+		if (attribs["http-equiv"].toLowerCase() === "content-security-policy") {
+			// just delete it. this needs to be emulated eventually but like
+			return new Comment(attribs.content as string);
+		} else if (attribs["http-equiv"].toLowerCase() === "refresh") {
+			const refresh = parseDeclarativeRefresh(attribs.content || "");
+			if (refresh && refresh.url !== null && refresh.url.length > 0) {
+				const rewritten = rewriteUrl(refresh.url.trim(), context, meta);
+				attribs.content =
+					(attribs.content as string).slice(0, refresh.urlStart) +
+					rewritten +
+					(attribs.content as string).slice(refresh.urlEnd);
+			}
+		}
+	}
+
+	return null;
+}
+
+/** the url inline scripts are rewritten with */
+export const INLINE_SCRIPT_URL = "(inline script element)";
+
+export function traverseParsedHtml(
+	node: any,
+	context: ScramjetContext,
+	meta: URLMeta,
+	// takes an inline script's rewrite elsewhere (htmlStream.ts sends big ones to the rewriter
+	// threads): given the script node and the text to rewrite, returns true when it will hand the
+	// rewrite to `finish` itself
+	deferScript?: (
+		node: any,
+		js: string,
+		isModule: boolean,
+		finish: (rewritten: string) => void
+	) => boolean
+) {
 	if (node.attribs) {
-		for (const rule of htmlRules) {
-			for (const attr in rule) {
-				const sel = rule[attr.toLowerCase()];
-				if (typeof sel === "function") continue;
-
-				if (sel === "*" || sel.includes(node.name)) {
-					if (node.attribs[attr] !== undefined) {
-						const value = node.attribs[attr];
-						const v = rule.fn(value, context, meta, node.attribs);
-
-						if (v === null) delete node.attribs[attr];
-						else {
-							node.attribs[attr] = v;
-						}
-						node.attribs[`scramjet-attr-${attr}`] = value;
-					}
-				}
-			}
-		}
-		for (const [attr, value] of Object_entries(node.attribs)) {
-			if (eventAttributes.includes(attr)) {
-				node.attribs[`scramjet-attr-${attr}`] = value;
-				node.attribs[attr] = rewriteJs(
-					value as string,
-					`(inline ${attr} on element)`,
-					context,
-					meta
-				);
-			}
-		}
+		const replacement = rewriteElementAttributes(
+			node.name,
+			node.attribs,
+			context,
+			meta
+		);
+		if (replacement) return replacement;
 	}
 
 	if (node.name === "style" && node.children[0] !== undefined)
@@ -423,38 +532,24 @@ function traverseParsedHtml(
 			"language" in node.attribs
 		);
 		if (isScriptType(scriptBlockType)) {
-			let js = node.children[0].data;
+			const source: string = node.children[0].data;
 			const module = isModuleScriptType(scriptBlockType);
-			node.attribs["scramjet-attr-script-source-src"] = bytesToBase64(
-				TextEncoder_encode(js)
-			);
 			const htmlcomment = /<!--[\s\S]*?-->/g;
-			js = js.replace(htmlcomment, "");
-			node.children[0].data = rewriteJs(
-				js,
-				"(inline script element)",
-				context,
-				meta,
-				module
-			);
-		}
-	}
-
-	if (node.name === "meta" && node.attribs["http-equiv"] !== undefined) {
-		if (
-			node.attribs["http-equiv"].toLowerCase() === "content-security-policy"
-		) {
-			// just delete it. this needs to be emulated eventually but like
-			node = new Comment(node.attribs.content);
-		} else if (node.attribs["http-equiv"].toLowerCase() === "refresh") {
-			const refresh = parseDeclarativeRefresh(node.attribs.content || "");
-			if (refresh && refresh.url !== null && refresh.url.length > 0) {
-				const rewritten = rewriteUrl(refresh.url.trim(), context, meta);
-				node.attribs.content =
-					node.attribs.content.slice(0, refresh.urlStart) +
-					rewritten +
-					node.attribs.content.slice(refresh.urlEnd);
-			}
+			const js = source.replace(htmlcomment, "");
+			// the script's text becomes the rewrite, and the page reads its source back from the
+			// attribute: not needed when the rewrite is the source (Aljazeera's 241 KB Apollo state
+			// doubled in size with it, and the frame's parser took the time to read it)
+			const finish = (rewritten: string) => {
+				node.children[0].data = rewritten;
+				if (rewritten !== source)
+					node.attribs["scramjet-attr-script-source-src"] = bytesToBase64(
+						TextEncoder_encode(source)
+					);
+			};
+			if (!deferScript?.(node, js, module, finish))
+				finish(
+					rewriteJs(js, INLINE_SCRIPT_URL, context, meta, module) as string
+				);
 		}
 	}
 
@@ -463,7 +558,8 @@ function traverseParsedHtml(
 			node.childNodes[childNode] = traverseParsedHtml(
 				node.childNodes[childNode],
 				context,
-				meta
+				meta,
+				deferScript
 			);
 		}
 	}
@@ -471,26 +567,54 @@ function traverseParsedHtml(
 	return node;
 }
 
+// a srcset is a comma-separated list of candidates: a URL (a run of non-whitespace) and optional
+// descriptors. URLs may contain commas themselves (`img.png?resize=300,225 300w`), so this follows
+// the HTML parsing algorithm instead of splitting on commas: dropping candidates makes the browser
+// pick another one, often the full-size original
+const isSrcsetSpace = (c: string) =>
+	c === " " || c === "\t" || c === "\n" || c === "\f" || c === "\r";
+
 export function rewriteSrcset(
 	srcset: string,
 	context: ScramjetContext,
 	meta: URLMeta
 ) {
-	const sources = srcset.split(/ .*,/).map((src) => src.trim());
-	const rewrittenSources = sources.map((source) => {
-		// Split into URLs and descriptors (if any)
-		// e.g. url0, url1 1.5x, url2 2x
-		const [url, ...descriptors] = source.split(/\s+/);
+	const out: string[] = [];
+	const n = srcset.length;
+	let i = 0;
+	while (i < n) {
+		while (i < n && (isSrcsetSpace(srcset[i]) || srcset[i] === ",")) i++;
+		if (i >= n) break;
 
-		// Rewrite the URLs and keep the descriptors (if any)
-		const rewrittenUrl = rewriteUrl(url.trim(), context, meta);
+		const urlStart = i;
+		while (i < n && !isSrcsetSpace(srcset[i])) i++;
+		let url = srcset.slice(urlStart, i);
 
-		return descriptors.length > 0
-			? `${rewrittenUrl} ${descriptors.join(" ")}`
-			: rewrittenUrl;
-	});
+		let descriptors = "";
+		if (url.endsWith(",")) {
+			// a URL that ends in commas ends the candidate, and loses the commas
+			while (url.endsWith(",")) url = url.slice(0, -1);
+		} else {
+			// descriptors run to the next comma outside parentheses
+			const descStart = i;
+			let inParens = false;
+			while (i < n) {
+				const c = srcset[i];
+				if (c === "(") inParens = true;
+				else if (c === ")") inParens = false;
+				else if (c === "," && !inParens) break;
+				i++;
+			}
+			descriptors = srcset.slice(descStart, i).trim();
+			i++;
+		}
+		if (!url) continue;
 
-	return rewrittenSources.join(", ");
+		const rewrittenUrl = rewriteUrl(url, context, meta);
+		out.push(descriptors ? `${rewrittenUrl} ${descriptors}` : rewrittenUrl);
+	}
+
+	return out.join(", ");
 }
 
 // function base64ToBytes(base64) {
@@ -499,7 +623,7 @@ export function rewriteSrcset(
 // 	return Uint8Array.from(binString, (m) => m.codePointAt(0));
 // }
 
-const eventAttributes = [
+export const eventAttributes = [
 	"onbeforexrselect",
 	"onabort",
 	"onbeforeinput",
@@ -601,3 +725,5 @@ const eventAttributes = [
 	"onscrollsnapchange",
 	"onscrollsnapchanging",
 ];
+
+const eventAttributeSet = new _Set<string>(eventAttributes);

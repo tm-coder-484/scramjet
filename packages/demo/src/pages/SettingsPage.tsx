@@ -5,10 +5,12 @@ import {
 	type AvailableTransports,
 	demoSettingsDefaults,
 	demoSettingsStore,
+	getWebrtcRelay,
 	normalizeHomeUrl,
 	normalizeMaxRequests,
 	normalizeTransport,
 	normalizeWispUrl,
+	webrtcRelayAvailable,
 } from "../store";
 
 const SettingsView: Component<
@@ -18,6 +20,7 @@ const SettingsView: Component<
 		transportInput: AvailableTransports;
 		homeUrlInput: string;
 		maxRequestsInput: string;
+		webrtcRelayInput: boolean;
 		status: string;
 		error: string;
 	},
@@ -27,6 +30,7 @@ const SettingsView: Component<
 	this.transportInput ??= demoSettingsStore.transport;
 	this.homeUrlInput ??= demoSettingsStore.homeUrl;
 	this.maxRequestsInput ??= String(demoSettingsStore.maxRequests);
+	this.webrtcRelayInput ??= demoSettingsStore.webrtcRelay !== false;
 	this.status ??= "";
 	this.error ??= "";
 
@@ -35,6 +39,7 @@ const SettingsView: Component<
 		this.transportInput = demoSettingsStore.transport;
 		this.homeUrlInput = demoSettingsStore.homeUrl;
 		this.maxRequestsInput = String(demoSettingsStore.maxRequests);
+		this.webrtcRelayInput = demoSettingsStore.webrtcRelay !== false;
 	};
 
 	const applySettings = async () => {
@@ -47,25 +52,44 @@ const SettingsView: Component<
 			const nextHomeUrl = normalizeHomeUrl(this.homeUrlInput);
 			const nextMaxRequests = normalizeMaxRequests(this.maxRequestsInput);
 			const wispChanged = nextWispUrl !== demoSettingsStore.wispUrl;
-			const transportChanged = nextTransport !== demoSettingsStore.transport;
+			const previousTransport = demoSettingsStore.transport;
+			const transportChanged = nextTransport !== previousTransport;
 
 			demoSettingsStore.wispUrl = nextWispUrl;
 			demoSettingsStore.transport = nextTransport;
 			demoSettingsStore.homeUrl = nextHomeUrl;
 			demoSettingsStore.maxRequests = nextMaxRequests;
+			const relayChanged =
+				this.webrtcRelayInput !== (demoSettingsStore.webrtcRelay !== false);
+			demoSettingsStore.webrtcRelay = this.webrtcRelayInput;
+			// read when each page loads, so this applies to pages opened from now on
+			controller.scramjetConfig.webrtcRelay = getWebrtcRelay();
 
 			this.wispUrlInput = nextWispUrl;
 			this.transportInput = nextTransport;
 			this.homeUrlInput = nextHomeUrl;
 			this.maxRequestsInput = String(nextMaxRequests);
 
+			controller.pushConfig();
+			// the relay runs the controller in a worker, so switching to or from it (or changing the
+			// server it talks to) needs a new controller: reload. libcurl and epoxy switch in place
+			if (
+				(transportChanged || wispChanged) &&
+				(nextTransport === "relay" || previousTransport === "relay")
+			) {
+				this.status = "Settings saved. Reloading to switch transport...";
+				setTimeout(() => location.reload(), 300);
+				return;
+			}
 			if (wispChanged || transportChanged) {
 				controller.setTransport(getTransport());
 			}
 			this.status =
 				wispChanged || transportChanged
 					? "Settings saved. Transport updated for new requests."
-					: "Settings saved.";
+					: relayChanged
+						? "Settings saved. Reload the site to apply the WebRTC change."
+						: "Settings saved.";
 		} catch (error) {
 			this.status = "";
 			this.error =
@@ -80,6 +104,7 @@ const SettingsView: Component<
 		this.transportInput = demoSettingsDefaults.transport;
 		this.homeUrlInput = demoSettingsDefaults.homeUrl;
 		this.maxRequestsInput = String(demoSettingsDefaults.maxRequests);
+		this.webrtcRelayInput = demoSettingsDefaults.webrtcRelay;
 		await applySettings();
 	};
 
@@ -153,6 +178,25 @@ const SettingsView: Component<
 				/>
 				<span class="hint">
 					Maximum number of captured requests kept in memory.
+				</span>
+			</label>
+
+			<label class="field">
+				<span class="label">WebRTC through the relay</span>
+				<span class="checkbox-row">
+					<input
+						type="checkbox"
+						checked={use(this.webrtcRelayInput)}
+						disabled={!webrtcRelayAvailable}
+						on:change={(e: Event) => {
+							this.webrtcRelayInput = (e.target as HTMLInputElement).checked;
+						}}
+					/>
+					<span class="hint">
+						{webrtcRelayAvailable
+							? "Video calls and game streams (e.g. GeForce NOW) go through the dev server's TURN relay instead of straight from your browser. Adds the relay's latency."
+							: "Unavailable: the relay runs with pnpm dev."}
+					</span>
 				</span>
 			</label>
 
@@ -276,6 +320,17 @@ SettingsView.style = css`
 	.hint {
 		color: #8f8f8f;
 		font-size: 0.78rem;
+	}
+
+	.checkbox-row {
+		display: flex;
+		align-items: center;
+		gap: 8px;
+	}
+
+	.checkbox-row input {
+		width: auto;
+		margin: 0;
 	}
 
 	.actions {

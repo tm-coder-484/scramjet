@@ -13,10 +13,20 @@ export function normalizeContentType(
 	if (!isHtmlMimeType(ct)) return;
 
 	headers.set("content-type", "text/html; charset=utf-8");
+	// the body was decoded and rewritten, so the upstream length and coding no longer describe it
+	headers.delete("content-length");
+	headers.delete("content-encoding");
 }
 
+// the statuses fetch follows, with somewhere to go. not 304, which answers the page's own conditional
+// request, nor 300, nor a 3xx without a Location: fetch hands those to the page as they are
+const REDIRECT_STATUSES = [301, 302, 303, 307, 308];
+
 export function isRedirect(response: BareResponse) {
-	return response.status >= 300 && response.status < 400;
+	return (
+		REDIRECT_STATUSES.includes(response.status) &&
+		response.rawHeaders.some(([k]) => k.toLowerCase() === "location")
+	);
 }
 
 export function isDocument(parsed: ScramjetFetchParsed) {

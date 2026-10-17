@@ -29,6 +29,12 @@ const flagDescriptions: Record<keyof ScramjetFlags, string> = {
 		"if an api interceptor fails, call the api with original input unsafely instead of throwing",
 	encapsulateWorkers:
 		"wrap web worker scripts in data urls to prevent scope issues (potentially buggy)",
+	viewTransitions:
+		"allow view transition animations (chromium can crash the tab running these in an iframe, e.g. youtube)",
+	rewriteCache:
+		"cache rewritten scripts in the browser, so repeat loads skip the rewriter",
+	renderBlocking:
+		"hold a page's body until its head stylesheets load, so the frame is not laid out unstyled first (less main thread work, but the body's scripts and images start later; usually slower overall)",
 	scramitize:
 		"Trigger debugger whenever the string 'scramjet' or the real location is detected in attacker code (debug feature)",
 	rewriterLogs: "Enable rewriter logging (debug feature)",
@@ -54,6 +60,7 @@ const FlagEditor: Component<
 	const toggleFlag = (flag: keyof ScramjetFlags, value: boolean) => {
 		flagStore[flag] = value;
 		Object.assign(controller.scramjetConfig.flags, flagStore);
+		controller.pushConfig();
 	};
 
 	const resetToDefaults = () => {
@@ -61,6 +68,7 @@ const FlagEditor: Component<
 			...defaultConfigDev.flags,
 		});
 		Object.assign(controller.scramjetConfig.flags, flagStore);
+		controller.pushConfig();
 	};
 
 	const bustCache = async () => {
@@ -79,6 +87,7 @@ const FlagEditor: Component<
 	cx.mount = async () => {
 		await controller.wait();
 		Object.assign(controller.scramjetConfig.flags, flagStore);
+		controller.pushConfig();
 	};
 
 	return (

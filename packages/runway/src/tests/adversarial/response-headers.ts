@@ -168,4 +168,45 @@ export default [
 			});
 		},
 	}),
+	serverTest({
+		// A stylesheet preloaded by the document's Link header with an integrity hash (Discord's
+		// front page does this through its CDN). The proxy rewrites the stylesheet's urls, so the
+		// hash no longer matches: the integrity in the header has to go, or the browser blocks the
+		// preload and the stylesheet with it, and the page renders unstyled.
+		name: "respheaders-link-preload-integrity",
+		autoPass: true,
+		js: `
+			const f = document.createElement("iframe");
+			f.src = "/sri/page.html";
+			document.body.appendChild(f);
+			await new Promise((r) => { f.onload = r; setTimeout(r, 4000); });
+			const doc = f.contentDocument;
+			assert(doc, "the frame document is reachable");
+			const box = doc.getElementById("box");
+			assert(box, "the frame rendered");
+			assertEqual(f.contentWindow.getComputedStyle(box).width, "123px", "the preloaded stylesheet applied");
+		`,
+		start: async (server) => {
+			const css = "#box { width: 123px; height: 10px; background: url(/sri/bg.png) no-repeat; }";
+			const { createHash } = await import("node:crypto");
+			const hash = "sha256-" + createHash("sha256").update(css).digest("base64");
+			server.on("request", (req, res) => {
+				if (res.headersSent) return;
+				const path = (req.url || "/").split("?")[0];
+				if (path === "/sri/page.html") {
+					res.writeHead(200, {
+						"Content-Type": "text/html",
+						Link: `</sri/style.css>; rel=preload; as=style; integrity="${hash}"`,
+					});
+					res.end(`<!DOCTYPE html><html><head><link rel="stylesheet" href="/sri/style.css" integrity="${hash}"></head><body><div id="box"></div></body></html>`);
+				} else if (path === "/sri/style.css") {
+					res.writeHead(200, { "Content-Type": "text/css" });
+					res.end(css);
+				} else if (path === "/sri/bg.png") {
+					res.writeHead(404);
+					res.end();
+				}
+			});
+		},
+	}),
 ];

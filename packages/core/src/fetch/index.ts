@@ -61,6 +61,10 @@ export interface ScramjetFetchParsed {
 	meta: URLMeta;
 	isModule: boolean;
 	isFakeDataURL: boolean;
+	// set when the request came from an <a download> link: the value of its download attribute
+	downloadName?: string;
+	// the request is an EventSource's (the page's request headers then include the browser's own)
+	isEventSource?: boolean;
 	referrerPolicy?: string;
 	trackedClient?: ScramjetFetchTrackedClient;
 }
@@ -70,6 +74,18 @@ export interface ScramjetFetchResponse {
 	headers: ScramjetHeaders;
 	status: number;
 	statusText: string;
+	/**
+	 * set when the response's cookies are still on their way to the page's clients: the body must
+	 * not end before this settles, or the page could use the response before it can see them.
+	 * Only for destinations the page can't use before their body ends (scripts, images...)
+	 */
+	cookieSync?: Promise<void>;
+	/**
+	 * set when `body` is the transport's own, untouched, and its server can serve it over plain
+	 * HTTP: gives the url to fetch it from instead, once (null if it's too late). Whoever answers
+	 * the page can fetch it there, so the browser streams it without this thread
+	 */
+	nativeBody?: () => string | null;
 }
 
 export type CookieSyncEntry = {
@@ -98,6 +114,8 @@ export type FetchHandlerInit = {
 export type TrackedHistoryState = {
 	url: string;
 	refererPolicy?: string;
+	// the Referer this document was navigated with
+	referrer?: string;
 };
 export class ScramjetFetchTrackedClient {
 	history: TrackedHistoryState[] = [];

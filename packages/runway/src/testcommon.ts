@@ -107,7 +107,10 @@ export function runwayTestTargetUrl(test: Test): string {
 	return `${scheme}://${hostname}:${test.port}${normalizedPath}`;
 }
 
-let nextPort = 10000 + Math.floor(Math.random() * 40000);
+// below Linux's ephemeral range (32768+ by default): a port in it can already be taken by any
+// outgoing connection (the browser's, a relay's), and test servers listen at import time, before
+// a collision could be retried ("EADDRINUSE" aborting the whole run). a run takes about 1000
+let nextPort = 10000 + Math.floor(Math.random() * 20000);
 
 export function basicTest(props: {
 	name: string;
